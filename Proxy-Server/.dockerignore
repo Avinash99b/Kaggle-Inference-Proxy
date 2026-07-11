@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.log
+.git/
+.gitignore
+run_model_with_proxy.py
+inference_server_config.json
+logs/
+.env
