@@ -194,12 +194,17 @@ DEFAULT_CONFIG = {
 
 
 def load_or_create_config(path: str, defaults: dict) -> dict:
+    abs_path = os.path.abspath(path)
     if not os.path.exists(path):
         with open(path, "w") as f:
             json.dump(defaults, f, indent=2)
-        print(f"[worker] No config found at '{path}'. A default config has "
-              f"been created. Please edit 'models', 'proxy_url' and "
-              f"'worker_shared_secret' to match your proxy before relying on it.")
+        print(f"[worker] No config found at '{abs_path}'. A default config "
+              f"(with only the built-in 'example-model' and gpu.n_ctx='max') has "
+              f"been created there. If you meant to use a custom config -- your "
+              f"own models/n_ctx/etc -- make sure it's actually saved at that "
+              f"exact path (or set WORKER_CONFIG_PATH to point at it) BEFORE "
+              f"the next run, otherwise this freshly-created default is what "
+              f"will keep loading.")
         return json.loads(json.dumps(defaults))
     with open(path, "r") as f:
         cfg = json.load(f)
@@ -208,6 +213,12 @@ def load_or_create_config(path: str, defaults: dict) -> dict:
     for k, v in defaults.items():
         if isinstance(v, dict) and isinstance(cfg.get(k), dict):
             merged[k] = {**v, **cfg[k]}
+    mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
+    print(f"[worker] Loaded EXISTING config from '{abs_path}' (last modified {mtime}). "
+          f"Note: an existing config file is never auto-overwritten with new script "
+          f"defaults -- if this file predates a script update (e.g. it still has an "
+          f"explicit integer 'gpu.n_ctx' instead of \"max\"), delete/replace it and "
+          f"rerun to pick up new defaults, or edit it directly.")
     return merged
 
 
@@ -868,6 +879,13 @@ class ModelManager:
             # KV-cache. This is purely inference-time context sizing.
             hyper = probe_gguf_hyperparams(model_path)
             desired_n_ctx = resolve_desired_n_ctx(configured_n_ctx, hyper)
+            logger.info(
+                "Context resolution for '%s': configured gpu/model n_ctx=%r, "
+                "GGUF header n_ctx_train=%s, resolved desired_n_ctx=%d (before any "
+                "VRAM-based shrinking below).",
+                alias, configured_n_ctx,
+                hyper.get("n_ctx_train") if hyper else "unknown (header probe failed)",
+                desired_n_ctx)
 
             n_ctx = desired_n_ctx
             if GPU_COUNT > 0:
