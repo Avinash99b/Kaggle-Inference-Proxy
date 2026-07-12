@@ -189,8 +189,10 @@ class Job:
     future: "asyncio.Future" = field(default_factory=lambda: asyncio.get_event_loop().create_future())
     delivered: bool = False
     delivered_at: Optional[float] = None
+    last_activity_at: Optional[float] = None   # refreshed on every streamed token
     retries: int = 0
     stream: bool = False
+    stream_queue: Optional["asyncio.Queue"] = None   # only set for true (WS) streaming jobs
 
 
 class WorkerState:
@@ -249,6 +251,10 @@ class JobManager:
             timeout=CONFIG["request_timeout_seconds"],
             stream=stream,
         )
+        if stream:
+            # True WS streaming jobs get a dedicated queue that the SSE
+            # response generator drains as tokens arrive from the worker.
+            job.stream_queue = asyncio.Queue()
         self.jobs[job.id] = job
         await self.queue.put(job.id)
         return job
@@ -264,6 +270,7 @@ class JobManager:
             return None
         job.delivered = True
         job.delivered_at = time.time()
+        job.last_activity_at = job.delivered_at
         return job
 
     async def wait_next_for_delivery(self, timeout: float) -> Optional[Job]:
@@ -277,7 +284,15 @@ class JobManager:
             return None
         job.delivered = True
         job.delivered_at = time.time()
+        job.last_activity_at = job.delivered_at
         return job
+
+    def mark_activity(self, job_id: str) -> None:
+        """Called whenever a streamed token arrives, so long-running streams
+        aren't mistaken for a stalled/dead worker by the watchdog."""
+        job = self.jobs.get(job_id)
+        if job is not None:
+            job.last_activity_at = time.time()
 
     def complete(self, job_id: str, result: Optional[dict], error: Optional[str]) -> bool:
         job = self.jobs.get(job_id)
@@ -293,10 +308,20 @@ class JobManager:
         """Called by the watchdog when a delivered job never got a result."""
         if job.future.done():
             return
+        # A streaming job that has already sent tokens to the client cannot
+        # be safely retried on a fresh worker (the client already received a
+        # partial response) -- fail it outright and unblock the SSE consumer.
+        if job.stream_queue is not None:
+            logger.error("Failing streaming job %s: %s", job.id, reason)
+            await job.stream_queue.put({"error": reason})
+            await job.stream_queue.put(None)
+            job.future.set_exception(RuntimeError(reason))
+            return
         if job.retries < CONFIG["retry"]["max_job_retries"]:
             job.retries += 1
             job.delivered = False
             job.delivered_at = None
+            job.last_activity_at = None
             logger.warning("Requeuing job %s after failure: %s", job.id, reason)
             await self.queue.put(job.id)
         else:
@@ -370,10 +395,11 @@ def format_text_completion(job_id: str, model: str, result: dict) -> dict:
 
 
 async def fake_sse_stream(final_chunk_builder):
-    """We do not have true token-by-token streaming across the WS/poll hop to
-    Kaggle, so as a compatibility fallback we compute the full result and then
-    emit it as a single SSE 'delta' chunk followed by [DONE]. This keeps
-    stream=True clients working without them needing special-case code."""
+    """Used only when the worker is on the long-poll fallback transport,
+    which cannot push individual tokens as they're generated. We compute the
+    full result and then emit it as a single SSE 'delta' chunk followed by
+    [DONE]. This keeps stream=True clients working (just without real
+    incremental output) whenever WebSocket isn't available."""
     payload = final_chunk_builder()
     yield f"data: {json.dumps(payload)}\n\n"
     yield "data: [DONE]\n\n"
@@ -408,6 +434,62 @@ def to_stream_text_chunk(job_id: str, model: str, result: dict) -> dict:
     }
 
 
+async def real_stream_generator(job: Job, model: str, kind: str):
+    """True token-by-token SSE stream for jobs delivered over the worker
+    WebSocket. Reads from job.stream_queue as the worker's WS handler feeds
+    it (see the 'stream_chunk' / 'stream_done' / 'error' cases in worker_ws),
+    and yields OpenAI-compatible chunk frames as soon as each token arrives.
+    """
+    role_sent = False
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(job.stream_queue.get(), timeout=job.timeout)
+            except asyncio.TimeoutError:
+                err = openai_error(
+                    "Timed out waiting for streamed tokens from the worker.",
+                    "server_error")
+                yield f"data: {json.dumps(err)}\n\n"
+                break
+
+            if item is None:
+                break  # normal end-of-stream sentinel
+
+            if "error" in item:
+                err = openai_error(f"Worker streaming error: {item['error']}", "server_error")
+                yield f"data: {json.dumps(err)}\n\n"
+                break
+
+            delta_text = item.get("delta", "") or ""
+            finish_reason = item.get("finish_reason")
+
+            if kind == "chat":
+                if not role_sent:
+                    first = {
+                        "id": f"chatcmpl-{job.id}", "object": "chat.completion.chunk",
+                        "created": int(time.time()), "model": model,
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(first)}\n\n"
+                    role_sent = True
+                delta_obj = {"content": delta_text} if delta_text else {}
+                chunk = {
+                    "id": f"chatcmpl-{job.id}", "object": "chat.completion.chunk",
+                    "created": int(time.time()), "model": model,
+                    "choices": [{"index": 0, "delta": delta_obj, "finish_reason": finish_reason}],
+                }
+            else:
+                chunk = {
+                    "id": f"cmpl-{job.id}", "object": "text_completion",
+                    "created": int(time.time()), "model": model,
+                    "choices": [{"index": 0, "text": delta_text, "logprobs": None,
+                                 "finish_reason": finish_reason}],
+                }
+            yield f"data: {json.dumps(chunk)}\n\n"
+    finally:
+        yield "data: [DONE]\n\n"
+
+
 # --------------------------------------------------------------------------- #
 # Shared request handling
 # --------------------------------------------------------------------------- #
@@ -426,12 +508,18 @@ def normalize_generation_params(body: dict) -> dict:
     }
 
 
-async def run_job_and_wait(kind: str, payload: dict, stream: bool) -> (Job, dict):
+def ensure_worker_online() -> None:
     if not WORKER.is_online():
         raise HTTPException(status_code=503, detail=openai_error(
             "No inference worker is currently connected. Please try again shortly.",
             "server_error"))
-    job = await JOBS.submit(kind, payload, stream)
+
+
+async def run_job_and_wait(kind: str, payload: dict) -> (Job, dict):
+    """Non-streaming (or poll-fallback) path: submit a job and block until
+    the worker returns the full result."""
+    ensure_worker_online()
+    job = await JOBS.submit(kind, payload, stream=False)
     try:
         result = await asyncio.wait_for(job.future, timeout=job.timeout)
     except asyncio.TimeoutError:
@@ -444,6 +532,12 @@ async def run_job_and_wait(kind: str, payload: dict, stream: bool) -> (Job, dict
     return job, result
 
 
+def worker_supports_real_streaming() -> bool:
+    """True token streaming requires the persistent WebSocket transport --
+    long-polling has no way to push individual tokens as they're produced."""
+    return WORKER.is_online() and WORKER.transport == "ws"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
     check_client_key(authorization)
@@ -454,14 +548,26 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         raise HTTPException(status_code=400, detail=openai_error(
             "'model' and 'messages' are required.", "invalid_request_error"))
     stream = bool(body.get("stream", False))
+    ensure_worker_online()
+
+    if stream and worker_supports_real_streaming():
+        payload = {
+            "kind": "chat", "model": model, "messages": messages, "stream": True,
+            "params": normalize_generation_params(body),
+        }
+        job = await JOBS.submit("chat", payload, stream=True)
+        return StreamingResponse(
+            real_stream_generator(job, model, "chat"),
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming, or the worker is currently on the long-poll fallback
+    # transport (no true incremental push available there).
     payload = {
-        "kind": "chat",
-        "model": model,
-        "messages": messages,
+        "kind": "chat", "model": model, "messages": messages, "stream": False,
         "params": normalize_generation_params(body),
     }
-    job, result = await run_job_and_wait("chat", payload, stream)
-
+    job, result = await run_job_and_wait("chat", payload)
     if stream:
         return StreamingResponse(
             fake_sse_stream(lambda: to_stream_chat_chunk(job.id, model, result)),
@@ -480,20 +586,31 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         raise HTTPException(status_code=400, detail=openai_error(
             "'model' and 'prompt' are required.", "invalid_request_error"))
     stream = bool(body.get("stream", False))
+    ensure_worker_online()
+
+    if stream and worker_supports_real_streaming():
+        payload = {
+            "kind": "completion", "model": model, "prompt": prompt, "stream": True,
+            "params": normalize_generation_params(body),
+        }
+        job = await JOBS.submit("completions", payload, stream=True)
+        return StreamingResponse(
+            real_stream_generator(job, model, "completion"),
+            media_type="text/event-stream",
+        )
+
     payload = {
-        "kind": "completion",
-        "model": model,
-        "prompt": prompt,
+        "kind": "completion", "model": model, "prompt": prompt, "stream": False,
         "params": normalize_generation_params(body),
     }
-    job, result = await run_job_and_wait("completions", payload, stream)
-
+    job, result = await run_job_and_wait("completions", payload)
     if stream:
         return StreamingResponse(
             fake_sse_stream(lambda: to_stream_text_chunk(job.id, model, result)),
             media_type="text/event-stream",
         )
     return JSONResponse(format_text_completion(job.id, model, result))
+
 
 
 @app.post("/v1/embeddings")
@@ -625,7 +742,10 @@ async def worker_ws(websocket: WebSocket):
         async def dispatcher():
             """Pulls jobs off the queue and pushes them to this worker one
             at a time (the GGUF backend processes a single request at a
-            time), waiting for the result before moving on."""
+            time), waiting for the result before moving on. For streaming
+            jobs, 'done' means the worker sent stream_done/error -- the
+            individual tokens themselves are delivered separately via the
+            job's stream_queue and consumed directly by the SSE response."""
             while True:
                 job = await JOBS.wait_next_for_delivery(timeout=5)
                 if job is None:
@@ -642,12 +762,16 @@ async def worker_ws(websocket: WebSocket):
                 except Exception as e:
                     await JOBS.requeue_or_fail(job, f"send failed: {e}")
                     return
-                # Wait (bounded) for this specific job's future to resolve.
-                # The receive loop below is what actually completes it.
-                deadline = time.time() + job.timeout
-                while not job.future.done() and time.time() < deadline:
+                # Wait for the job's future to resolve. The window is
+                # rolling (based on last_activity_at) rather than a single
+                # fixed deadline, so a long but actively-streaming
+                # generation doesn't get killed just for taking a while.
+                while not job.future.done():
                     await asyncio.sleep(0.2)
                     if not WORKER.is_online():
+                        break
+                    last_activity = job.last_activity_at or job.delivered_at or time.time()
+                    if time.time() - last_activity > job.timeout:
                         break
                 if not job.future.done():
                     await JOBS.requeue_or_fail(job, "worker did not respond in time")
@@ -671,6 +795,36 @@ async def worker_ws(websocket: WebSocket):
                     WORKER.touch()
                     job_id = msg.get("job_id")
                     JOBS.complete(job_id, msg.get("result"), msg.get("error"))
+                elif mtype == "stream_chunk":
+                    # A single token/delta for an in-progress streaming job.
+                    WORKER.touch()
+                    job_id = msg.get("job_id")
+                    JOBS.mark_activity(job_id)
+                    job = JOBS.jobs.get(job_id)
+                    if job is not None and job.stream_queue is not None:
+                        await job.stream_queue.put({
+                            "delta": msg.get("delta", ""),
+                            "finish_reason": msg.get("finish_reason"),
+                        })
+                elif mtype == "stream_done":
+                    # Streaming job finished successfully -- unblock the SSE
+                    # consumer with the end-of-stream sentinel and resolve
+                    # the job future (carries aggregated usage, if any).
+                    WORKER.touch()
+                    job_id = msg.get("job_id")
+                    job = JOBS.jobs.get(job_id)
+                    if job is not None and job.stream_queue is not None:
+                        await job.stream_queue.put(None)
+                    JOBS.complete(job_id, msg.get("result", {}), None)
+                elif mtype == "error":
+                    # Out-of-band error for a job that may be mid-stream.
+                    WORKER.touch()
+                    job_id = msg.get("job_id")
+                    job = JOBS.jobs.get(job_id)
+                    if job is not None and job.stream_queue is not None:
+                        await job.stream_queue.put({"error": msg.get("error", "unknown error")})
+                        await job.stream_queue.put(None)
+                    JOBS.complete(job_id, None, msg.get("error", "unknown error"))
                 elif mtype == "models_update":
                     WORKER.models = msg.get("models", WORKER.models)
                 else:
@@ -763,9 +917,14 @@ async def watchdog_loop():
         for job in list(JOBS.jobs.values()):
             if job.future.done():
                 continue
-            if job.delivered and job.delivered_at and (now - job.delivered_at) > job.timeout:
-                await JOBS.requeue_or_fail(job, "delivery watchdog timeout")
-            elif not job.delivered and (now - job.created_at) > job.timeout:
+            if job.delivered:
+                last_activity = job.last_activity_at or job.delivered_at or now
+                if (now - last_activity) > job.timeout:
+                    await JOBS.requeue_or_fail(job, "delivery watchdog timeout")
+            elif (now - job.created_at) > job.timeout:
+                if job.stream_queue is not None:
+                    await job.stream_queue.put({"error": "timed out waiting in queue"})
+                    await job.stream_queue.put(None)
                 job.future.set_exception(RuntimeError("timed out waiting in queue"))
         JOBS.cleanup()
 
