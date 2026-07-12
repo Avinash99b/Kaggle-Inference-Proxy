@@ -216,6 +216,15 @@ class WorkerState:
     def touch(self) -> None:
         self.last_heartbeat = time.time()
 
+    def mark_offline(self) -> None:
+        """Immediately mark the worker offline instead of waiting for the
+        worker_offline_after_seconds grace window to elapse. Used whenever we
+        positively know the connection is gone (e.g. a WebSocket close or an
+        explicit deregister call), so new requests get a fast, honest 503
+        instead of silently hanging until they individually time out."""
+        self.last_heartbeat = 0.0
+        self.status = "unknown"
+
     def snapshot(self) -> dict:
         return {
             "worker_id": self.worker_id,
@@ -305,7 +314,8 @@ class JobManager:
         return True
 
     async def requeue_or_fail(self, job: Job, reason: str) -> None:
-        """Called by the watchdog when a delivered job never got a result."""
+        """Called by the watchdog (or by an immediate disconnect handler)
+        when a delivered job never got a result."""
         if job.future.done():
             return
         # A streaming job that has already sent tokens to the client cannot
@@ -696,6 +706,17 @@ def apply_worker_hello(worker_id: str, models: dict, transport: str) -> None:
                 worker_id, transport, list(WORKER.models.keys()))
 
 
+async def fail_in_flight_jobs(reason: str) -> None:
+    """Immediately fail/requeue every job that was already delivered to the
+    (now-gone) worker connection, instead of waiting for the watchdog to
+    notice via its timeout. Jobs that are still only queued (never
+    delivered) are left alone -- they'll simply wait for the next worker to
+    connect and pick them up, same as before."""
+    in_flight = [j for j in JOBS.jobs.values() if not j.future.done() and j.delivered]
+    for job in in_flight:
+        await JOBS.requeue_or_fail(job, reason)
+
+
 # --------------------------------------------------------------------------- #
 # WebSocket transport (primary)
 # --------------------------------------------------------------------------- #
@@ -840,7 +861,18 @@ async def worker_ws(websocket: WebSocket):
         if authed and WORKER.worker_id == worker_id:
             WORKER.ws = None
             WORKER.transport = None
+            # Mark offline THE INSTANT the socket is gone -- don't wait for
+            # worker_offline_after_seconds. The dispatcher task tied to this
+            # connection has already been cancelled above, so nothing will
+            # ever pull queued jobs or resolve in-flight ones for this
+            # connection; without this, is_online() would keep reporting
+            # True for up to worker_offline_after_seconds, so new requests
+            # would be accepted and then hang, and any job that was already
+            # delivered to this worker would just sit until its own
+            # (much longer) per-job timeout expired.
+            WORKER.mark_offline()
             logger.info("Worker '%s' disconnected from WebSocket.", worker_id)
+            await fail_in_flight_jobs("worker disconnected mid-request")
 
 
 # --------------------------------------------------------------------------- #
@@ -904,9 +936,30 @@ async def worker_heartbeat(request: Request):
     return {"status": "ok"}
 
 
+@app.post("/worker/deregister")
+async def worker_deregister(request: Request):
+    """Explicit 'I'm shutting down' signal. Both transports can call this on
+    a clean shutdown (e.g. Ctrl+C in a Kaggle notebook) so the proxy learns
+    about the disconnect immediately instead of relying purely on the
+    WebSocket close event or the long-poll heartbeat timeout."""
+    body = await request.json()
+    worker_id = body.get("worker_id", "kaggle-worker")
+    if not verify_worker_auth(worker_id, body.get("timestamp", ""), body.get("signature", "")):
+        raise HTTPException(status_code=401, detail="bad worker signature")
+    if WORKER.worker_id == worker_id:
+        WORKER.ws = None
+        WORKER.transport = None
+        WORKER.mark_offline()
+        logger.info("Worker '%s' explicitly deregistered.", worker_id)
+        await fail_in_flight_jobs("worker deregistered")
+    return {"status": "deregistered"}
+
+
 # --------------------------------------------------------------------------- #
 # Background watchdog: fail jobs that were delivered but never completed
-# (covers the case of a worker dying mid-job on either transport).
+# (covers the case of a worker dying mid-job on either transport, as a
+# backstop for anything the immediate-disconnect handlers above don't catch
+# -- e.g. a long-poll worker that vanishes without ever calling /deregister).
 # --------------------------------------------------------------------------- #
 
 
