@@ -4,48 +4,14 @@ run_model_with_proxy.py
 Private Kaggle GGUF inference worker.
 
 Run this in a Kaggle notebook (ideally with the "GPU T4 x2" accelerator
-enabled). It:
-
-  1. Installs missing Python/system dependencies automatically.
-  2. Installs/builds a CUDA-enabled llama.cpp Python backend (llama-cpp-python).
-  3. Connects OUTBOUND to the proxy (WebSocket first, long-poll fallback).
-     Kaggle never needs an inbound port -- this script only makes outgoing
-     connections.
-  4. Waits for jobs, downloads/caches the requested GGUF model from Hugging
-     Face on demand, loads it (splitting across both T4s when it helps),
-     runs generation, and reports the result back to the proxy.
-  5. Manages its on-disk model cache: before every download it checks how
-     much free space is available and, if there isn't enough room, evicts
-     the least-recently-used cached model(s) first. A background monitor
-     also periodically checks free space so the cache stays healthy even
-     between downloads. The cache lives outside /kaggle/working (which has
-     a small, quota-limited size on Kaggle) so there's much more headroom.
-  6. Is VRAM-aware, purely for INFERENCE (this script never trains or
-     fine-tunes anything -- it is solely an inference client node that
-     loads pre-trained GGUF weights and runs forward-pass generation, so
-     the only VRAM consumers it ever accounts for are the model weights
-     themselves and the KV-cache; there's no optimizer state, no gradients,
-     and no activation memory for backprop to budget for the way you would
-     for training). Only one model is ever kept loaded at a time --
-     switching models automatically unloads whatever's currently resident
-     first, so a new model can claim that freed VRAM. By default (config
-     "gpu.n_ctx": "max"), every model is loaded with the LARGEST context
-     window it was itself trained with (read straight from its GGUF
-     header), and that is only reduced as far as necessary to fit
-     currently-free VRAM (with a configurable safety headroom, default 5%),
-     using the model's own GGUF header to estimate KV-cache cost per token.
-     If a load still hits a CUDA OOM (estimates are inherently approximate),
-     it automatically retries with a smaller context window a few times
-     before giving up. An explicit integer context size can still be set
-     per-model (or globally) in config to override the "always maximize"
-     default.
-  7. Cleanly tells the proxy it's going away on Ctrl+C / shutdown, so the
-     proxy stops waiting on it immediately instead of leaving in-flight
-     HTTP requests hanging until they individually time out.
+enabled). It installs dependencies, builds a CUDA llama.cpp backend, connects
+outbound to the proxy (WebSocket first, long-poll fallback), downloads/caches
+GGUF models from Hugging Face on demand, runs generation, and reports results
+back. It manages disk space (LRU eviction) and VRAM (dynamic context sizing)
+so it can run unattended.
 
 Just run:
     python run_model_with_proxy.py
-or paste the contents into a Kaggle notebook cell and run it.
 """
 
 from __future__ import annotations
@@ -67,8 +33,31 @@ import uuid
 from typing import Any, Dict, List, Optional, Set
 
 # --------------------------------------------------------------------------- #
-# Step 0: self-install Python dependencies before importing them
+# Step -1: consolidate Hugging Face's own cache into our tracked cache dir.
+#
+# BUG FIX: hf_hub_download's default cache lives under ~/.cache/huggingface,
+# which on Kaggle sits on the SAME small root volume as everything else
+# (despite /tmp "feeling" bigger, `df` reports one shared quota for the
+# instance). Our old code downloaded with `local_dir=...`, which made
+# huggingface_hub materialize a full second copy of every model file
+# outside of that hidden cache. Two problems resulted:
+#   1. Every model was stored twice on disk (double the space per model).
+#   2. Our eviction logic only ever deleted the `local_dir` copy it knew
+#      about -- the hidden ~/.cache/huggingface blob was never freed, so
+#      disk usage crept up over time even though our own accounting said
+#      there was room, eventually blowing through the real quota
+#      (the "59.1GiB used / 57.6GiB max" crash).
+#
+# Fix: point HF's cache at a subdirectory of our own (tracked, evictable)
+# cache dir, and stop using `local_dir` so huggingface_hub uses its normal
+# single-copy, symlinked cache instead of materializing a duplicate file.
+# This must happen before huggingface_hub is imported, since it reads these
+# env vars once at import time.
 # --------------------------------------------------------------------------- #
+_DEFAULT_MODEL_CACHE_DIR = "/tmp/gguf_models"
+os.environ.setdefault("HF_HOME", os.path.join(_DEFAULT_MODEL_CACHE_DIR, ".hf_cache"))
+os.environ.setdefault("HF_HUB_CACHE", os.path.join(_DEFAULT_MODEL_CACHE_DIR, ".hf_cache", "hub"))
+os.makedirs(os.environ["HF_HUB_CACHE"], exist_ok=True)
 
 
 def _pip_install(*packages: str, extra_index: Optional[str] = None, env: Optional[dict] = None) -> None:
@@ -109,19 +98,13 @@ DEFAULT_CONFIG = {
     "worker_id": "kaggle-worker-1",
     "worker_shared_secret": "change-me-worker-secret",
     "huggingface_token": "",
-    # NOTE: deliberately NOT under /kaggle/working -- that path is backed by
-    # a small, quota-limited "output" volume on Kaggle (often ~20GB) meant
-    # for notebook artifacts you commit, not a multi-GB model cache. /tmp
-    # sits on the much larger underlying instance disk.
-    "model_cache_dir": "/tmp/gguf_models",
+    "model_cache_dir": _DEFAULT_MODEL_CACHE_DIR,
     "models": {
         "example-model": {
             "repo": "TheBloke/Llama-2-7B-Chat-GGUF",
             "file": "llama-2-7b-chat.Q4_K_M.gguf"
-            # Optional per-model overrides (fall back to the global "gpu"
-            # section below if omitted): "n_ctx", "n_gpu_layers", "n_batch",
-            # "n_threads". e.g. a long-context model could set a bigger
-            # "n_ctx" here without raising it globally for every model.
+            # Optional per-model overrides (else fall back to "gpu" below):
+            # "n_ctx", "n_gpu_layers", "n_batch", "n_threads".
         }
     },
     "default_generation": {
@@ -145,28 +128,28 @@ DEFAULT_CONFIG = {
     },
     "disk_management": {
         "enabled": True,
-        # Extra headroom (beyond the file we're about to download) that we
-        # always try to keep free. Eviction targets required_bytes + this.
         "safety_margin_gb": 2,
-        # Floor used by the background monitor loop: if free space drops
-        # below this at any time (not just during a download), evict LRU
-        # cached models until we're back above it (or nothing is left to
-        # evict).
         "min_free_space_gb": 5,
         "monitor_interval_seconds": 30
     },
     "vram_management": {
-        # Fraction of TOTAL VRAM (across the GPU(s) this worker uses) that
-        # is always kept free as headroom, e.g. 0.05 = never plan to use
-        # the last 5%.
+        # Fraction of total VRAM always kept free as headroom.
         "headroom_fraction": 0.05,
-        # Never size a context window below this many tokens, even under
-        # heavy VRAM pressure.
         "min_n_ctx": 256,
-        # On a CUDA OOM while loading, retry with n_ctx multiplied by this
-        # factor (repeatedly, down to min_n_ctx) before giving up.
         "oom_shrink_factor": 0.75,
-        "max_oom_retries": 4
+        "max_oom_retries": 4,
+        # BUG FIX: "max" used to mean "the model's full trained context,
+        # shrunk only as far as VRAM math says is needed" -- with no upper
+        # bound. For models trained with huge native windows (e.g. this
+        # Qwen3-Coder-1M GGUF), that VRAM math alone produced n_ctx=215017,
+        # which is unusable in practice: llama.cpp's compute buffers
+        # (attention/KQ scratch, batch buffers, etc.) scale with n_ctx too,
+        # not just KV-cache, and were never budgeted for. The resulting
+        # allocation blew past system RAM and Kaggle hard-restarted the
+        # notebook. This cap bounds "max" auto-sizing to something that
+        # actually fits real hardware; raise it explicitly per-model if you
+        # know your box can handle more.
+        "max_auto_n_ctx": 32768
     },
     "backend_build": {
         "prefer_prebuilt_wheel": True,
@@ -174,13 +157,6 @@ DEFAULT_CONFIG = {
     },
     "gpu": {
         "attempt_dual_gpu_split": True,
-        # "max" (the default) means: always try to load every model at the
-        # largest context window IT supports -- read from its own GGUF
-        # header's trained context length -- and only shrink from there as
-        # far as needed to fit available VRAM. This is an inference-only
-        # setting (KV-cache sizing), not a training batch/sequence length.
-        # Set an explicit integer here (or per-model under "models") if you
-        # want a fixed cap instead of always-maximize.
         "n_ctx": "max",
         "n_batch": 512,
         "n_threads": 0,
@@ -198,13 +174,7 @@ def load_or_create_config(path: str, defaults: dict) -> dict:
     if not os.path.exists(path):
         with open(path, "w") as f:
             json.dump(defaults, f, indent=2)
-        print(f"[worker] No config found at '{abs_path}'. A default config "
-              f"(with only the built-in 'example-model' and gpu.n_ctx='max') has "
-              f"been created there. If you meant to use a custom config -- your "
-              f"own models/n_ctx/etc -- make sure it's actually saved at that "
-              f"exact path (or set WORKER_CONFIG_PATH to point at it) BEFORE "
-              f"the next run, otherwise this freshly-created default is what "
-              f"will keep loading.")
+        print(f"[worker] No config found at '{abs_path}'. Created a default config there.")
         return json.loads(json.dumps(defaults))
     with open(path, "r") as f:
         cfg = json.load(f)
@@ -214,15 +184,23 @@ def load_or_create_config(path: str, defaults: dict) -> dict:
         if isinstance(v, dict) and isinstance(cfg.get(k), dict):
             merged[k] = {**v, **cfg[k]}
     mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
-    print(f"[worker] Loaded EXISTING config from '{abs_path}' (last modified {mtime}). "
-          f"Note: an existing config file is never auto-overwritten with new script "
-          f"defaults -- if this file predates a script update (e.g. it still has an "
-          f"explicit integer 'gpu.n_ctx' instead of \"max\"), delete/replace it and "
-          f"rerun to pick up new defaults, or edit it directly.")
+    print(f"[worker] Loaded existing config from '{abs_path}' (last modified {mtime}). "
+          f"An existing config is never auto-overwritten with new defaults -- delete/replace "
+          f"it (or edit it directly) to pick up new script defaults.")
     return merged
 
 
 CONFIG = load_or_create_config(CONFIG_PATH, DEFAULT_CONFIG)
+
+# If the config overrides model_cache_dir, keep HF's cache inside it too --
+# otherwise we're back to two caches on (possibly) two different volumes.
+if CONFIG["model_cache_dir"] != _DEFAULT_MODEL_CACHE_DIR:
+    _hf_cache = os.path.join(CONFIG["model_cache_dir"], ".hf_cache", "hub")
+    os.makedirs(_hf_cache, exist_ok=True)
+    os.environ["HF_HUB_CACHE"] = _hf_cache
+    import huggingface_hub.constants as _hf_constants
+    _hf_constants.HF_HUB_CACHE = _hf_cache
+    _hf_constants.HUGGINGFACE_HUB_CACHE = _hf_cache
 
 logging.basicConfig(
     level=getattr(logging, CONFIG["logging"].get("level", "INFO").upper(), logging.INFO),
@@ -239,7 +217,6 @@ os.makedirs(CONFIG["model_cache_dir"], exist_ok=True)
 
 
 def detect_gpus() -> int:
-    """Best-effort GPU count detection without hard-depending on torch."""
     try:
         out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
         if out.returncode == 0:
@@ -262,9 +239,7 @@ logger.info("Detected %d GPU(s).", GPU_COUNT)
 
 
 def query_gpu_memory() -> List[dict]:
-    """Per-GPU memory stats via nvidia-smi, in MB:
-    [{'index': 0, 'total_mb': ..., 'used_mb': ..., 'free_mb': ...}, ...]
-    Returns [] if nvidia-smi isn't available (e.g. CPU-only worker)."""
+    """Per-GPU memory stats via nvidia-smi, in MB. [] if unavailable."""
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,memory.total,memory.used,memory.free",
@@ -291,10 +266,7 @@ def query_gpu_memory() -> List[dict]:
 
 
 class VramManager:
-    """Best-effort VRAM accounting used to decide how large a context window
-    a model can safely be loaded with, and to keep a safety headroom free so
-    llama.cpp's own transient allocations (or anything else briefly sharing
-    the GPU) don't tip things into an OOM."""
+    """Tracks free VRAM to size context windows and keep a safety headroom."""
 
     def __init__(self, config: dict):
         self.config = config
@@ -308,9 +280,6 @@ class VramManager:
         return []
 
     def totals(self) -> Dict[str, int]:
-        """{'total_bytes', 'free_bytes', 'used_bytes'} summed across the
-        GPU(s) this worker is configured to use. All zero if there's no
-        usable GPU / nvidia-smi is unavailable."""
         indices = set(self.relevant_gpu_indices())
         if not indices:
             return {"total_bytes": 0, "free_bytes": 0, "used_bytes": 0}
@@ -328,21 +297,16 @@ class VramManager:
         return int(self.totals()["total_bytes"] * frac)
 
     def usable_free_bytes(self) -> int:
-        """Currently-free VRAM minus the configured safety headroom."""
         totals = self.totals()
         return max(totals["free_bytes"] - self.headroom_bytes(), 0)
 
 
 # --------------------------------------------------------------------------- #
-# Step 3: install/build the CUDA-enabled llama.cpp backend (llama-cpp-python)
+# Step 3: install/build the CUDA-enabled llama.cpp backend
 # --------------------------------------------------------------------------- #
 
 
 def ensure_llama_cpp_backend():
-    """Install llama-cpp-python. Try a prebuilt CUDA wheel first (fast,
-    no compiler needed); if that fails, build from source with CUDA via
-    CMAKE_ARGS; if THAT fails, fall back to a CPU-only build so the worker
-    can still serve requests (slower, but functional)."""
     try:
         import llama_cpp  # noqa
         logger.info("llama-cpp-python already importable.")
@@ -389,20 +353,14 @@ ensure_llama_cpp_backend()
 from llama_cpp import Llama  # noqa: E402
 
 # --------------------------------------------------------------------------- #
-# Step 4: disk cache manager (LRU eviction to keep the model cache within
-# available disk space)
+# Step 4: disk cache manager (LRU eviction)
 # --------------------------------------------------------------------------- #
 
 
 class DiskCacheManager:
-    """Tracks which downloaded GGUF files live in the cache directory and
-    when each was last used, so we can evict the least-recently-used
-    model(s) whenever we're about to run low on disk space -- instead of
-    downloads failing outright with 'not enough free disk space'.
-
-    State is persisted to a small JSON file inside the cache directory so
-    LRU ordering survives a notebook restart.
-    """
+    """Tracks cached GGUF files and last-used time so the least-recently-used
+    model(s) can be evicted before disk fills up. Persists to a JSON file in
+    the cache dir so LRU order survives a restart."""
 
     def __init__(self, cache_dir: str, config: dict):
         self.cache_dir = cache_dir
@@ -411,8 +369,6 @@ class DiskCacheManager:
         self._lock = threading.Lock()
         self.entries: Dict[str, dict] = self._load_metadata()
         self._reconcile_with_disk()
-
-    # -- persistence ----------------------------------------------------- #
 
     def _load_metadata(self) -> Dict[str, dict]:
         if os.path.exists(self.metadata_path):
@@ -434,28 +390,20 @@ class DiskCacheManager:
             logger.warning("Could not persist cache metadata: %s", e)
 
     def _reconcile_with_disk(self) -> None:
-        """Drop metadata entries whose backing file no longer exists (e.g.
-        someone manually cleared the cache dir), so eviction decisions are
-        never made against stale/missing entries."""
+        """Drop entries whose backing file (following symlinks) no longer exists."""
         with self._lock:
-            missing = [k for k, v in self.entries.items() if not os.path.exists(v.get("path", ""))]
+            missing = [k for k, v in self.entries.items()
+                       if not os.path.exists(v.get("path", ""))]
             for k in missing:
                 del self.entries[k]
             if missing:
                 self._save_metadata()
 
-    # -- disk stats -------------------------------------------------------- #
-
     @staticmethod
     def free_space_bytes(path: str) -> int:
-        usage = shutil.disk_usage(path)
-        return usage.free
-
-    # -- bookkeeping --------------------------------------------------------- #
+        return shutil.disk_usage(path).free
 
     def touch(self, cache_key: str, local_path: str, size_bytes: int) -> None:
-        """Record/refresh that `cache_key` was just used, so it's the least
-        likely candidate for eviction right now."""
         with self._lock:
             self.entries[cache_key] = {
                 "path": local_path,
@@ -471,29 +419,32 @@ class DiskCacheManager:
         if entry is None:
             return
         path = entry["path"]
+        # BUG FIX: `path` may be a symlink into the HF blob cache (this is
+        # now the normal case, see resolve_local_path). Deleting only the
+        # symlink would leave the real multi-GB blob on disk forever, which
+        # was the root cause of disk usage silently outrunning what our own
+        # eviction accounting believed it had freed. Resolve and remove the
+        # real target too.
+        real_path = os.path.realpath(path) if os.path.islink(path) else path
+        for p in {path, real_path}:
+            try:
+                if os.path.exists(p) or os.path.islink(p):
+                    os.remove(p)
+            except Exception as e:
+                logger.warning("Failed to remove cached file '%s' for '%s': %s", p, cache_key, e)
+        logger.info("Evicted cached model '%s' (%.2f GB) to free disk space.",
+                    cache_key, entry.get("size_bytes", 0) / (1024 ** 3))
+        parent = os.path.dirname(path)
         try:
-            if os.path.exists(path):
-                os.remove(path)
-                logger.info("Evicted cached model '%s' (%s, %.2f GB) to free disk space.",
-                            cache_key, path, entry.get("size_bytes", 0) / (1024 ** 3))
-            # Clean up the now-possibly-empty per-repo directory.
-            parent = os.path.dirname(path)
             if os.path.isdir(parent) and not os.listdir(parent):
                 os.rmdir(parent)
-        except Exception as e:
-            logger.warning("Failed to remove cached file for '%s' (%s): %s", cache_key, path, e)
+        except Exception:
+            pass
 
     def ensure_space_for(self, required_bytes: int, protect_paths: Optional[Set[str]] = None) -> bool:
-        """Evict least-recently-used cached models (oldest 'last_used'
-        first) until at least `required_bytes` plus the configured safety
-        margin is free, skipping anything in `protect_paths` (e.g. whatever
-        model is currently loaded in memory -- deleting that out from under
-        an active model would be bad).
-
-        Returns True if the target was met (or exceeded); False if there
-        genuinely isn't enough disk space even after evicting everything
-        evictable.
-        """
+        """Evicts LRU cached models until `required_bytes` + safety margin is
+        free, skipping anything in `protect_paths`. Returns False if that
+        target still can't be met after evicting everything evictable."""
         protect_paths = protect_paths or set()
         disk_cfg = self.config.get("disk_management", {})
         margin_bytes = int(disk_cfg.get("safety_margin_gb", 2) * (1024 ** 3))
@@ -503,8 +454,7 @@ class DiskCacheManager:
         if free >= target:
             return True
 
-        logger.info("Low disk space: %.2f GB free, need %.2f GB (including safety margin). "
-                    "Evicting least-recently-used cached models...",
+        logger.info("Low disk space: %.2f GB free, need %.2f GB. Evicting LRU cached models...",
                     free / (1024 ** 3), target / (1024 ** 3))
 
         with self._lock:
@@ -521,9 +471,9 @@ class DiskCacheManager:
 
         if free < target:
             logger.warning(
-                "Only %.2f GB free after evicting every evictable cached model "
-                "(%.2f GB was requested including margin). Proceeding only if the "
-                "raw file itself still fits.", free / (1024 ** 3), target / (1024 ** 3))
+                "Only %.2f GB free after evicting everything evictable (%.2f GB requested "
+                "including margin). Proceeding only if the raw file itself still fits.",
+                free / (1024 ** 3), target / (1024 ** 3))
             return free >= required_bytes
         return True
 
@@ -534,11 +484,9 @@ class DiskCacheManager:
 
 
 def probe_gguf_hyperparams(model_path: str) -> Optional[dict]:
-    """Loads just the GGUF header + vocab (n_gpu_layers=0, vocab_only=True,
-    minimal n_ctx) to read architecture hyperparameters needed for a
-    KV-cache VRAM estimate, without putting any weights on the GPU. Cheap
-    and CPU-only. Returns None if the probe or metadata parsing fails --
-    callers must be able to fall back to a coarser estimate."""
+    """Reads GGUF header + vocab only (n_gpu_layers=0, vocab_only=True) to
+    get architecture hyperparameters for a KV-cache estimate, without
+    touching the GPU. Returns None if probing/parsing fails."""
     try:
         probe = Llama(model_path=model_path, vocab_only=True, n_ctx=8,
                        n_gpu_layers=0, verbose=False)
@@ -573,7 +521,7 @@ def probe_gguf_hyperparams(model_path: str) -> Optional[dict]:
 
         if not n_layer or not n_embd or not n_head:
             logger.info("GGUF header for %s didn't expose full hyperparameters "
-                        "(arch=%r); will use a coarser VRAM estimate.", model_path, arch)
+                        "(arch=%r); using a coarser VRAM estimate.", model_path, arch)
             return None
 
         return {
@@ -593,43 +541,35 @@ def probe_gguf_hyperparams(model_path: str) -> Optional[dict]:
 
 
 def estimate_kv_bytes_per_token(hyper: dict, kv_dtype_bytes: int = 2) -> int:
-    """Bytes of KV-cache VRAM consumed per token of context, summed across
-    all layers (K + V combined). Uses head_count_kv (not head_count) so
-    grouped-query-attention models (Llama-3, Mistral, Qwen2, etc.) aren't
-    overestimated. kv_dtype_bytes=2 assumes llama.cpp's default f16 KV
-    cache (a conservative-but-reasonable default; quantized KV would use
-    less)."""
+    """Bytes of KV-cache VRAM per token, summed across all layers (K + V).
+    Uses head_count_kv so GQA models (Llama-3, Mistral, Qwen2/3, etc.)
+    aren't overestimated. kv_dtype_bytes=2 assumes llama.cpp's default f16
+    KV cache."""
     n_layer = hyper["n_layer"]
     n_embd = hyper["n_embd"]
     n_head = hyper["n_head"]
     n_head_kv = hyper.get("n_head_kv") or n_head
     head_dim = n_embd / n_head
-    kv_embd = head_dim * n_head_kv  # per-layer K (or V) dimension
-    return int(n_layer * kv_embd * 2 * kv_dtype_bytes)  # *2 for K and V
+    kv_embd = head_dim * n_head_kv
+    return int(n_layer * kv_embd * 2 * kv_dtype_bytes)
 
 
 def resolve_desired_n_ctx(configured: Any, hyper: Optional[dict],
                            fallback_max: int = 32768) -> int:
-    """Turns the configured 'gpu.n_ctx' / per-model 'n_ctx' value into a
-    concrete integer context target. This is INFERENCE context sizing only
-    (how many tokens of KV-cache to allocate for generation) -- it has
-    nothing to do with training sequence length or batch size.
+    """Turns 'gpu.n_ctx' / per-model 'n_ctx' into a concrete integer target.
 
-    A configured value of "max" (the default) means: always aim for the
-    largest context window this specific model was itself trained with,
-    read straight from its own GGUF header (n_ctx_train) via `hyper`, so
-    every model gets to use as much context as it actually supports rather
-    than a fixed guess. If the header didn't expose a trained context
-    length (probe failed / unusual GGUF) and no explicit override was
-    configured, falls back to `fallback_max` as a generous default -- the
-    caller still sizes down further to fit VRAM. An explicit integer in
-    config is always honored as-is instead."""
+    "max" means: aim for the model's own trained context length (from its
+    GGUF header). It is then ALSO capped by vram_management.max_auto_n_ctx
+    (applied by the caller) -- auto-maximizing to a model's full native
+    window (which can be 1M+ tokens) is not something real hardware can
+    serve safely, regardless of what the raw VRAM-fit math says, so "max"
+    is bounded rather than unlimited. An explicit integer in config is
+    always honored as-is."""
     if isinstance(configured, str) and configured.strip().lower() == "max":
         if hyper and hyper.get("n_ctx_train"):
             return int(hyper["n_ctx_train"])
-        logger.info("Could not read the model's trained max context length from its "
-                    "GGUF header; falling back to n_ctx=%d as the target before VRAM sizing.",
-                    fallback_max)
+        logger.info("Could not read the model's trained max context from its GGUF header; "
+                    "falling back to n_ctx=%d before VRAM sizing.", fallback_max)
         return fallback_max
     return int(configured)
 
@@ -637,18 +577,10 @@ def resolve_desired_n_ctx(configured: Any, hyper: Optional[dict],
 def compute_dynamic_n_ctx(model_path: str, desired_n_ctx: int, n_gpu_layers: int,
                            n_batch: int, vram: VramManager, config: dict,
                            hyper: Optional[dict] = None) -> int:
-    """Figures out the largest context size (up to `desired_n_ctx`, and
-    capped at the model's own trained max context if known) that should fit
-    in currently-free VRAM while preserving the configured headroom
-    fraction. This budgets INFERENCE-time VRAM only -- model weights (or
-    the fraction of them offloaded to GPU) plus KV-cache -- never gradients
-    or optimizer state, since this worker only ever runs forward-pass
-    generation. Falls back to `desired_n_ctx` unchanged if there's no GPU in
-    play (nothing to size against).
-
-    `hyper` can be passed in if the GGUF header was already probed by the
-    caller (e.g. to resolve "max" via resolve_desired_n_ctx), to avoid
-    probing the same file twice; otherwise it's probed here."""
+    """Largest context (up to desired_n_ctx) that fits currently-free VRAM
+    while preserving the configured headroom. Budgets inference-only VRAM:
+    model weights (or the offloaded fraction) + KV-cache + a compute-buffer
+    estimate. Falls back to desired_n_ctx unchanged if there's no GPU."""
     if not vram.relevant_gpu_indices():
         return desired_n_ctx
 
@@ -667,22 +599,36 @@ def compute_dynamic_n_ctx(model_path: str, desired_n_ctx: int, n_gpu_layers: int
         kv_per_token = estimate_kv_bytes_per_token(hyper)
         n_ctx_cap = hyper.get("n_ctx_train") or desired_n_ctx
     else:
-        # No header info -- assume all weights land on GPU and fall back to
-        # a coarse, deliberately generous per-token KV estimate so we don't
-        # undershoot and OOM anyway.
         weight_bytes = file_size
         kv_per_token = 128 * 1024
         n_ctx_cap = desired_n_ctx
 
-    compute_overhead = max(512 * 1024 ** 2, n_batch * 1024 * 1024)
-    available_for_kv = usable_free - weight_bytes - compute_overhead
+    # BUG FIX: the old flat overhead (a fixed few hundred MB, independent of
+    # context size) badly underestimated llama.cpp's compute/scratch
+    # buffers (attention scratch, batch buffers, etc.), which DO grow with
+    # n_ctx. That let this function "approve" a 215k-token context that fit
+    # the naive weights+KV math but not the real allocation, crashing the
+    # notebook. Add a per-token compute term on top of the flat batch
+    # overhead so large contexts are sized more conservatively.
+    flat_overhead = max(512 * 1024 ** 2, n_batch * 1024 * 1024)
+    per_token_compute_overhead = 2 * 1024  # ~2KB/token, conservative estimate
+    available_for_kv = usable_free - weight_bytes - flat_overhead
 
     if available_for_kv <= 0:
         max_ctx_by_vram = 0
     else:
-        max_ctx_by_vram = int(available_for_kv // max(kv_per_token, 1))
+        max_ctx_by_vram = int(available_for_kv // max(kv_per_token + per_token_compute_overhead, 1))
 
     final_ctx = min(desired_n_ctx, n_ctx_cap or desired_n_ctx)
+
+    # BUG FIX: apply the configured hard ceiling for auto-"max" sizing.
+    # Fixing the VRAM math alone isn't enough -- host RAM, load time, and
+    # per-request latency all scale with n_ctx too, so "max" should never
+    # try to reach a model's full native window unattended.
+    max_auto_n_ctx = vram_cfg.get("max_auto_n_ctx")
+    if max_auto_n_ctx:
+        final_ctx = min(final_ctx, int(max_auto_n_ctx))
+
     if max_ctx_by_vram > 0:
         final_ctx = min(final_ctx, max_ctx_by_vram)
     else:
@@ -691,7 +637,7 @@ def compute_dynamic_n_ctx(model_path: str, desired_n_ctx: int, n_gpu_layers: int
 
     if final_ctx < desired_n_ctx:
         logger.info(
-            "Sizing context for VRAM headroom: requested n_ctx=%d, using n_ctx=%d "
+            "Sizing context for VRAM/safety headroom: requested n_ctx=%d, using n_ctx=%d "
             "(usable free VRAM=%.2f GB, est. weight VRAM=%.2f GB, est. KV/token=%d bytes).",
             desired_n_ctx, final_ctx, usable_free / (1024 ** 3),
             weight_bytes / (1024 ** 3), kv_per_token)
@@ -712,14 +658,12 @@ class ModelManager:
         self.llm: Optional[Llama] = None
         self.disk_cache = DiskCacheManager(self.cache_dir, config)
         self.vram = VramManager(config)
-        self._load_lock = threading.Lock()  # serialize concurrent ensure_loaded calls
+        self._load_lock = threading.Lock()
 
     def registry(self) -> Dict[str, Any]:
         return self.config.get("models", {})
 
     def _protected_paths(self) -> Set[str]:
-        """Files that must never be evicted right now because they back the
-        model currently loaded in memory."""
         return {self.current_local_path} if self.current_local_path else set()
 
     def _remote_file_size(self, repo: str, filename: str, token: Optional[str]) -> Optional[int]:
@@ -734,69 +678,62 @@ class ModelManager:
     def resolve_local_path(self, alias: str) -> str:
         entry = self.registry().get(alias)
         if entry is None:
-            raise ValueError(f"Model alias '{alias}' is not present in the model registry. "
+            raise ValueError(f"Model alias '{alias}' is not in the model registry. "
                               f"Add it to inference_server_config.json under 'models'.")
-        # Local file path support -- not subject to disk-cache eviction,
-        # since we didn't download it and don't own its lifecycle.
         if "path" in entry:
             path = entry["path"]
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Configured local model path does not exist: {path}")
             return path
 
-        # Hugging Face repo/file support, with on-disk caching + LRU eviction.
         repo = entry["repo"]
         filename = entry["file"]
         cache_key = f"{repo}/{filename}"
-        local_target = os.path.join(self.cache_dir, repo.replace("/", "__"), filename)
+        token = self.config.get("huggingface_token") or None
 
-        if os.path.exists(local_target):
-            logger.info("Using cached model file for '%s' at %s", alias, local_target)
-            size = os.path.getsize(local_target)
-            self.disk_cache.touch(cache_key, local_target, size)
-            return local_target
-
+        # BUG FIX: no more `local_dir=...`. Using cache_dir here lets
+        # huggingface_hub manage a single, symlinked copy of each blob
+        # (inside HF_HUB_CACHE, which we've pointed at our own cache_dir),
+        # instead of materializing a second full copy per model. This call
+        # is also cheap/idempotent when already cached -- it just verifies
+        # and returns the existing path without re-downloading -- so we no
+        # longer need to hand-roll an "already exists" check against a
+        # manually-computed local_dir path.
         dl_cfg = self.config.get("download", {})
         max_retries = dl_cfg.get("max_retries", 4)
         backoff = dl_cfg.get("retry_backoff_seconds", 5)
-        token = self.config.get("huggingface_token") or None
 
-        disk_cfg = self.config.get("disk_management", {})
-        if disk_cfg.get("enabled", True):
-            remote_size = self._remote_file_size(repo, filename, token)
-            if remote_size:
-                ok = self.disk_cache.ensure_space_for(remote_size, protect_paths=self._protected_paths())
-                if not ok:
-                    free_gb = self.disk_cache.free_space_bytes(self.cache_dir) / (1024 ** 3)
-                    raise RuntimeError(
-                        f"Not enough disk space to download '{alias}' "
-                        f"({remote_size / (1024 ** 3):.2f} GB needed, only "
-                        f"{free_gb:.2f} GB free even after evicting all evictable "
-                        f"cached models).")
-            else:
-                logger.info("Proceeding without a pre-download space check for '%s' "
-                            "(remote size unknown).", alias)
+        already_cached = cache_key in self.disk_cache.entries and \
+            os.path.exists(self.disk_cache.entries[cache_key]["path"])
+        if not already_cached:
+            disk_cfg = self.config.get("disk_management", {})
+            if disk_cfg.get("enabled", True):
+                remote_size = self._remote_file_size(repo, filename, token)
+                if remote_size:
+                    ok = self.disk_cache.ensure_space_for(remote_size, protect_paths=self._protected_paths())
+                    if not ok:
+                        free_gb = self.disk_cache.free_space_bytes(self.cache_dir) / (1024 ** 3)
+                        raise RuntimeError(
+                            f"Not enough disk space to download '{alias}' "
+                            f"({remote_size / (1024 ** 3):.2f} GB needed, only "
+                            f"{free_gb:.2f} GB free even after evicting all evictable cached models).")
+                else:
+                    logger.info("Proceeding without a pre-download space check for '%s' "
+                                "(remote size unknown).", alias)
 
         last_err = None
         for attempt in range(1, max_retries + 1):
             try:
-                logger.info("Downloading '%s' from %s (attempt %d/%d)...",
-                            filename, repo, attempt, max_retries)
-                path = hf_hub_download(
-                    repo_id=repo,
-                    filename=filename,
-                    local_dir=os.path.join(self.cache_dir, repo.replace("/", "__")),
-                    token=token,
-                )
-                logger.info("Downloaded model to %s", path)
+                logger.info("Resolving '%s' from %s (attempt %d/%d)...", filename, repo, attempt, max_retries)
+                path = hf_hub_download(repo_id=repo, filename=filename, cache_dir=self.cache_dir, token=token)
+                logger.info("Model resolved at %s", path)
                 size = os.path.getsize(path)
                 self.disk_cache.touch(cache_key, path, size)
                 return path
             except Exception as e:
                 last_err = e
                 logger.warning("Download attempt %d failed: %s", attempt, e)
-                # If a download failed partway through disk exhaustion, try
-                # freeing more room before the next attempt too.
+                disk_cfg = self.config.get("disk_management", {})
                 if disk_cfg.get("enabled", True):
                     remote_size = self._remote_file_size(repo, filename, token)
                     if remote_size:
@@ -818,9 +755,7 @@ class ModelManager:
                     torch.cuda.empty_cache()
             except Exception:
                 pass
-            # Give the driver a brief moment to actually reclaim VRAM before
-            # anything queries free memory to size the next model's context.
-            time.sleep(0.5)
+            time.sleep(0.5)  # let the driver actually reclaim VRAM
 
     def _build_load_kwargs(self, alias: str, entry: dict, n_ctx: int) -> dict:
         gpu_cfg = self.config.get("gpu", {})
@@ -844,8 +779,7 @@ class ModelManager:
             except Exception as e:
                 if is_cuda_oom_error(e):
                     raise
-                logger.warning("Dual-GPU split failed/did not help (%s); "
-                                "falling back to single-GPU/CPU load.", e)
+                logger.warning("Dual-GPU split failed/did not help (%s); falling back.", e)
         return Llama(**kwargs)
 
     def ensure_loaded(self, alias: str) -> Llama:
@@ -853,19 +787,13 @@ class ModelManager:
             if self.current_alias == alias and self.llm is not None:
                 return self.llm
 
-            # Switching models (or first load): release whatever's currently
-            # loaded FIRST so its VRAM is freed and counted as available
-            # before we size the incoming model's context window. This is
-            # what lets a second, larger model reclaim VRAM a first model
-            # was occupying instead of trying (and failing) to fit both at
-            # once -- only one model is ever kept resident at a time.
             if self.llm is not None:
                 logger.info("Switching from '%s' to '%s' -- unloading current model first.",
                             self.current_alias, alias)
                 self.unload()
 
             model_path = self.resolve_local_path(alias)
-            self.current_local_path = model_path  # protects from disk eviction while loading/in-use
+            self.current_local_path = model_path
 
             entry = self.registry().get(alias, {})
             gpu_cfg = self.config.get("gpu", {})
@@ -873,27 +801,18 @@ class ModelManager:
             n_gpu_layers = entry.get("n_gpu_layers", gpu_cfg.get("n_gpu_layers", -1)) if GPU_COUNT > 0 else 0
             n_batch = entry.get("n_batch", gpu_cfg.get("n_batch", 512))
 
-            # Probe the GGUF header once (cheap, CPU-only, no GPU needed) so
-            # we know this model's own trained max context length -- used
-            # both to resolve "max" and, on GPU workers, to size the
-            # KV-cache. This is purely inference-time context sizing.
             hyper = probe_gguf_hyperparams(model_path)
             desired_n_ctx = resolve_desired_n_ctx(configured_n_ctx, hyper)
             logger.info(
-                "Context resolution for '%s': configured gpu/model n_ctx=%r, "
-                "GGUF header n_ctx_train=%s, resolved desired_n_ctx=%d (before any "
-                "VRAM-based shrinking below).",
+                "Context resolution for '%s': configured n_ctx=%r, GGUF n_ctx_train=%s, "
+                "resolved desired_n_ctx=%d (before VRAM/safety shrinking).",
                 alias, configured_n_ctx,
-                hyper.get("n_ctx_train") if hyper else "unknown (header probe failed)",
-                desired_n_ctx)
+                hyper.get("n_ctx_train") if hyper else "unknown", desired_n_ctx)
 
             n_ctx = desired_n_ctx
             if GPU_COUNT > 0:
                 n_ctx = compute_dynamic_n_ctx(model_path, desired_n_ctx, n_gpu_layers,
                                                n_batch, self.vram, self.config, hyper=hyper)
-            # CPU-only workers have nothing to size against, so they always
-            # get the model's full trained max context (or the configured
-            # override) unchanged.
 
             attempt_dual = GPU_COUNT >= 2 and gpu_cfg.get("attempt_dual_gpu_split", True)
             vram_cfg = self.config.get("vram_management", {})
@@ -919,9 +838,8 @@ class ModelManager:
                         self.current_local_path = None
                         raise
                     new_ctx = max(min_ctx, int(n_ctx * shrink_factor))
-                    logger.warning(
-                        "CUDA OOM while loading '%s' at n_ctx=%d; retrying with n_ctx=%d "
-                        "(attempt %d/%d).", alias, n_ctx, new_ctx, attempts, max_retries)
+                    logger.warning("CUDA OOM loading '%s' at n_ctx=%d; retrying with n_ctx=%d (%d/%d).",
+                                    alias, n_ctx, new_ctx, attempts, max_retries)
                     n_ctx = new_ctx
                     try:
                         import torch
@@ -936,11 +854,8 @@ MODELS = ModelManager(CONFIG)
 
 
 async def disk_monitor_loop():
-    """Periodically checks free disk space independent of any download in
-    progress, and evicts least-recently-used cached models if free space
-    drops below the configured minimum. This catches disk pressure from
-    causes other than 'about to download a model' (HF hub temp files,
-    logs, other notebook output, etc.)."""
+    """Periodically evicts LRU cached models if free space drops below the
+    configured minimum, independent of any in-progress download."""
     disk_cfg = CONFIG.get("disk_management", {})
     if not disk_cfg.get("enabled", True):
         return
@@ -951,12 +866,9 @@ async def disk_monitor_loop():
         try:
             free = MODELS.disk_cache.free_space_bytes(MODELS.cache_dir)
             if free < min_free_bytes:
-                logger.info(
-                    "Disk monitor: %.2f GB free is below the configured %.2f GB minimum; "
-                    "evicting least-recently-used cached models.",
-                    free / (1024 ** 3), min_free_bytes / (1024 ** 3))
-                MODELS.disk_cache.ensure_space_for(
-                    min_free_bytes, protect_paths=MODELS._protected_paths())
+                logger.info("Disk monitor: %.2f GB free < %.2f GB minimum; evicting LRU cached models.",
+                            free / (1024 ** 3), min_free_bytes / (1024 ** 3))
+                MODELS.disk_cache.ensure_space_for(min_free_bytes, protect_paths=MODELS._protected_paths())
         except Exception as e:
             logger.warning("Disk monitor loop error: %s", e)
 
@@ -966,8 +878,6 @@ async def disk_monitor_loop():
 
 
 def build_chat_prompt_messages(messages: list) -> list:
-    # llama-cpp-python's create_chat_completion accepts OpenAI-style message
-    # dicts directly, so we pass them through mostly as-is.
     return [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages]
 
 
@@ -1004,8 +914,7 @@ def recover_from_oom(model_alias: str, e: Exception) -> None:
 
 
 def run_inference(payload: dict) -> dict:
-    """Non-streaming path: runs synchronously (blocking) -- called from a
-    worker thread via run_in_executor. Returns the full completion at once."""
+    """Non-streaming path: blocking, called via run_in_executor."""
     model_alias = payload["model"]
     gen_kwargs = build_gen_kwargs(payload)
 
@@ -1029,13 +938,7 @@ def run_inference(payload: dict) -> dict:
             finish_reason = choice.get("finish_reason", "stop")
 
         usage = out.get("usage", {})
-        return {
-            "result": {
-                "text": text,
-                "finish_reason": finish_reason,
-                "usage": usage,
-            }
-        }
+        return {"result": {"text": text, "finish_reason": finish_reason, "usage": usage}}
     except RuntimeError as e:
         if is_cuda_oom_error(e):
             recover_from_oom(model_alias, e)
@@ -1048,17 +951,11 @@ def run_inference(payload: dict) -> dict:
 
 
 def run_inference_streaming(payload: dict, on_token):
-    """True token-by-token streaming path. Runs synchronously (blocking) in
-    a background thread; calls on_token(delta_text, finish_reason) for every
-    token/chunk llama.cpp produces, as it produces it. Raises on failure so
-    the caller can distinguish a clean finish from an error.
-
-    llama-cpp-python's stream=True mode already yields OpenAI-shaped chunk
-    dicts, which is why the mapping below is so direct.
-    """
+    """Token-by-token streaming path (blocking; run in a background thread).
+    Calls on_token(delta_text, finish_reason) as tokens are produced."""
     model_alias = payload["model"]
     gen_kwargs = build_gen_kwargs(payload)
-    llm = MODELS.ensure_loaded(model_alias)  # let model-load errors propagate
+    llm = MODELS.ensure_loaded(model_alias)
 
     if payload["kind"] == "chat":
         messages = build_chat_prompt_messages(payload["messages"])
@@ -1094,7 +991,7 @@ class ProxyClient:
             + config["transport"]["ws_path"]
         self.worker_id = config["worker_id"]
         self.secret = config["worker_shared_secret"]
-        self.seen_job_ids: set = set()  # de-dupe protection across retries
+        self.seen_job_ids: set = set()
         self.ws_failures = 0
         self.loop = asyncio.get_event_loop()
 
@@ -1105,10 +1002,8 @@ class ProxyClient:
         return {"worker_id": self.worker_id, "timestamp": ts, "signature": sig}
 
     def _check_and_mark_duplicate(self, job_id: str) -> bool:
-        """Returns True if this job_id was already processed (duplicate
-        delivery -- e.g. a redelivery after a dropped ack). Safe to ignore."""
         if job_id in self.seen_job_ids:
-            logger.info("Duplicate delivery of job %s ignored (already processed).", job_id)
+            logger.info("Duplicate delivery of job %s ignored.", job_id)
             return True
         self.seen_job_ids.add(job_id)
         if len(self.seen_job_ids) > 10000:
@@ -1122,9 +1017,8 @@ class ProxyClient:
         return {"job_id": job_id, **result}
 
     async def process_stream_job(self, ws, job_id: str, payload: dict) -> None:
-        """Runs generation in a background thread, forwarding each token to
-        the proxy as a 'stream_chunk' WS message the instant it's produced,
-        then closes out with 'stream_done' (or 'error' on failure)."""
+        """Streams tokens to the proxy as they're produced, then sends
+        stream_done (or error) at the end."""
         if self._check_and_mark_duplicate(job_id):
             await ws.send(json.dumps({
                 "type": "stream_done", "job_id": job_id, "result": {"duplicate": True},
@@ -1181,12 +1075,7 @@ class ProxyClient:
                     "delta": item.get("delta", ""), "finish_reason": item.get("finish_reason"),
                 }))
         except Exception as e:
-            # Most likely the WS connection itself dropped mid-stream. Not
-            # much we can do to notify the proxy at this point; the proxy's
-            # own disconnect handler / watchdog will fail/requeue this job.
             logger.warning("Lost connection while streaming job %s: %s", job_id, e)
-
-    # ---------------------- WebSocket transport ---------------------- #
 
     async def run_websocket_forever(self):
         t_cfg = self.config["transport"]
@@ -1215,9 +1104,6 @@ class ProxyClient:
                                 payload = msg["payload"]
                                 await ws.send(json.dumps({"type": "ack", "job_id": msg["job_id"]}))
                                 if payload.get("stream"):
-                                    # True token-by-token streaming: this
-                                    # call sends its own stream_chunk/
-                                    # stream_done/error messages as it goes.
                                     await self.process_stream_job(ws, msg["job_id"], payload)
                                 else:
                                     result = await self.process_job(msg["job_id"], payload)
@@ -1236,8 +1122,8 @@ class ProxyClient:
                 logger.warning("WebSocket connection failed/dropped (%s). Failure count=%d",
                                 e, self.ws_failures)
                 if self.ws_failures >= t_cfg["ws_failure_threshold_before_poll_fallback"]:
-                    logger.info("Too many WS failures, temporarily switching to long-poll fallback.")
-                    return  # let the caller switch transport
+                    logger.info("Too many WS failures, switching to long-poll fallback.")
+                    return
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
 
@@ -1254,13 +1140,10 @@ class ProxyClient:
             except Exception:
                 return
 
-    # ---------------------- Long-poll transport ---------------------- #
-
     async def run_long_poll_forever(self, stop_after_seconds: float):
-        """Runs the long-poll loop for a while, then returns so the caller
-        can periodically retry upgrading back to WebSocket."""
+        """Runs long-poll for a while, then returns so the caller can retry
+        upgrading back to WebSocket."""
         t_cfg = self.config["transport"]
-        # Register so the proxy knows we exist even before the first poll returns.
         try:
             requests.post(f"{self.proxy_url}/worker/register", json={
                 "models": self.config.get("models", {}), **self._sign()
@@ -1272,8 +1155,6 @@ class ProxyClient:
         while time.time() < end_time:
             try:
                 params = {**self._sign(), "worker_id": self.worker_id}
-                # requests is sync; run it off the event loop so heartbeats/etc
-                # elsewhere (none currently) aren't blocked longer than needed.
                 resp = await self.loop.run_in_executor(
                     None,
                     lambda: requests.get(f"{self.proxy_url}/worker/poll", params=params,
@@ -1286,7 +1167,6 @@ class ProxyClient:
                 data = resp.json()
                 job = data.get("job")
                 if job is None:
-                    # No work right now -- send a lightweight heartbeat and loop.
                     await self._poll_heartbeat()
                     continue
                 result = await self.process_job(job["job_id"], job["payload"])
@@ -1313,13 +1193,8 @@ class ProxyClient:
         except Exception:
             pass
 
-    # ---------------------- Shutdown ---------------------- #
-
     async def deregister(self):
-        """Best-effort 'I'm going away' signal so the proxy stops treating
-        us as online immediately, instead of waiting on the WS close event
-        (WS transport) or the offline-after-seconds grace window (long-poll
-        transport). Safe to call even if we're not currently connected."""
+        """Tells the proxy we're going away so it stops waiting on us."""
         try:
             await self.loop.run_in_executor(
                 None,
@@ -1330,11 +1205,9 @@ class ProxyClient:
         except Exception as e:
             logger.warning("Deregistration call failed (proxy may already consider us offline): %s", e)
 
-    # ---------------------- Top-level orchestration ---------------------- #
-
     async def run_forever(self):
-        """WebSocket-first with automatic long-poll fallback, and automatic
-        re-attempts to upgrade back to WebSocket over time."""
+        """WebSocket-first with automatic long-poll fallback and periodic
+        re-attempts to upgrade back to WebSocket."""
         prefer_ws = self.config["transport"].get("prefer_websocket", True)
         while True:
             if prefer_ws:
@@ -1342,7 +1215,7 @@ class ProxyClient:
                     await self.run_websocket_forever()
                 except Exception as e:
                     logger.error("WebSocket loop crashed: %s", e)
-                logger.info("Falling back to long-polling for a while before retrying WebSocket...")
+                logger.info("Falling back to long-polling before retrying WebSocket...")
             await self.run_long_poll_forever(stop_after_seconds=120)
             logger.info("Attempting to upgrade back to WebSocket transport...")
 
