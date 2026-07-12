@@ -56,15 +56,11 @@ from typing import Any, Dict, List, Optional, Set
 # --------------------------------------------------------------------------- #
 _DEFAULT_MODEL_CACHE_DIR = "/tmp/gguf_models"
 os.environ.setdefault("HF_HOME", os.path.join(_DEFAULT_MODEL_CACHE_DIR, ".hf_cache"))
-os.environ.setdefault(
-    "HF_HUB_CACHE", os.path.join(_DEFAULT_MODEL_CACHE_DIR, ".hf_cache", "hub")
-)
+os.environ.setdefault("HF_HUB_CACHE", os.path.join(_DEFAULT_MODEL_CACHE_DIR, ".hf_cache", "hub"))
 os.makedirs(os.environ["HF_HUB_CACHE"], exist_ok=True)
 
 
-def _pip_install(
-    *packages: str, extra_index: Optional[str] = None, env: Optional[dict] = None
-) -> None:
+def _pip_install(*packages: str, extra_index: Optional[str] = None, env: Optional[dict] = None) -> None:
     cmd = [sys.executable, "-m", "pip", "install", "-q", "--upgrade", *packages]
     if extra_index:
         cmd += ["--extra-index-url", extra_index]
@@ -89,11 +85,7 @@ ensure_base_dependencies()
 
 import requests  # noqa: E402
 import websockets  # noqa: E402
-from huggingface_hub import (
-    hf_hub_download,
-    hf_hub_url,
-    get_hf_file_metadata,
-)  # noqa: E402
+from huggingface_hub import hf_hub_download, hf_hub_url, get_hf_file_metadata  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Step 1: config load / generate
@@ -256,15 +248,12 @@ DEFAULT_CONFIG = {
     "logging": {"level": "INFO", "file": "worker.log"},
 }
 
-
 def load_or_create_config(path: str, defaults: dict) -> dict:
     abs_path = os.path.abspath(path)
     if not os.path.exists(path):
         with open(path, "w") as f:
             json.dump(defaults, f, indent=2)
-        print(
-            f"[worker] No config found at '{abs_path}'. Created a default config there."
-        )
+        print(f"[worker] No config found at '{abs_path}'. Created a default config there.")
         return json.loads(json.dumps(defaults))
     with open(path, "r") as f:
         cfg = json.load(f)
@@ -274,11 +263,9 @@ def load_or_create_config(path: str, defaults: dict) -> dict:
         if isinstance(v, dict) and isinstance(cfg.get(k), dict):
             merged[k] = {**v, **cfg[k]}
     mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
-    print(
-        f"[worker] Loaded existing config from '{abs_path}' (last modified {mtime}). "
-        f"An existing config is never auto-overwritten with new defaults -- delete/replace "
-        f"it (or edit it directly) to pick up new script defaults."
-    )
+    print(f"[worker] Loaded existing config from '{abs_path}' (last modified {mtime}). "
+          f"An existing config is never auto-overwritten with new defaults -- delete/replace "
+          f"it (or edit it directly) to pick up new script defaults.")
     return merged
 
 
@@ -291,19 +278,13 @@ if CONFIG["model_cache_dir"] != _DEFAULT_MODEL_CACHE_DIR:
     os.makedirs(_hf_cache, exist_ok=True)
     os.environ["HF_HUB_CACHE"] = _hf_cache
     import huggingface_hub.constants as _hf_constants
-
     _hf_constants.HF_HUB_CACHE = _hf_cache
     _hf_constants.HUGGINGFACE_HUB_CACHE = _hf_cache
 
 logging.basicConfig(
-    level=getattr(
-        logging, CONFIG["logging"].get("level", "INFO").upper(), logging.INFO
-    ),
+    level=getattr(logging, CONFIG["logging"].get("level", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(CONFIG["logging"].get("file", "worker.log")),
-    ],
+    handlers=[logging.StreamHandler(), logging.FileHandler(CONFIG["logging"].get("file", "worker.log"))],
 )
 logger = logging.getLogger("worker")
 
@@ -316,9 +297,7 @@ os.makedirs(CONFIG["model_cache_dir"], exist_ok=True)
 
 def detect_gpus() -> int:
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10
-        )
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
         if out.returncode == 0:
             lines = [l for l in out.stdout.splitlines() if l.strip().startswith("GPU")]
             if lines:
@@ -327,7 +306,6 @@ def detect_gpus() -> int:
         pass
     try:
         import torch  # noqa
-
         if torch.cuda.is_available():
             return torch.cuda.device_count()
     except Exception:
@@ -343,15 +321,9 @@ def query_gpu_memory() -> List[dict]:
     """Per-GPU memory stats via nvidia-smi, in MB. [] if unavailable."""
     try:
         out = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,memory.total,memory.used,memory.free",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+            ["nvidia-smi", "--query-gpu=index,memory.total,memory.used,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10)
         if out.returncode != 0:
             return []
         stats = []
@@ -360,14 +332,12 @@ def query_gpu_memory() -> List[dict]:
             if len(parts) != 4:
                 continue
             idx, total, used, free = parts
-            stats.append(
-                {
-                    "index": int(idx),
-                    "total_mb": int(total),
-                    "used_mb": int(used),
-                    "free_mb": int(free),
-                }
-            )
+            stats.append({
+                "index": int(idx),
+                "total_mb": int(total),
+                "used_mb": int(used),
+                "free_mb": int(free),
+            })
         return stats
     except Exception as e:
         logger.debug("nvidia-smi memory query failed: %s", e)
@@ -396,9 +366,9 @@ class VramManager:
         total = used = free = 0
         for s in stats:
             if s["index"] in indices:
-                total += s["total_mb"] * (1024**2)
-                used += s["used_mb"] * (1024**2)
-                free += s["free_mb"] * (1024**2)
+                total += s["total_mb"] * (1024 ** 2)
+                used += s["used_mb"] * (1024 ** 2)
+                free += s["free_mb"] * (1024 ** 2)
         return {"total_bytes": total, "free_bytes": free, "used_bytes": used}
 
     def headroom_bytes(self) -> int:
@@ -415,57 +385,96 @@ class VramManager:
 # --------------------------------------------------------------------------- #
 
 
+def _llama_cpp_has_gpu_support() -> bool:
+    """Checks whether the currently-importable llama_cpp build actually has
+    CUDA offload compiled in, rather than trusting that installation
+    "succeeded". A plain `import llama_cpp` succeeding proves nothing about
+    GPU support -- a CPU-only build imports fine too."""
+    try:
+        import llama_cpp
+        return bool(llama_cpp.llama_supports_gpu_offload())
+    except Exception as e:
+        logger.debug("Could not query llama_cpp GPU offload support: %s", e)
+        return False
+
+
 def ensure_llama_cpp_backend():
+    """Installs llama-cpp-python with CUDA support when a GPU is present.
+
+    BUG FIX: the old version stopped as soon as `import llama_cpp` worked,
+    even for the "prebuilt CUDA wheel" attempt. But `pip install
+    llama-cpp-python --extra-index-url .../whl/cu121` doesn't guarantee a
+    CUDA wheel gets used -- if that index doesn't have a matching wheel for
+    whatever version pip resolves to, pip silently falls back to building
+    the plain PyPI sdist from source with default (CPU-only) cmake flags.
+    That's exactly what happened here: the log showed "Building wheel for
+    llama-cpp-python ... done" during the supposed "prebuilt wheel" step,
+    which should never need to build anything, and the code logged
+    "Installed prebuilt CUDA wheel" regardless, purely because import
+    succeeded. Net effect: every layer stayed on CPU (0 VRAM used, ~25GB
+    system RAM, ~300% CPU during inference) despite n_gpu_layers=-1 asking
+    to offload everything.
+
+    Every install path below is now followed by an explicit GPU-offload
+    check, and falls through to the next (more forceful) strategy if that
+    check fails -- import succeeding is no longer treated as success.
+    """
+    if GPU_COUNT == 0:
+        logger.info("No GPU detected; installing CPU-only llama-cpp-python.")
+        try:
+            import llama_cpp  # noqa
+            return
+        except ImportError:
+            pass
+        _pip_install("llama-cpp-python")
+        return
+
     try:
         import llama_cpp  # noqa
-
-        logger.info("llama-cpp-python already importable.")
-        return
+        if _llama_cpp_has_gpu_support():
+            logger.info("llama-cpp-python already importable with CUDA support.")
+            return
+        logger.warning("llama-cpp-python is importable but was NOT built with CUDA "
+                        "support even though %d GPU(s) are present; reinstalling.", GPU_COUNT)
     except ImportError:
         pass
 
     cfg = CONFIG["backend_build"]
 
-    if GPU_COUNT > 0 and cfg.get("prefer_prebuilt_wheel", True):
+    if cfg.get("prefer_prebuilt_wheel", True):
         try:
             logger.info("Attempting prebuilt CUDA wheel for llama-cpp-python...")
             _pip_install(
-                "llama-cpp-python",
+                "llama-cpp-python", "--force-reinstall", "--no-cache-dir",
                 extra_index="https://abetlen.github.io/llama-cpp-python/whl/cu121",
             )
-            import llama_cpp  # noqa
-
-            logger.info("Installed prebuilt CUDA llama-cpp-python wheel.")
-            return
+            if _llama_cpp_has_gpu_support():
+                logger.info("Installed prebuilt CUDA llama-cpp-python wheel (verified GPU offload).")
+                return
+            logger.warning("Prebuilt-wheel install completed but GPU offload is NOT available "
+                            "(it likely fell back to a CPU build from source); trying an "
+                            "explicit CUDA source build instead.")
         except Exception as e:
-            logger.warning(
-                "Prebuilt CUDA wheel install failed (%s); will try source build.", e
-            )
+            logger.warning("Prebuilt CUDA wheel install failed (%s); will try source build.", e)
 
-    if GPU_COUNT > 0:
-        try:
-            logger.info(
-                "Building llama-cpp-python from source with CUDA (%s)...",
-                cfg.get("cmake_cuda_args"),
-            )
-            _pip_install(
-                "llama-cpp-python",
-                env={
-                    "CMAKE_ARGS": cfg.get("cmake_cuda_args", "-DGGML_CUDA=on"),
-                    "FORCE_CMAKE": "1",
-                },
-            )
-            import llama_cpp  # noqa
-
-            logger.info("Built CUDA-enabled llama-cpp-python from source.")
+    try:
+        logger.info("Building llama-cpp-python from source with CUDA (%s)...",
+                    cfg.get("cmake_cuda_args"))
+        _pip_install(
+            "llama-cpp-python", "--force-reinstall", "--no-cache-dir",
+            env={"CMAKE_ARGS": cfg.get("cmake_cuda_args", "-DGGML_CUDA=on"),
+                 "FORCE_CMAKE": "1"},
+        )
+        if _llama_cpp_has_gpu_support():
+            logger.info("Built CUDA-enabled llama-cpp-python from source (verified GPU offload).")
             return
-        except Exception as e:
-            logger.warning(
-                "CUDA source build failed (%s); falling back to CPU build.", e
-            )
+        logger.error("CUDA source build completed but GPU offload is still NOT available. "
+                     "Falling back to CPU-only inference -- this will be slow and will NOT "
+                     "use VRAM. Check that the CUDA toolkit/driver matches this environment.")
+    except Exception as e:
+        logger.error("CUDA source build failed (%s). Falling back to CPU-only llama-cpp-python; "
+                     "inference will run on CPU only.", e)
 
-    logger.info("Installing CPU-only llama-cpp-python.")
-    _pip_install("llama-cpp-python")
     import llama_cpp  # noqa
 
 
@@ -496,10 +505,8 @@ class DiskCacheManager:
                 with open(self.metadata_path, "r") as f:
                     return json.load(f)
             except Exception:
-                logger.warning(
-                    "Could not read cache metadata at %s, starting fresh.",
-                    self.metadata_path,
-                )
+                logger.warning("Could not read cache metadata at %s, starting fresh.",
+                                self.metadata_path)
         return {}
 
     def _save_metadata(self) -> None:
@@ -514,11 +521,8 @@ class DiskCacheManager:
     def _reconcile_with_disk(self) -> None:
         """Drop entries whose backing file (following symlinks) no longer exists."""
         with self._lock:
-            missing = [
-                k
-                for k, v in self.entries.items()
-                if not os.path.exists(v.get("path", ""))
-            ]
+            missing = [k for k, v in self.entries.items()
+                       if not os.path.exists(v.get("path", ""))]
             for k in missing:
                 del self.entries[k]
             if missing:
@@ -556,14 +560,9 @@ class DiskCacheManager:
                 if os.path.exists(p) or os.path.islink(p):
                     os.remove(p)
             except Exception as e:
-                logger.warning(
-                    "Failed to remove cached file '%s' for '%s': %s", p, cache_key, e
-                )
-        logger.info(
-            "Evicted cached model '%s' (%.2f GB) to free disk space.",
-            cache_key,
-            entry.get("size_bytes", 0) / (1024**3),
-        )
+                logger.warning("Failed to remove cached file '%s' for '%s': %s", p, cache_key, e)
+        logger.info("Evicted cached model '%s' (%.2f GB) to free disk space.",
+                    cache_key, entry.get("size_bytes", 0) / (1024 ** 3))
         parent = os.path.dirname(path)
         try:
             if os.path.isdir(parent) and not os.listdir(parent):
@@ -571,34 +570,25 @@ class DiskCacheManager:
         except Exception:
             pass
 
-    def ensure_space_for(
-        self, required_bytes: int, protect_paths: Optional[Set[str]] = None
-    ) -> bool:
+    def ensure_space_for(self, required_bytes: int, protect_paths: Optional[Set[str]] = None) -> bool:
         """Evicts LRU cached models until `required_bytes` + safety margin is
         free, skipping anything in `protect_paths`. Returns False if that
         target still can't be met after evicting everything evictable."""
         protect_paths = protect_paths or set()
         disk_cfg = self.config.get("disk_management", {})
-        margin_bytes = int(disk_cfg.get("safety_margin_gb", 2) * (1024**3))
+        margin_bytes = int(disk_cfg.get("safety_margin_gb", 2) * (1024 ** 3))
         target = required_bytes + margin_bytes
 
         free = self.free_space_bytes(self.cache_dir)
         if free >= target:
             return True
 
-        logger.info(
-            "Low disk space: %.2f GB free, need %.2f GB. Evicting LRU cached models...",
-            free / (1024**3),
-            target / (1024**3),
-        )
+        logger.info("Low disk space: %.2f GB free, need %.2f GB. Evicting LRU cached models...",
+                    free / (1024 ** 3), target / (1024 ** 3))
 
         with self._lock:
             candidates = sorted(
-                (
-                    k
-                    for k, v in self.entries.items()
-                    if v.get("path") not in protect_paths
-                ),
+                (k for k, v in self.entries.items() if v.get("path") not in protect_paths),
                 key=lambda k: self.entries[k]["last_used"],
             )
 
@@ -612,9 +602,7 @@ class DiskCacheManager:
             logger.warning(
                 "Only %.2f GB free after evicting everything evictable (%.2f GB requested "
                 "including margin). Proceeding only if the raw file itself still fits.",
-                free / (1024**3),
-                target / (1024**3),
-            )
+                free / (1024 ** 3), target / (1024 ** 3))
             return free >= required_bytes
         return True
 
@@ -629,13 +617,8 @@ def probe_gguf_hyperparams(model_path: str) -> Optional[dict]:
     get architecture hyperparameters for a KV-cache estimate, without
     touching the GPU. Returns None if probing/parsing fails."""
     try:
-        probe = Llama(
-            model_path=model_path,
-            vocab_only=True,
-            n_ctx=8,
-            n_gpu_layers=0,
-            verbose=False,
-        )
+        probe = Llama(model_path=model_path, vocab_only=True, n_ctx=8,
+                       n_gpu_layers=0, verbose=True)
     except Exception as e:
         logger.warning("Could not probe GGUF header for %s: %s", model_path, e)
         return None
@@ -666,12 +649,8 @@ def probe_gguf_hyperparams(model_path: str) -> Optional[dict]:
                 pass
 
         if not n_layer or not n_embd or not n_head:
-            logger.info(
-                "GGUF header for %s didn't expose full hyperparameters "
-                "(arch=%r); using a coarser VRAM estimate.",
-                model_path,
-                arch,
-            )
+            logger.info("GGUF header for %s didn't expose full hyperparameters "
+                        "(arch=%r); using a coarser VRAM estimate.", model_path, arch)
             return None
 
         return {
@@ -704,9 +683,8 @@ def estimate_kv_bytes_per_token(hyper: dict, kv_dtype_bytes: int = 2) -> int:
     return int(n_layer * kv_embd * 2 * kv_dtype_bytes)
 
 
-def resolve_desired_n_ctx(
-    configured: Any, hyper: Optional[dict], fallback_max: int = 32768
-) -> int:
+def resolve_desired_n_ctx(configured: Any, hyper: Optional[dict],
+                           fallback_max: int = 32768) -> int:
     """Turns 'gpu.n_ctx' / per-model 'n_ctx' into a concrete integer target.
 
     "max" means: aim for the model's own trained context length (from its
@@ -719,24 +697,15 @@ def resolve_desired_n_ctx(
     if isinstance(configured, str) and configured.strip().lower() == "max":
         if hyper and hyper.get("n_ctx_train"):
             return int(hyper["n_ctx_train"])
-        logger.info(
-            "Could not read the model's trained max context from its GGUF header; "
-            "falling back to n_ctx=%d before VRAM sizing.",
-            fallback_max,
-        )
+        logger.info("Could not read the model's trained max context from its GGUF header; "
+                    "falling back to n_ctx=%d before VRAM sizing.", fallback_max)
         return fallback_max
     return int(configured)
 
 
-def compute_dynamic_n_ctx(
-    model_path: str,
-    desired_n_ctx: int,
-    n_gpu_layers: int,
-    n_batch: int,
-    vram: VramManager,
-    config: dict,
-    hyper: Optional[dict] = None,
-) -> int:
+def compute_dynamic_n_ctx(model_path: str, desired_n_ctx: int, n_gpu_layers: int,
+                           n_batch: int, vram: VramManager, config: dict,
+                           hyper: Optional[dict] = None) -> int:
     """Largest context (up to desired_n_ctx) that fits currently-free VRAM
     while preserving the configured headroom. Budgets inference-only VRAM:
     model weights (or the offloaded fraction) + KV-cache + a compute-buffer
@@ -755,9 +724,7 @@ def compute_dynamic_n_ctx(
     if hyper:
         n_layer = hyper["n_layer"]
         gpu_layers_used = n_layer if n_gpu_layers < 0 else min(n_gpu_layers, n_layer)
-        weight_bytes = (
-            int(file_size * (gpu_layers_used / n_layer)) if n_layer else file_size
-        )
+        weight_bytes = int(file_size * (gpu_layers_used / n_layer)) if n_layer else file_size
         kv_per_token = estimate_kv_bytes_per_token(hyper)
         n_ctx_cap = hyper.get("n_ctx_train") or desired_n_ctx
     else:
@@ -772,16 +739,14 @@ def compute_dynamic_n_ctx(
     # the naive weights+KV math but not the real allocation, crashing the
     # notebook. Add a per-token compute term on top of the flat batch
     # overhead so large contexts are sized more conservatively.
-    flat_overhead = max(512 * 1024**2, n_batch * 1024 * 1024)
+    flat_overhead = max(512 * 1024 ** 2, n_batch * 1024 * 1024)
     per_token_compute_overhead = 2 * 1024  # ~2KB/token, conservative estimate
     available_for_kv = usable_free - weight_bytes - flat_overhead
 
     if available_for_kv <= 0:
         max_ctx_by_vram = 0
     else:
-        max_ctx_by_vram = int(
-            available_for_kv // max(kv_per_token + per_token_compute_overhead, 1)
-        )
+        max_ctx_by_vram = int(available_for_kv // max(kv_per_token + per_token_compute_overhead, 1))
 
     final_ctx = min(desired_n_ctx, n_ctx_cap or desired_n_ctx)
 
@@ -803,12 +768,8 @@ def compute_dynamic_n_ctx(
         logger.info(
             "Sizing context for VRAM/safety headroom: requested n_ctx=%d, using n_ctx=%d "
             "(usable free VRAM=%.2f GB, est. weight VRAM=%.2f GB, est. KV/token=%d bytes).",
-            desired_n_ctx,
-            final_ctx,
-            usable_free / (1024**3),
-            weight_bytes / (1024**3),
-            kv_per_token,
-        )
+            desired_n_ctx, final_ctx, usable_free / (1024 ** 3),
+            weight_bytes / (1024 ** 3), kv_per_token)
     return final_ctx
 
 
@@ -834,32 +795,24 @@ class ModelManager:
     def _protected_paths(self) -> Set[str]:
         return {self.current_local_path} if self.current_local_path else set()
 
-    def _remote_file_size(
-        self, repo: str, filename: str, token: Optional[str]
-    ) -> Optional[int]:
+    def _remote_file_size(self, repo: str, filename: str, token: Optional[str]) -> Optional[int]:
         try:
             url = hf_hub_url(repo_id=repo, filename=filename)
             meta = get_hf_file_metadata(url, token=token)
             return getattr(meta, "size", None)
         except Exception as e:
-            logger.warning(
-                "Could not fetch remote size for %s/%s: %s", repo, filename, e
-            )
+            logger.warning("Could not fetch remote size for %s/%s: %s", repo, filename, e)
             return None
 
     def resolve_local_path(self, alias: str) -> str:
         entry = self.registry().get(alias)
         if entry is None:
-            raise ValueError(
-                f"Model alias '{alias}' is not in the model registry. "
-                f"Add it to inference_server_config.json under 'models'."
-            )
+            raise ValueError(f"Model alias '{alias}' is not in the model registry. "
+                              f"Add it to inference_server_config.json under 'models'.")
         if "path" in entry:
             path = entry["path"]
             if not os.path.exists(path):
-                raise FileNotFoundError(
-                    f"Configured local model path does not exist: {path}"
-                )
+                raise FileNotFoundError(f"Configured local model path does not exist: {path}")
             return path
 
         repo = entry["repo"]
@@ -879,49 +832,29 @@ class ModelManager:
         max_retries = dl_cfg.get("max_retries", 4)
         backoff = dl_cfg.get("retry_backoff_seconds", 5)
 
-        already_cached = cache_key in self.disk_cache.entries and os.path.exists(
-            self.disk_cache.entries[cache_key]["path"]
-        )
+        already_cached = cache_key in self.disk_cache.entries and \
+            os.path.exists(self.disk_cache.entries[cache_key]["path"])
         if not already_cached:
             disk_cfg = self.config.get("disk_management", {})
             if disk_cfg.get("enabled", True):
                 remote_size = self._remote_file_size(repo, filename, token)
                 if remote_size:
-                    ok = self.disk_cache.ensure_space_for(
-                        remote_size, protect_paths=self._protected_paths()
-                    )
+                    ok = self.disk_cache.ensure_space_for(remote_size, protect_paths=self._protected_paths())
                     if not ok:
-                        free_gb = self.disk_cache.free_space_bytes(self.cache_dir) / (
-                            1024**3
-                        )
+                        free_gb = self.disk_cache.free_space_bytes(self.cache_dir) / (1024 ** 3)
                         raise RuntimeError(
                             f"Not enough disk space to download '{alias}' "
                             f"({remote_size / (1024 ** 3):.2f} GB needed, only "
-                            f"{free_gb:.2f} GB free even after evicting all evictable cached models)."
-                        )
+                            f"{free_gb:.2f} GB free even after evicting all evictable cached models).")
                 else:
-                    logger.info(
-                        "Proceeding without a pre-download space check for '%s' "
-                        "(remote size unknown).",
-                        alias,
-                    )
+                    logger.info("Proceeding without a pre-download space check for '%s' "
+                                "(remote size unknown).", alias)
 
         last_err = None
         for attempt in range(1, max_retries + 1):
             try:
-                logger.info(
-                    "Resolving '%s' from %s (attempt %d/%d)...",
-                    filename,
-                    repo,
-                    attempt,
-                    max_retries,
-                )
-                path = hf_hub_download(
-                    repo_id=repo,
-                    filename=filename,
-                    cache_dir=self.cache_dir,
-                    token=token,
-                )
+                logger.info("Resolving '%s' from %s (attempt %d/%d)...", filename, repo, attempt, max_retries)
+                path = hf_hub_download(repo_id=repo, filename=filename, cache_dir=self.cache_dir, token=token)
                 logger.info("Model resolved at %s", path)
                 size = os.path.getsize(path)
                 self.disk_cache.touch(cache_key, path, size)
@@ -933,19 +866,13 @@ class ModelManager:
                 if disk_cfg.get("enabled", True):
                     remote_size = self._remote_file_size(repo, filename, token)
                     if remote_size:
-                        self.disk_cache.ensure_space_for(
-                            remote_size, protect_paths=self._protected_paths()
-                        )
+                        self.disk_cache.ensure_space_for(remote_size, protect_paths=self._protected_paths())
                 time.sleep(backoff * attempt)
-        raise RuntimeError(
-            f"Failed to download model '{alias}' after {max_retries} attempts: {last_err}"
-        )
+        raise RuntimeError(f"Failed to download model '{alias}' after {max_retries} attempts: {last_err}")
 
     def unload(self):
         if self.llm is not None:
-            logger.info(
-                "Unloading current model '%s' to free VRAM.", self.current_alias
-            )
+            logger.info("Unloading current model '%s' to free VRAM.", self.current_alias)
             del self.llm
             self.llm = None
             self.current_alias = None
@@ -953,7 +880,6 @@ class ModelManager:
             gc.collect()
             try:
                 import torch
-
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
@@ -962,15 +888,9 @@ class ModelManager:
 
     def _build_load_kwargs(self, alias: str, entry: dict, n_ctx: int) -> dict:
         gpu_cfg = self.config.get("gpu", {})
-        n_gpu_layers = (
-            entry.get("n_gpu_layers", gpu_cfg.get("n_gpu_layers", -1))
-            if GPU_COUNT > 0
-            else 0
-        )
+        n_gpu_layers = entry.get("n_gpu_layers", gpu_cfg.get("n_gpu_layers", -1)) if GPU_COUNT > 0 else 0
         n_batch = entry.get("n_batch", gpu_cfg.get("n_batch", 512))
-        n_threads = (
-            entry.get("n_threads", gpu_cfg.get("n_threads", 0)) or os.cpu_count() or 4
-        )
+        n_threads = entry.get("n_threads", gpu_cfg.get("n_threads", 0)) or os.cpu_count() or 4
         return dict(
             model_path=self.current_local_path,
             n_ctx=n_ctx,
@@ -988,9 +908,7 @@ class ModelManager:
             except Exception as e:
                 if is_cuda_oom_error(e):
                     raise
-                logger.warning(
-                    "Dual-GPU split failed/did not help (%s); falling back.", e
-                )
+                logger.warning("Dual-GPU split failed/did not help (%s); falling back.", e)
         return Llama(**kwargs)
 
     def ensure_loaded(self, alias: str) -> Llama:
@@ -999,11 +917,8 @@ class ModelManager:
                 return self.llm
 
             if self.llm is not None:
-                logger.info(
-                    "Switching from '%s' to '%s' -- unloading current model first.",
-                    self.current_alias,
-                    alias,
-                )
+                logger.info("Switching from '%s' to '%s' -- unloading current model first.",
+                            self.current_alias, alias)
                 self.unload()
 
             model_path = self.resolve_local_path(alias)
@@ -1012,11 +927,7 @@ class ModelManager:
             entry = self.registry().get(alias, {})
             gpu_cfg = self.config.get("gpu", {})
             configured_n_ctx = entry.get("n_ctx", gpu_cfg.get("n_ctx", "max"))
-            n_gpu_layers = (
-                entry.get("n_gpu_layers", gpu_cfg.get("n_gpu_layers", -1))
-                if GPU_COUNT > 0
-                else 0
-            )
+            n_gpu_layers = entry.get("n_gpu_layers", gpu_cfg.get("n_gpu_layers", -1)) if GPU_COUNT > 0 else 0
             n_batch = entry.get("n_batch", gpu_cfg.get("n_batch", 512))
 
             hyper = probe_gguf_hyperparams(model_path)
@@ -1024,27 +935,15 @@ class ModelManager:
             logger.info(
                 "Context resolution for '%s': configured n_ctx=%r, GGUF n_ctx_train=%s, "
                 "resolved desired_n_ctx=%d (before VRAM/safety shrinking).",
-                alias,
-                configured_n_ctx,
-                hyper.get("n_ctx_train") if hyper else "unknown",
-                desired_n_ctx,
-            )
+                alias, configured_n_ctx,
+                hyper.get("n_ctx_train") if hyper else "unknown", desired_n_ctx)
 
             n_ctx = desired_n_ctx
             if GPU_COUNT > 0:
-                n_ctx = compute_dynamic_n_ctx(
-                    model_path,
-                    desired_n_ctx,
-                    n_gpu_layers,
-                    n_batch,
-                    self.vram,
-                    self.config,
-                    hyper=hyper,
-                )
+                n_ctx = compute_dynamic_n_ctx(model_path, desired_n_ctx, n_gpu_layers,
+                                               n_batch, self.vram, self.config, hyper=hyper)
 
-            attempt_dual = GPU_COUNT >= 2 and gpu_cfg.get(
-                "attempt_dual_gpu_split", True
-            )
+            attempt_dual = GPU_COUNT >= 2 and gpu_cfg.get("attempt_dual_gpu_split", True)
             vram_cfg = self.config.get("vram_management", {})
             min_ctx = vram_cfg.get("min_n_ctx", 256)
             shrink_factor = vram_cfg.get("oom_shrink_factor", 0.75)
@@ -1054,12 +953,8 @@ class ModelManager:
             while True:
                 kwargs = self._build_load_kwargs(alias, entry, n_ctx)
                 try:
-                    logger.info(
-                        "Loading '%s' (n_ctx=%d, n_gpu_layers=%s)...",
-                        alias,
-                        n_ctx,
-                        kwargs["n_gpu_layers"],
-                    )
+                    logger.info("Loading '%s' (n_ctx=%d, n_gpu_layers=%s)...",
+                                alias, n_ctx, kwargs["n_gpu_layers"])
                     self.llm = self._try_load(kwargs, attempt_dual)
                     self.current_alias = alias
                     logger.info("Loaded '%s' with n_ctx=%d.", alias, n_ctx)
@@ -1072,18 +967,11 @@ class ModelManager:
                         self.current_local_path = None
                         raise
                     new_ctx = max(min_ctx, int(n_ctx * shrink_factor))
-                    logger.warning(
-                        "CUDA OOM loading '%s' at n_ctx=%d; retrying with n_ctx=%d (%d/%d).",
-                        alias,
-                        n_ctx,
-                        new_ctx,
-                        attempts,
-                        max_retries,
-                    )
+                    logger.warning("CUDA OOM loading '%s' at n_ctx=%d; retrying with n_ctx=%d (%d/%d).",
+                                    alias, n_ctx, new_ctx, attempts, max_retries)
                     n_ctx = new_ctx
                     try:
                         import torch
-
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                     except Exception:
@@ -1101,23 +989,17 @@ async def disk_monitor_loop():
     if not disk_cfg.get("enabled", True):
         return
     interval = disk_cfg.get("monitor_interval_seconds", 30)
-    min_free_bytes = int(disk_cfg.get("min_free_space_gb", 5) * (1024**3))
+    min_free_bytes = int(disk_cfg.get("min_free_space_gb", 5) * (1024 ** 3))
     while True:
         await asyncio.sleep(interval)
         try:
             free = MODELS.disk_cache.free_space_bytes(MODELS.cache_dir)
             if free < min_free_bytes:
-                logger.info(
-                    "Disk monitor: %.2f GB free < %.2f GB minimum; evicting LRU cached models.",
-                    free / (1024**3),
-                    min_free_bytes / (1024**3),
-                )
-                MODELS.disk_cache.ensure_space_for(
-                    min_free_bytes, protect_paths=MODELS._protected_paths()
-                )
+                logger.info("Disk monitor: %.2f GB free < %.2f GB minimum; evicting LRU cached models.",
+                            free / (1024 ** 3), min_free_bytes / (1024 ** 3))
+                MODELS.disk_cache.ensure_space_for(min_free_bytes, protect_paths=MODELS._protected_paths())
         except Exception as e:
             logger.warning("Disk monitor loop error: %s", e)
-
 
 # --------------------------------------------------------------------------- #
 # Step 7: inference execution
@@ -1125,10 +1007,7 @@ async def disk_monitor_loop():
 
 
 def build_chat_prompt_messages(messages: list) -> list:
-    return [
-        {"role": m.get("role", "user"), "content": m.get("content", "")}
-        for m in messages
-    ]
+    return [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages]
 
 
 def build_gen_kwargs(payload: dict) -> dict:
@@ -1157,7 +1036,6 @@ def recover_from_oom(model_alias: str, e: Exception) -> None:
     MODELS.unload()
     try:
         import torch
-
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
@@ -1189,23 +1067,15 @@ def run_inference(payload: dict) -> dict:
             finish_reason = choice.get("finish_reason", "stop")
 
         usage = out.get("usage", {})
-        return {
-            "result": {"text": text, "finish_reason": finish_reason, "usage": usage}
-        }
+        return {"result": {"text": text, "finish_reason": finish_reason, "usage": usage}}
     except RuntimeError as e:
         if is_cuda_oom_error(e):
             recover_from_oom(model_alias, e)
-            return {
-                "error": "cuda_out_of_memory: the model ran out of GPU memory for this request"
-            }
-        logger.error(
-            "Runtime error during inference: %s\n%s", e, traceback.format_exc()
-        )
+            return {"error": "cuda_out_of_memory: the model ran out of GPU memory for this request"}
+        logger.error("Runtime error during inference: %s\n%s", e, traceback.format_exc())
         return {"error": f"inference_error: {e}"}
     except Exception as e:
-        logger.error(
-            "Unexpected error during inference: %s\n%s", e, traceback.format_exc()
-        )
+        logger.error("Unexpected error during inference: %s\n%s", e, traceback.format_exc())
         return {"error": f"inference_error: {e}"}
 
 
@@ -1218,9 +1088,7 @@ def run_inference_streaming(payload: dict, on_token):
 
     if payload["kind"] == "chat":
         messages = build_chat_prompt_messages(payload["messages"])
-        stream = llm.create_chat_completion(
-            messages=messages, stream=True, **gen_kwargs
-        )
+        stream = llm.create_chat_completion(messages=messages, stream=True, **gen_kwargs)
         for chunk in stream:
             choice = chunk["choices"][0]
             delta = choice.get("delta", {}) or {}
@@ -1248,10 +1116,8 @@ class ProxyClient:
     def __init__(self, config: dict):
         self.config = config
         self.proxy_url = config["proxy_url"].rstrip("/")
-        self.ws_url = (
-            self.proxy_url.replace("http://", "ws://").replace("https://", "wss://")
+        self.ws_url = self.proxy_url.replace("http://", "ws://").replace("https://", "wss://") \
             + config["transport"]["ws_path"]
-        )
         self.worker_id = config["worker_id"]
         self.secret = config["worker_shared_secret"]
         self.seen_job_ids: set = set()
@@ -1260,9 +1126,8 @@ class ProxyClient:
 
     def _sign(self) -> Dict[str, str]:
         ts = str(time.time())
-        sig = hmac.new(
-            self.secret.encode(), f"{self.worker_id}:{ts}".encode(), hashlib.sha256
-        ).hexdigest()
+        sig = hmac.new(self.secret.encode(), f"{self.worker_id}:{ts}".encode(),
+                        hashlib.sha256).hexdigest()
         return {"worker_id": self.worker_id, "timestamp": ts, "signature": sig}
 
     def _check_and_mark_duplicate(self, job_id: str) -> bool:
@@ -1284,15 +1149,9 @@ class ProxyClient:
         """Streams tokens to the proxy as they're produced, then sends
         stream_done (or error) at the end."""
         if self._check_and_mark_duplicate(job_id):
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "stream_done",
-                        "job_id": job_id,
-                        "result": {"duplicate": True},
-                    }
-                )
-            )
+            await ws.send(json.dumps({
+                "type": "stream_done", "job_id": job_id, "result": {"duplicate": True},
+            }))
             return
 
         queue: "asyncio.Queue" = asyncio.Queue()
@@ -1301,8 +1160,7 @@ class ProxyClient:
 
         def on_token(delta: str, finish_reason: Optional[str]) -> None:
             loop.call_soon_threadsafe(
-                queue.put_nowait, {"delta": delta, "finish_reason": finish_reason}
-            )
+                queue.put_nowait, {"delta": delta, "finish_reason": finish_reason})
 
         def worker_thread() -> None:
             try:
@@ -1313,22 +1171,14 @@ class ProxyClient:
                     recover_from_oom(model_alias, e)
                     err = "cuda_out_of_memory: the model ran out of GPU memory for this request"
                 else:
-                    logger.error(
-                        "Runtime error during streaming inference: %s\n%s",
-                        e,
-                        traceback.format_exc(),
-                    )
+                    logger.error("Runtime error during streaming inference: %s\n%s",
+                                  e, traceback.format_exc())
                     err = f"inference_error: {e}"
                 loop.call_soon_threadsafe(queue.put_nowait, {"__error__": err})
             except Exception as e:
-                logger.error(
-                    "Unexpected error during streaming inference: %s\n%s",
-                    e,
-                    traceback.format_exc(),
-                )
-                loop.call_soon_threadsafe(
-                    queue.put_nowait, {"__error__": f"inference_error: {e}"}
-                )
+                logger.error("Unexpected error during streaming inference: %s\n%s",
+                              e, traceback.format_exc())
+                loop.call_soon_threadsafe(queue.put_nowait, {"__error__": f"inference_error: {e}"})
 
         threading.Thread(target=worker_thread, daemon=True).start()
 
@@ -1337,41 +1187,22 @@ class ProxyClient:
             while True:
                 item = await queue.get()
                 if item.get("__done__"):
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": "stream_done",
-                                "job_id": job_id,
-                                "result": {
-                                    "usage": {"completion_tokens": completion_tokens}
-                                },
-                            }
-                        )
-                    )
+                    await ws.send(json.dumps({
+                        "type": "stream_done", "job_id": job_id,
+                        "result": {"usage": {"completion_tokens": completion_tokens}},
+                    }))
                     return
                 if "__error__" in item:
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": "error",
-                                "job_id": job_id,
-                                "error": item["__error__"],
-                            }
-                        )
-                    )
+                    await ws.send(json.dumps({
+                        "type": "error", "job_id": job_id, "error": item["__error__"],
+                    }))
                     return
                 if item.get("delta"):
                     completion_tokens += 1
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "stream_chunk",
-                            "job_id": job_id,
-                            "delta": item.get("delta", ""),
-                            "finish_reason": item.get("finish_reason"),
-                        }
-                    )
-                )
+                await ws.send(json.dumps({
+                    "type": "stream_chunk", "job_id": job_id,
+                    "delta": item.get("delta", ""), "finish_reason": item.get("finish_reason"),
+                }))
         except Exception as e:
             logger.warning("Lost connection while streaming job %s: %s", job_id, e)
 
@@ -1382,14 +1213,8 @@ class ProxyClient:
 
         while True:
             try:
-                async with websockets.connect(
-                    self.ws_url, ping_interval=20, ping_timeout=20
-                ) as ws:
-                    hello = {
-                        "type": "hello",
-                        "models": self.config.get("models", {}),
-                        **self._sign(),
-                    }
+                async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as ws:
+                    hello = {"type": "hello", "models": self.config.get("models", {}), **self._sign()}
                     await ws.send(json.dumps(hello))
                     ack_raw = await asyncio.wait_for(ws.recv(), timeout=15)
                     ack = json.loads(ack_raw)
@@ -1406,20 +1231,12 @@ class ProxyClient:
                             msg = json.loads(raw)
                             if msg.get("type") == "job":
                                 payload = msg["payload"]
-                                await ws.send(
-                                    json.dumps({"type": "ack", "job_id": msg["job_id"]})
-                                )
+                                await ws.send(json.dumps({"type": "ack", "job_id": msg["job_id"]}))
                                 if payload.get("stream"):
-                                    await self.process_stream_job(
-                                        ws, msg["job_id"], payload
-                                    )
+                                    await self.process_stream_job(ws, msg["job_id"], payload)
                                 else:
-                                    result = await self.process_job(
-                                        msg["job_id"], payload
-                                    )
-                                    await ws.send(
-                                        json.dumps({"type": "result", **result})
-                                    )
+                                    result = await self.process_job(msg["job_id"], payload)
+                                    await ws.send(json.dumps({"type": "result", **result}))
                             elif msg.get("type") == "heartbeat_ack":
                                 pass
                             else:
@@ -1431,18 +1248,10 @@ class ProxyClient:
                 raise
             except Exception as e:
                 self.ws_failures += 1
-                logger.warning(
-                    "WebSocket connection failed/dropped (%s). Failure count=%d",
-                    e,
-                    self.ws_failures,
-                )
-                if (
-                    self.ws_failures
-                    >= t_cfg["ws_failure_threshold_before_poll_fallback"]
-                ):
-                    logger.info(
-                        "Too many WS failures, switching to long-poll fallback."
-                    )
+                logger.warning("WebSocket connection failed/dropped (%s). Failure count=%d",
+                                e, self.ws_failures)
+                if self.ws_failures >= t_cfg["ws_failure_threshold_before_poll_fallback"]:
+                    logger.info("Too many WS failures, switching to long-poll fallback.")
                     return
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
@@ -1452,15 +1261,11 @@ class ProxyClient:
         while True:
             await asyncio.sleep(interval)
             try:
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "heartbeat",
-                            "status": "idle" if MODELS.llm is None else "idle",
-                            "current_model": MODELS.current_alias,
-                        }
-                    )
-                )
+                await ws.send(json.dumps({
+                    "type": "heartbeat",
+                    "status": "idle" if MODELS.llm is None else "idle",
+                    "current_model": MODELS.current_alias,
+                }))
             except Exception:
                 return
 
@@ -1469,11 +1274,9 @@ class ProxyClient:
         upgrading back to WebSocket."""
         t_cfg = self.config["transport"]
         try:
-            requests.post(
-                f"{self.proxy_url}/worker/register",
-                json={"models": self.config.get("models", {}), **self._sign()},
-                timeout=15,
-            )
+            requests.post(f"{self.proxy_url}/worker/register", json={
+                "models": self.config.get("models", {}), **self._sign()
+            }, timeout=15)
         except Exception as e:
             logger.warning("Long-poll registration failed: %s", e)
 
@@ -1483,18 +1286,11 @@ class ProxyClient:
                 params = {**self._sign(), "worker_id": self.worker_id}
                 resp = await self.loop.run_in_executor(
                     None,
-                    lambda: requests.get(
-                        f"{self.proxy_url}/worker/poll",
-                        params=params,
-                        timeout=t_cfg["long_poll_wait_seconds"] + 15,
-                    ),
+                    lambda: requests.get(f"{self.proxy_url}/worker/poll", params=params,
+                                          timeout=t_cfg["long_poll_wait_seconds"] + 15),
                 )
                 if resp.status_code != 200:
-                    logger.warning(
-                        "Long-poll returned HTTP %s: %s",
-                        resp.status_code,
-                        resp.text[:200],
-                    )
+                    logger.warning("Long-poll returned HTTP %s: %s", resp.status_code, resp.text[:200])
                     await asyncio.sleep(t_cfg["poll_interval_seconds"])
                     continue
                 data = resp.json()
@@ -1505,11 +1301,8 @@ class ProxyClient:
                 result = await self.process_job(job["job_id"], job["payload"])
                 await self.loop.run_in_executor(
                     None,
-                    lambda: requests.post(
-                        f"{self.proxy_url}/worker/result",
-                        json={**self._sign(), **result},
-                        timeout=30,
-                    ),
+                    lambda: requests.post(f"{self.proxy_url}/worker/result",
+                                           json={**self._sign(), **result}, timeout=30),
                 )
             except Exception as e:
                 logger.warning("Long-poll cycle error: %s", e)
@@ -1519,16 +1312,12 @@ class ProxyClient:
         try:
             await self.loop.run_in_executor(
                 None,
-                lambda: requests.post(
-                    f"{self.proxy_url}/worker/heartbeat",
-                    json={
-                        **self._sign(),
-                        "status": "idle" if MODELS.llm is None else "idle",
-                        "current_model": MODELS.current_alias,
-                        "models": self.config.get("models", {}),
-                    },
-                    timeout=15,
-                ),
+                lambda: requests.post(f"{self.proxy_url}/worker/heartbeat", json={
+                    **self._sign(),
+                    "status": "idle" if MODELS.llm is None else "idle",
+                    "current_model": MODELS.current_alias,
+                    "models": self.config.get("models", {}),
+                }, timeout=15),
             )
         except Exception:
             pass
@@ -1538,16 +1327,12 @@ class ProxyClient:
         try:
             await self.loop.run_in_executor(
                 None,
-                lambda: requests.post(
-                    f"{self.proxy_url}/worker/deregister", json=self._sign(), timeout=10
-                ),
+                lambda: requests.post(f"{self.proxy_url}/worker/deregister",
+                                       json=self._sign(), timeout=10),
             )
             logger.info("Deregistered from proxy.")
         except Exception as e:
-            logger.warning(
-                "Deregistration call failed (proxy may already consider us offline): %s",
-                e,
-            )
+            logger.warning("Deregistration call failed (proxy may already consider us offline): %s", e)
 
     async def run_forever(self):
         """WebSocket-first with automatic long-poll fallback and periodic
@@ -1570,11 +1355,8 @@ class ProxyClient:
 
 
 async def main():
-    logger.info(
-        "Starting GGUF Kaggle worker '%s' -> proxy %s",
-        CONFIG["worker_id"],
-        CONFIG["proxy_url"],
-    )
+    logger.info("Starting GGUF Kaggle worker '%s' -> proxy %s",
+                CONFIG["worker_id"], CONFIG["proxy_url"])
     client = ProxyClient(CONFIG)
     monitor_task = asyncio.create_task(disk_monitor_loop())
     try:
@@ -1584,11 +1366,8 @@ async def main():
             except KeyboardInterrupt:
                 raise
             except Exception as e:
-                logger.error(
-                    "Top-level worker loop crashed, restarting in 5s: %s\n%s",
-                    e,
-                    traceback.format_exc(),
-                )
+                logger.error("Top-level worker loop crashed, restarting in 5s: %s\n%s",
+                              e, traceback.format_exc())
                 await asyncio.sleep(5)
     except KeyboardInterrupt:
         logger.info("Shutting down worker (KeyboardInterrupt).")
