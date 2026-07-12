@@ -20,15 +20,25 @@ enabled). It:
      also periodically checks free space so the cache stays healthy even
      between downloads. The cache lives outside /kaggle/working (which has
      a small, quota-limited size on Kaggle) so there's much more headroom.
-  6. Is VRAM-aware: only one model is ever kept loaded at a time -- switching
-     models automatically unloads whatever's currently resident first, so a
-     new model can claim that freed VRAM. Each model's context window is
-     sized dynamically against currently-free VRAM (with a configurable
-     safety headroom, default 5%), using the model's own GGUF header to
-     estimate KV-cache cost per token. If a load still hits a CUDA OOM
-     (estimates are inherently approximate), it automatically retries with
-     a smaller context window a few times before giving up. Context size
-     can also be set per-model in config, not just globally.
+  6. Is VRAM-aware, purely for INFERENCE (this script never trains or
+     fine-tunes anything -- it is solely an inference client node that
+     loads pre-trained GGUF weights and runs forward-pass generation, so
+     the only VRAM consumers it ever accounts for are the model weights
+     themselves and the KV-cache; there's no optimizer state, no gradients,
+     and no activation memory for backprop to budget for the way you would
+     for training). Only one model is ever kept loaded at a time --
+     switching models automatically unloads whatever's currently resident
+     first, so a new model can claim that freed VRAM. By default (config
+     "gpu.n_ctx": "max"), every model is loaded with the LARGEST context
+     window it was itself trained with (read straight from its GGUF
+     header), and that is only reduced as far as necessary to fit
+     currently-free VRAM (with a configurable safety headroom, default 5%),
+     using the model's own GGUF header to estimate KV-cache cost per token.
+     If a load still hits a CUDA OOM (estimates are inherently approximate),
+     it automatically retries with a smaller context window a few times
+     before giving up. An explicit integer context size can still be set
+     per-model (or globally) in config to override the "always maximize"
+     default.
   7. Cleanly tells the proxy it's going away on Ctrl+C / shutdown, so the
      proxy stops waiting on it immediately instead of leaving in-flight
      HTTP requests hanging until they individually time out.
@@ -164,7 +174,14 @@ DEFAULT_CONFIG = {
     },
     "gpu": {
         "attempt_dual_gpu_split": True,
-        "n_ctx": 4096,
+        # "max" (the default) means: always try to load every model at the
+        # largest context window IT supports -- read from its own GGUF
+        # header's trained context length -- and only shrink from there as
+        # far as needed to fit available VRAM. This is an inference-only
+        # setting (KV-cache sizing), not a training batch/sequence length.
+        # Set an explicit integer here (or per-model under "models") if you
+        # want a fixed cap instead of always-maximize.
+        "n_ctx": "max",
         "n_batch": 512,
         "n_threads": 0,
         "n_gpu_layers": -1
@@ -580,20 +597,55 @@ def estimate_kv_bytes_per_token(hyper: dict, kv_dtype_bytes: int = 2) -> int:
     return int(n_layer * kv_embd * 2 * kv_dtype_bytes)  # *2 for K and V
 
 
+def resolve_desired_n_ctx(configured: Any, hyper: Optional[dict],
+                           fallback_max: int = 32768) -> int:
+    """Turns the configured 'gpu.n_ctx' / per-model 'n_ctx' value into a
+    concrete integer context target. This is INFERENCE context sizing only
+    (how many tokens of KV-cache to allocate for generation) -- it has
+    nothing to do with training sequence length or batch size.
+
+    A configured value of "max" (the default) means: always aim for the
+    largest context window this specific model was itself trained with,
+    read straight from its own GGUF header (n_ctx_train) via `hyper`, so
+    every model gets to use as much context as it actually supports rather
+    than a fixed guess. If the header didn't expose a trained context
+    length (probe failed / unusual GGUF) and no explicit override was
+    configured, falls back to `fallback_max` as a generous default -- the
+    caller still sizes down further to fit VRAM. An explicit integer in
+    config is always honored as-is instead."""
+    if isinstance(configured, str) and configured.strip().lower() == "max":
+        if hyper and hyper.get("n_ctx_train"):
+            return int(hyper["n_ctx_train"])
+        logger.info("Could not read the model's trained max context length from its "
+                    "GGUF header; falling back to n_ctx=%d as the target before VRAM sizing.",
+                    fallback_max)
+        return fallback_max
+    return int(configured)
+
+
 def compute_dynamic_n_ctx(model_path: str, desired_n_ctx: int, n_gpu_layers: int,
-                           n_batch: int, vram: VramManager, config: dict) -> int:
+                           n_batch: int, vram: VramManager, config: dict,
+                           hyper: Optional[dict] = None) -> int:
     """Figures out the largest context size (up to `desired_n_ctx`, and
     capped at the model's own trained max context if known) that should fit
     in currently-free VRAM while preserving the configured headroom
-    fraction. Falls back to `desired_n_ctx` unchanged if there's no GPU in
-    play (nothing to size against)."""
+    fraction. This budgets INFERENCE-time VRAM only -- model weights (or
+    the fraction of them offloaded to GPU) plus KV-cache -- never gradients
+    or optimizer state, since this worker only ever runs forward-pass
+    generation. Falls back to `desired_n_ctx` unchanged if there's no GPU in
+    play (nothing to size against).
+
+    `hyper` can be passed in if the GGUF header was already probed by the
+    caller (e.g. to resolve "max" via resolve_desired_n_ctx), to avoid
+    probing the same file twice; otherwise it's probed here."""
     if not vram.relevant_gpu_indices():
         return desired_n_ctx
 
     vram_cfg = config.get("vram_management", {})
     min_ctx = vram_cfg.get("min_n_ctx", 256)
 
-    hyper = probe_gguf_hyperparams(model_path)
+    if hyper is None:
+        hyper = probe_gguf_hyperparams(model_path)
     usable_free = vram.usable_free_bytes()
     file_size = os.path.getsize(model_path)
 
@@ -806,14 +858,24 @@ class ModelManager:
 
             entry = self.registry().get(alias, {})
             gpu_cfg = self.config.get("gpu", {})
-            desired_n_ctx = entry.get("n_ctx", gpu_cfg.get("n_ctx", 4096))
+            configured_n_ctx = entry.get("n_ctx", gpu_cfg.get("n_ctx", "max"))
             n_gpu_layers = entry.get("n_gpu_layers", gpu_cfg.get("n_gpu_layers", -1)) if GPU_COUNT > 0 else 0
             n_batch = entry.get("n_batch", gpu_cfg.get("n_batch", 512))
+
+            # Probe the GGUF header once (cheap, CPU-only, no GPU needed) so
+            # we know this model's own trained max context length -- used
+            # both to resolve "max" and, on GPU workers, to size the
+            # KV-cache. This is purely inference-time context sizing.
+            hyper = probe_gguf_hyperparams(model_path)
+            desired_n_ctx = resolve_desired_n_ctx(configured_n_ctx, hyper)
 
             n_ctx = desired_n_ctx
             if GPU_COUNT > 0:
                 n_ctx = compute_dynamic_n_ctx(model_path, desired_n_ctx, n_gpu_layers,
-                                               n_batch, self.vram, self.config)
+                                               n_batch, self.vram, self.config, hyper=hyper)
+            # CPU-only workers have nothing to size against, so they always
+            # get the model's full trained max context (or the configured
+            # override) unchanged.
 
             attempt_dual = GPU_COUNT >= 2 and gpu_cfg.get("attempt_dual_gpu_split", True)
             vram_cfg = self.config.get("vram_management", {})

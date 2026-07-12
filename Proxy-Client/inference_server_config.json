@@ -3,7 +3,7 @@
   "worker_id": "kaggle-worker-1",
   "worker_shared_secret": "change-me-worker-secret",
   "huggingface_token": "",
-  "model_cache_dir": "/kaggle/working/gguf_models",
+  "model_cache_dir": "/tmp/gguf_models",
 
   "models": {
     "general-qwen3-30b": {
