@@ -1,36 +1,44 @@
 """
-proxy_server.py
+proxy_server_multi.py
 ================================================================================
-Public-facing, OpenAI-compatible API proxy.
+Public-facing, OpenAI-compatible API proxy — MULTI-WORKER ROUTER.
 
-This process is the only thing that needs a real public IP / domain / TLS
-certificate. It exposes a normal-looking OpenAI API to clients:
+This is the multi-inference-server evolution of proxy_server.py. Instead of
+tracking a single active worker, this process can accept connections from
+many Kaggle-hosted inference workers simultaneously (one model loaded per
+worker), and routes each incoming client request to whichever connected
+worker is:
+
+    1. Actually serving the requested model
+    2. Least busy right now (fewest in-flight jobs, lowest GPU utilization)
+    3. Most recently heard from (tie-break), then round-robin as a final
+       deterministic tie-break
+
+Clients only ever see a normal, stateless OpenAI-compatible API:
 
     GET  /v1/models
     POST /v1/chat/completions
     POST /v1/completions
-    POST /v1/embeddings          (returns a clean OpenAI-style error - the
-                                   llama.cpp GGUF worker does not serve
-                                   embeddings in this setup)
+    POST /v1/embeddings          (not supported -> clean OpenAI-style error)
     GET  /health
     GET  /dashboard
 
-Behind the scenes it queues each incoming request as a "Job" and waits for a
-single privately-connected Kaggle worker to pick it up and return a result.
-The worker connects OUTBOUND to this server -- this server never dials into
-Kaggle. Two transports are supported for the worker:
+Workers connect OUTBOUND to this server (this server never dials into
+Kaggle) via one of two transports:
 
     * WebSocket  (ws://.../worker/ws)   <- preferred, low latency, push-based
-    * Long-poll  (GET /worker/poll,
-                  POST /worker/result)  <- fallback if WS is blocked/unstable
+    * Long-poll  (POST /worker/register, GET /worker/poll,
+                  POST /worker/result, POST /worker/heartbeat,
+                  POST /worker/deregister)  <- fallback transport
 
-Only one worker is considered "active" at a time. Clients are completely
-unaware of any of this; from their point of view it is a normal, stateless
-OpenAI-compatible server (no server-side conversation memory is kept).
+Unlike the single-worker reference, MANY workers may be connected and
+"active" at the same time. Each worker has its own job queue; a job is
+routed to exactly one worker's queue based on the scoring function below and
+never migrates between workers mid-flight (especially not mid-stream).
 
 Run:
     pip install fastapi "uvicorn[standard]" websockets
-    python proxy_server.py
+    python proxy_server_multi.py
 """
 
 from __future__ import annotations
@@ -38,13 +46,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -60,9 +70,9 @@ CONFIG_PATH = os.environ.get("PROXY_CONFIG_PATH", "proxy_server_config.json")
 DEFAULT_CONFIG = {
     "host": "0.0.0.0",
     "port": 8000,
-    "client_api_keys": ["sk-change-me-client-key"],
+    "client_api_keys": ["sk-your-api-key-here"],
     "worker_shared_secret": "change-me-worker-secret",
-    "max_queue_size": 100,
+    "max_queue_size_per_worker": 100,
     "request_timeout_seconds": 300,
     "long_poll_timeout_seconds": 40,
     "job_delivery_ack_timeout_seconds": 15,
@@ -74,6 +84,10 @@ DEFAULT_CONFIG = {
     },
     "retry": {
         "max_job_retries": 1,
+    },
+    "routing": {
+        "prefer_least_busy_gpu": True,
+        "fallback_to_round_robin": True,
     },
     "logging": {
         "level": "INFO",
@@ -95,9 +109,9 @@ def load_or_create_config(path: str, defaults: dict) -> dict:
     if not os.path.exists(path):
         with open(path, "w") as f:
             json.dump(defaults, f, indent=2)
-        print(f"[proxy_server] No config found at '{path}'. A default config "
-              f"has been created. Please review/edit it (API keys, secrets, "
-              f"ports) before exposing this server publicly.")
+        print(f"[proxy_server_multi] No config found at '{path}'. A default "
+              f"config has been created. Please review/edit it (API keys, "
+              f"secrets, ports) before exposing this server publicly.")
         return json.loads(json.dumps(defaults))
     with open(path, "r") as f:
         cfg = json.load(f)
@@ -125,7 +139,7 @@ logging.basicConfig(
         logging.FileHandler(CONFIG["logging"].get("file", "proxy_server.log")),
     ],
 )
-logger = logging.getLogger("proxy_server")
+logger = logging.getLogger("proxy_server_multi")
 
 # --------------------------------------------------------------------------- #
 # Auth helpers
@@ -175,7 +189,7 @@ def openai_error(message: str, err_type: str = "server_error", code: Optional[st
 
 
 # --------------------------------------------------------------------------- #
-# Job / worker state
+# Job dataclass (unchanged shape from the single-worker reference)
 # --------------------------------------------------------------------------- #
 
 
@@ -184,6 +198,7 @@ class Job:
     id: str
     kind: str                      # "chat", "completions"
     payload: dict                  # normalized job payload sent to worker
+    worker_id: Optional[str] = None            # which worker this job was routed to
     created_at: float = field(default_factory=time.time)
     timeout: float = 300.0
     future: "asyncio.Future" = field(default_factory=lambda: asyncio.get_event_loop().create_future())
@@ -195,18 +210,34 @@ class Job:
     stream_queue: Optional["asyncio.Queue"] = None   # only set for true (WS) streaming jobs
 
 
-class WorkerState:
-    """Tracks the single active worker (whichever transport it is using)."""
+# --------------------------------------------------------------------------- #
+# Per-worker state
+# --------------------------------------------------------------------------- #
 
-    def __init__(self) -> None:
-        self.worker_id: Optional[str] = None
-        self.transport: Optional[str] = None       # "ws" or "poll"
+
+class WorkerState:
+    """Tracks one connected inference worker (whichever transport it is
+    using) along with its own private job queue."""
+
+    def __init__(self, worker_id: str) -> None:
+        self.worker_id: str = worker_id
+        self.transport: Optional[str] = None        # "ws" or "poll"
         self.ws: Optional[WebSocket] = None
         self.last_heartbeat: float = 0.0
         self.models: Dict[str, Any] = {}
-        self.status: str = "unknown"                # idle / busy / loading_model / unknown
+        self.status: str = "unknown"                 # idle / busy / loading_model / unknown
         self.current_model: Optional[str] = None
+        self.in_flight_jobs: int = 0
+        self.gpu_stats: dict = {}                     # {"total_mb", "used_mb", "free_mb", "utilization_percent"}
         self.lock = asyncio.Lock()
+
+        # Per-worker job queue + job map (jobs routed to this worker only).
+        self.queue: "asyncio.Queue[str]" = asyncio.Queue(
+            maxsize=CONFIG.get("max_queue_size_per_worker", 100))
+        self.jobs: Dict[str, Job] = {}
+
+        # Bookkeeping for the WS dispatcher task tied to this connection.
+        self.dispatcher_task: Optional["asyncio.Task"] = None
 
     def is_online(self) -> bool:
         if self.last_heartbeat == 0:
@@ -219,62 +250,153 @@ class WorkerState:
     def mark_offline(self) -> None:
         """Immediately mark the worker offline instead of waiting for the
         worker_offline_after_seconds grace window to elapse. Used whenever we
-        positively know the connection is gone (e.g. a WebSocket close or an
-        explicit deregister call), so new requests get a fast, honest 503
-        instead of silently hanging until they individually time out."""
+        positively know the connection is gone (WS close, explicit
+        deregister, or heartbeat staleness during a sweep)."""
         self.last_heartbeat = 0.0
         self.status = "unknown"
-
-    def snapshot(self) -> dict:
-        return {
-            "worker_id": self.worker_id,
-            "transport": self.transport,
-            "online": self.is_online(),
-            "status": self.status,
-            "current_model": self.current_model,
-            "last_heartbeat_age_seconds": round(time.time() - self.last_heartbeat, 1)
-            if self.last_heartbeat else None,
-            "known_models": list(self.models.keys()),
-        }
-
-
-class JobManager:
-    """Owns the job queue and the map of in-flight jobs."""
-
-    def __init__(self) -> None:
-        self.queue: "asyncio.Queue[str]" = asyncio.Queue(maxsize=CONFIG["max_queue_size"])
-        self.jobs: Dict[str, Job] = {}
 
     def qsize(self) -> int:
         return self.queue.qsize()
 
-    async def submit(self, kind: str, payload: dict, stream: bool) -> Job:
-        if self.queue.full():
+    def snapshot(self) -> dict:
+        return {
+            "worker_id": self.worker_id,
+            "online": self.is_online(),
+            "transport": self.transport,
+            "status": self.status,
+            "current_model": self.current_model,
+            "in_flight_jobs": self.in_flight_jobs,
+            "gpu_stats": self.gpu_stats,
+            "known_models": list(self.models.keys()),
+            "queue_depth": self.qsize(),
+            "last_heartbeat_age_seconds": round(time.time() - self.last_heartbeat, 1)
+            if self.last_heartbeat else None,
+        }
+
+
+# --------------------------------------------------------------------------- #
+# Worker registry + routing
+# --------------------------------------------------------------------------- #
+
+
+class WorkerRegistry:
+    """Owns the Dict[worker_id -> WorkerState] and all job bookkeeping across
+    every worker. Routing decisions (which worker gets a given request) live
+    here too, since they need a global view of all workers."""
+
+    def __init__(self) -> None:
+        self.workers: Dict[str, WorkerState] = {}
+        self._rr_counter = itertools.count()  # round-robin tiebreaker source
+        self._registry_lock = asyncio.Lock()
+
+    async def get_or_create(self, worker_id: str) -> WorkerState:
+        async with self._registry_lock:
+            w = self.workers.get(worker_id)
+            if w is None:
+                w = WorkerState(worker_id)
+                self.workers[worker_id] = w
+            return w
+
+    def get(self, worker_id: str) -> Optional[WorkerState]:
+        return self.workers.get(worker_id)
+
+    def all_workers(self) -> List[WorkerState]:
+        return list(self.workers.values())
+
+    def online_workers(self) -> List[WorkerState]:
+        return [w for w in self.workers.values() if w.is_online()]
+
+    def all_known_models(self) -> Dict[str, dict]:
+        """Union of models across all currently-online workers, for
+        GET /v1/models. If multiple workers serve the same model id, the
+        last one wins for metadata purposes (metadata itself is usually
+        trivial/empty)."""
+        merged: Dict[str, dict] = {}
+        for w in self.online_workers():
+            for model_id, meta in w.models.items():
+                merged[model_id] = meta
+        return merged
+
+    def total_queue_depth(self) -> int:
+        return sum(w.qsize() for w in self.workers.values())
+
+    def total_in_flight(self) -> int:
+        return sum(
+            1
+            for w in self.workers.values()
+            for j in w.jobs.values()
+            if not j.future.done()
+        )
+
+    def score_worker(self, worker: WorkerState) -> Tuple[float, float, float, int]:
+        """Lower score = better. Used for routing decisions.
+
+        priority = (in_flight_jobs, gpu_utilization_percent, heartbeat_age,
+                    round_robin_counter)
+
+        The round-robin counter is only consulted as the final tiebreaker
+        when everything else is equal (e.g. two freshly-registered, idle
+        workers serving the same model)."""
+        utilization = worker.gpu_stats.get("utilization_percent", 0) or 0
+        in_flight = worker.in_flight_jobs
+        recency = time.time() - worker.last_heartbeat if worker.last_heartbeat else float("inf")
+        rr = next(self._rr_counter) if CONFIG["routing"].get("fallback_to_round_robin", True) else 0
+        return (in_flight, utilization, recency, rr)
+
+    def route_request(self, model: str) -> Optional[WorkerState]:
+        """Pick the best online worker currently serving `model`."""
+        candidates = [
+            w for w in self.workers.values()
+            if w.is_online() and model in w.models
+        ]
+        if not candidates:
+            return None
+        scored = [(self.score_worker(w), w) for w in candidates]
+        scored.sort(key=lambda pair: pair[0])
+        return scored[0][1]
+
+    async def submit_job(self, worker: WorkerState, kind: str, payload: dict,
+                          stream: bool) -> Job:
+        if worker.queue.full():
             raise HTTPException(status_code=429, detail=openai_error(
-                "Server is overloaded, queue is full. Please retry shortly.",
+                "Selected inference server's queue is full. Please retry shortly.",
                 "rate_limit_error"))
         job = Job(
             id=str(uuid.uuid4()),
             kind=kind,
             payload=payload,
+            worker_id=worker.worker_id,
             timeout=CONFIG["request_timeout_seconds"],
             stream=stream,
         )
         if stream:
-            # True WS streaming jobs get a dedicated queue that the SSE
-            # response generator drains as tokens arrive from the worker.
             job.stream_queue = asyncio.Queue()
-        self.jobs[job.id] = job
-        await self.queue.put(job.id)
+        worker.jobs[job.id] = job
+        worker.in_flight_jobs += 1
+        await worker.queue.put(job.id)
+        logger.info("Routed job %s (kind=%s, model=%s) -> worker '%s' "
+                    "(in_flight=%d, gpu_util=%s%%)",
+                    job.id, kind, payload.get("model"), worker.worker_id,
+                    worker.in_flight_jobs, worker.gpu_stats.get("utilization_percent"))
         return job
 
-    def pop_next_for_delivery(self) -> Optional[Job]:
-        """Non-blocking pop used by both the WS dispatcher and long-poll."""
+    def find_job(self, job_id: str) -> Tuple[Optional[WorkerState], Optional[Job]]:
+        """Locate a job (and its owning worker) by id, searching across all
+        workers. Used by long-poll result/heartbeat endpoints which only
+        carry worker_id + job_id, not a direct WorkerState reference."""
+        for w in self.workers.values():
+            j = w.jobs.get(job_id)
+            if j is not None:
+                return w, j
+        return None, None
+
+    def pop_next_for_delivery(self, worker: WorkerState) -> Optional[Job]:
+        """Non-blocking pop from this worker's queue."""
         try:
-            job_id = self.queue.get_nowait()
+            job_id = worker.queue.get_nowait()
         except asyncio.QueueEmpty:
             return None
-        job = self.jobs.get(job_id)
+        job = worker.jobs.get(job_id)
         if job is None or job.future.done():
             return None
         job.delivered = True
@@ -282,13 +404,14 @@ class JobManager:
         job.last_activity_at = job.delivered_at
         return job
 
-    async def wait_next_for_delivery(self, timeout: float) -> Optional[Job]:
-        """Blocking (up to timeout) pop, used by the long-poll endpoint."""
+    async def wait_next_for_delivery(self, worker: WorkerState, timeout: float) -> Optional[Job]:
+        """Blocking (up to timeout) pop from this worker's queue, used by
+        both the WS dispatcher loop and the long-poll endpoint."""
         try:
-            job_id = await asyncio.wait_for(self.queue.get(), timeout=timeout)
+            job_id = await asyncio.wait_for(worker.queue.get(), timeout=timeout)
         except asyncio.TimeoutError:
             return None
-        job = self.jobs.get(job_id)
+        job = worker.jobs.get(job_id)
         if job is None or job.future.done():
             return None
         job.delivered = True
@@ -296,64 +419,107 @@ class JobManager:
         job.last_activity_at = job.delivered_at
         return job
 
-    def mark_activity(self, job_id: str) -> None:
+    def mark_activity(self, worker: WorkerState, job_id: str) -> None:
         """Called whenever a streamed token arrives, so long-running streams
         aren't mistaken for a stalled/dead worker by the watchdog."""
-        job = self.jobs.get(job_id)
+        job = worker.jobs.get(job_id)
         if job is not None:
             job.last_activity_at = time.time()
 
-    def complete(self, job_id: str, result: Optional[dict], error: Optional[str]) -> bool:
-        job = self.jobs.get(job_id)
+    def complete(self, worker: WorkerState, job_id: str, result: Optional[dict],
+                 error: Optional[str]) -> bool:
+        job = worker.jobs.get(job_id)
         if job is None or job.future.done():
             return False  # unknown or duplicate delivery -- ignore safely
         if error:
             job.future.set_exception(RuntimeError(error))
         else:
             job.future.set_result(result)
+        worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
         return True
 
-    async def requeue_or_fail(self, job: Job, reason: str) -> None:
+    async def requeue_or_fail(self, worker: WorkerState, job: Job, reason: str) -> None:
         """Called by the watchdog (or by an immediate disconnect handler)
-        when a delivered job never got a result."""
+        when a delivered job never got a result. Jobs are only ever
+        requeued onto the SAME worker's queue (never migrated to a
+        different worker), matching the "streaming job MUST stay with same
+        worker" requirement -- for non-streaming jobs this still means a
+        retry only makes sense if that worker is expected to come back
+        (e.g. a transient send failure), otherwise it will simply fail once
+        retries are exhausted or the worker is confirmed offline."""
         if job.future.done():
             return
         # A streaming job that has already sent tokens to the client cannot
-        # be safely retried on a fresh worker (the client already received a
-        # partial response) -- fail it outright and unblock the SSE consumer.
+        # be safely retried (the client already received a partial
+        # response) -- fail it outright and unblock the SSE consumer.
         if job.stream_queue is not None:
-            logger.error("Failing streaming job %s: %s", job.id, reason)
+            logger.error("Failing streaming job %s on worker '%s': %s",
+                         job.id, worker.worker_id, reason)
             await job.stream_queue.put({"error": reason})
             await job.stream_queue.put(None)
             job.future.set_exception(RuntimeError(reason))
+            worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
             return
-        if job.retries < CONFIG["retry"]["max_job_retries"]:
+        if job.retries < CONFIG["retry"]["max_job_retries"] and worker.is_online():
             job.retries += 1
             job.delivered = False
             job.delivered_at = None
             job.last_activity_at = None
-            logger.warning("Requeuing job %s after failure: %s", job.id, reason)
-            await self.queue.put(job.id)
+            logger.warning("Requeuing job %s on worker '%s' after failure: %s",
+                           job.id, worker.worker_id, reason)
+            await worker.queue.put(job.id)
         else:
-            logger.error("Failing job %s permanently: %s", job.id, reason)
+            logger.error("Failing job %s on worker '%s' permanently: %s",
+                         job.id, worker.worker_id, reason)
             job.future.set_exception(RuntimeError(reason))
+            worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+
+    async def fail_in_flight_jobs_for_worker(self, worker: WorkerState, reason: str) -> None:
+        """Immediately fail/requeue every job that was already delivered to
+        this (now-gone) worker connection, instead of waiting for the
+        watchdog to notice via its timeout. Jobs still only queued (never
+        delivered) are left in this worker's queue -- if the worker comes
+        back online they'll be picked up then; the watchdog will eventually
+        fail them too if the worker stays offline past their own timeout."""
+        in_flight = [j for j in worker.jobs.values() if not j.future.done() and j.delivered]
+        for job in in_flight:
+            await self.requeue_or_fail(worker, job, reason)
 
     def cleanup(self, max_age: float = 3600) -> None:
         now = time.time()
-        stale = [jid for jid, j in self.jobs.items()
-                 if j.future.done() and (now - j.created_at) > max_age]
-        for jid in stale:
-            del self.jobs[jid]
+        for w in self.workers.values():
+            stale = [jid for jid, j in w.jobs.items()
+                     if j.future.done() and (now - j.created_at) > max_age]
+            for jid in stale:
+                del w.jobs[jid]
+
+    def prune_dead_workers(self, max_age: float = 24 * 3600) -> None:
+        """Drop bookkeeping for workers that have been offline for a very
+        long time, so the registry doesn't grow unbounded across many
+        Kaggle session churns. Only prunes workers with no in-flight/queued
+        jobs left."""
+        now = time.time()
+        dead = []
+        for wid, w in self.workers.items():
+            if w.is_online():
+                continue
+            if w.in_flight_jobs > 0 or w.qsize() > 0:
+                continue
+            if w.last_heartbeat and (now - w.last_heartbeat) > max_age:
+                dead.append(wid)
+        for wid in dead:
+            del self.workers[wid]
+            logger.info("Pruned long-dead worker '%s' from registry.", wid)
 
 
-WORKER = WorkerState()
-JOBS = JobManager()
+REGISTRY = WorkerRegistry()
+
 
 # --------------------------------------------------------------------------- #
 # FastAPI app
 # --------------------------------------------------------------------------- #
 
-app = FastAPI(title="GGUF-Kaggle OpenAI-Compatible Proxy")
+app = FastAPI(title="GGUF-Kaggle OpenAI-Compatible Multi-Worker Proxy")
 
 if CONFIG["cors"].get("enabled"):
     app.add_middleware(
@@ -365,7 +531,7 @@ if CONFIG["cors"].get("enabled"):
 
 
 # --------------------------------------------------------------------------- #
-# OpenAI response formatting helpers
+# OpenAI response formatting helpers (unchanged from reference)
 # --------------------------------------------------------------------------- #
 
 
@@ -405,11 +571,11 @@ def format_text_completion(job_id: str, model: str, result: dict) -> dict:
 
 
 async def fake_sse_stream(final_chunk_builder):
-    """Used only when the worker is on the long-poll fallback transport,
-    which cannot push individual tokens as they're generated. We compute the
-    full result and then emit it as a single SSE 'delta' chunk followed by
-    [DONE]. This keeps stream=True clients working (just without real
-    incremental output) whenever WebSocket isn't available."""
+    """Used only when the winning worker is on the long-poll fallback
+    transport, which cannot push individual tokens as they're generated. We
+    compute the full result and then emit it as a single SSE 'delta' chunk
+    followed by [DONE]. This keeps stream=True clients working (just
+    without real incremental output) whenever that worker isn't on WS."""
     payload = final_chunk_builder()
     yield f"data: {json.dumps(payload)}\n\n"
     yield "data: [DONE]\n\n"
@@ -445,11 +611,12 @@ def to_stream_text_chunk(job_id: str, model: str, result: dict) -> dict:
 
 
 async def real_stream_generator(job: Job, model: str, kind: str):
-    """True token-by-token SSE stream for jobs delivered over the worker
-    WebSocket. Reads from job.stream_queue as the worker's WS handler feeds
-    it (see the 'stream_chunk' / 'stream_done' / 'error' cases in worker_ws),
-    and yields OpenAI-compatible chunk frames as soon as each token arrives.
-    """
+    """True token-by-token SSE stream for jobs delivered over a worker's
+    WebSocket. Reads from job.stream_queue as that worker's WS handler
+    feeds it (see 'stream_chunk' / 'stream_done' / 'error' below), and
+    yields OpenAI-compatible chunk frames as soon as each token arrives.
+    The job (and therefore the stream) never migrates to a different
+    worker mid-flight."""
     role_sent = False
     try:
         while True:
@@ -501,7 +668,7 @@ async def real_stream_generator(job: Job, model: str, kind: str):
 
 
 # --------------------------------------------------------------------------- #
-# Shared request handling
+# Shared request handling / routing
 # --------------------------------------------------------------------------- #
 
 
@@ -518,18 +685,27 @@ def normalize_generation_params(body: dict) -> dict:
     }
 
 
-def ensure_worker_online() -> None:
-    if not WORKER.is_online():
-        raise HTTPException(status_code=503, detail=openai_error(
-            "No inference worker is currently connected. Please try again shortly.",
-            "server_error"))
+def route_or_503(model: str) -> WorkerState:
+    """Find the best worker for `model`, or raise a clean 503."""
+    worker = REGISTRY.route_request(model)
+    if worker is None:
+        # Distinguish "model unknown anywhere" from "model exists but all
+        # workers serving it are offline" for a clearer error message.
+        known_anywhere = any(model in w.models for w in REGISTRY.all_workers())
+        if known_anywhere:
+            msg = (f"No inference server currently has model '{model}' "
+                   f"online. It is configured on a worker that is not "
+                   f"currently connected.")
+        else:
+            msg = f"No inference server currently has model '{model}' loaded."
+        raise HTTPException(status_code=503, detail=openai_error(msg, "server_error"))
+    return worker
 
 
-async def run_job_and_wait(kind: str, payload: dict) -> (Job, dict):
-    """Non-streaming (or poll-fallback) path: submit a job and block until
-    the worker returns the full result."""
-    ensure_worker_online()
-    job = await JOBS.submit(kind, payload, stream=False)
+async def run_job_and_wait(worker: WorkerState, kind: str, payload: dict) -> Tuple[Job, dict]:
+    """Non-streaming (or poll-fallback) path: submit a job to a specific
+    worker's queue and block until that worker returns the full result."""
+    job = await REGISTRY.submit_job(worker, kind, payload, stream=False)
     try:
         result = await asyncio.wait_for(job.future, timeout=job.timeout)
     except asyncio.TimeoutError:
@@ -542,10 +718,10 @@ async def run_job_and_wait(kind: str, payload: dict) -> (Job, dict):
     return job, result
 
 
-def worker_supports_real_streaming() -> bool:
+def worker_supports_real_streaming(worker: WorkerState) -> bool:
     """True token streaming requires the persistent WebSocket transport --
     long-polling has no way to push individual tokens as they're produced."""
-    return WORKER.is_online() and WORKER.transport == "ws"
+    return worker.is_online() and worker.transport == "ws"
 
 
 @app.post("/v1/chat/completions")
@@ -558,26 +734,27 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         raise HTTPException(status_code=400, detail=openai_error(
             "'model' and 'messages' are required.", "invalid_request_error"))
     stream = bool(body.get("stream", False))
-    ensure_worker_online()
 
-    if stream and worker_supports_real_streaming():
+    worker = route_or_503(model)
+
+    if stream and worker_supports_real_streaming(worker):
         payload = {
             "kind": "chat", "model": model, "messages": messages, "stream": True,
             "params": normalize_generation_params(body),
         }
-        job = await JOBS.submit("chat", payload, stream=True)
+        job = await REGISTRY.submit_job(worker, "chat", payload, stream=True)
         return StreamingResponse(
             real_stream_generator(job, model, "chat"),
             media_type="text/event-stream",
         )
 
-    # Non-streaming, or the worker is currently on the long-poll fallback
-    # transport (no true incremental push available there).
+    # Non-streaming, or the chosen worker is currently on the long-poll
+    # fallback transport (no true incremental push available there).
     payload = {
         "kind": "chat", "model": model, "messages": messages, "stream": False,
         "params": normalize_generation_params(body),
     }
-    job, result = await run_job_and_wait("chat", payload)
+    job, result = await run_job_and_wait(worker, "chat", payload)
     if stream:
         return StreamingResponse(
             fake_sse_stream(lambda: to_stream_chat_chunk(job.id, model, result)),
@@ -596,14 +773,15 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         raise HTTPException(status_code=400, detail=openai_error(
             "'model' and 'prompt' are required.", "invalid_request_error"))
     stream = bool(body.get("stream", False))
-    ensure_worker_online()
 
-    if stream and worker_supports_real_streaming():
+    worker = route_or_503(model)
+
+    if stream and worker_supports_real_streaming(worker):
         payload = {
             "kind": "completion", "model": model, "prompt": prompt, "stream": True,
             "params": normalize_generation_params(body),
         }
-        job = await JOBS.submit("completions", payload, stream=True)
+        job = await REGISTRY.submit_job(worker, "completions", payload, stream=True)
         return StreamingResponse(
             real_stream_generator(job, model, "completion"),
             media_type="text/event-stream",
@@ -613,14 +791,13 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         "kind": "completion", "model": model, "prompt": prompt, "stream": False,
         "params": normalize_generation_params(body),
     }
-    job, result = await run_job_and_wait("completions", payload)
+    job, result = await run_job_and_wait(worker, "completions", payload)
     if stream:
         return StreamingResponse(
             fake_sse_stream(lambda: to_stream_text_chunk(job.id, model, result)),
             media_type="text/event-stream",
         )
     return JSONResponse(format_text_completion(job.id, model, result))
-
 
 
 @app.post("/v1/embeddings")
@@ -631,7 +808,7 @@ async def embeddings(request: Request, authorization: Optional[str] = Header(Non
         status_code=400,
         content=openai_error(
             "This deployment does not support the embeddings endpoint. "
-            "Only chat/completions models are available via this worker.",
+            "Only chat/completions models are available via connected workers.",
             "invalid_request_error",
             code="embeddings_not_supported",
         ),
@@ -644,19 +821,21 @@ async def list_models(authorization: Optional[str] = Header(None)):
     now = int(time.time())
     data = [
         {"id": alias, "object": "model", "created": now, "owned_by": "kaggle-worker"}
-        for alias in WORKER.models.keys()
+        for alias in REGISTRY.all_known_models().keys()
     ]
     return {"object": "list", "data": data}
 
 
 @app.get("/health")
 async def health():
-    JOBS.cleanup()
+    REGISTRY.cleanup()
+    workers_snapshot = [w.snapshot() for w in REGISTRY.all_workers()]
     return {
         "status": "ok",
-        "worker": WORKER.snapshot(),
-        "queue_depth": JOBS.qsize(),
-        "in_flight_jobs": sum(1 for j in JOBS.jobs.values() if not j.future.done()),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "workers": workers_snapshot,
+        "queue_depth": REGISTRY.total_queue_depth(),
+        "in_flight_jobs": REGISTRY.total_in_flight(),
     }
 
 
@@ -665,26 +844,57 @@ async def dashboard():
     if not CONFIG["dashboard"].get("enabled", True):
         raise HTTPException(status_code=404)
     refresh = CONFIG["dashboard"].get("refresh_seconds", 5)
-    w = WORKER.snapshot()
-    pending = sum(1 for j in JOBS.jobs.values() if not j.future.done())
+    workers = REGISTRY.all_workers()
+    workers_sorted = sorted(workers, key=lambda w: w.worker_id)
+
+    rows = []
+    for w in workers_sorted:
+        snap = w.snapshot()
+        status_class = "ok" if snap["online"] else "bad"
+        gpu = snap["gpu_stats"] or {}
+        gpu_str = (f"{gpu.get('used_mb', '?')}/{gpu.get('total_mb', '?')} MB "
+                   f"({gpu.get('utilization_percent', '?')}%)") if gpu else "—"
+        rows.append(f"""
+      <tr>
+        <td>{snap['worker_id']}</td>
+        <td class="{status_class}">{snap['online']}</td>
+        <td>{snap['transport']}</td>
+        <td>{snap['status']}</td>
+        <td>{snap['current_model'] or '—'}</td>
+        <td>{', '.join(snap['known_models']) or '(none reported yet)'}</td>
+        <td>{snap['in_flight_jobs']}</td>
+        <td>{snap['queue_depth']}</td>
+        <td>{gpu_str}</td>
+        <td>{snap['last_heartbeat_age_seconds']}</td>
+      </tr>""")
+
+    total_queue = REGISTRY.total_queue_depth()
+    total_in_flight = REGISTRY.total_in_flight()
+    online_count = sum(1 for w in workers if w.is_online())
+
     html = f"""
     <html><head><meta http-equiv="refresh" content="{refresh}">
-    <title>GGUF Proxy Dashboard</title>
+    <title>Multi-Worker Proxy Dashboard</title>
     <style>
         body {{ font-family: monospace; background:#0d1117; color:#c9d1d9; padding:2rem; }}
         .ok {{ color:#3fb950; }} .bad {{ color:#f85149; }}
-        table {{ border-collapse: collapse; }} td, th {{ padding: 4px 12px; text-align:left; }}
+        table {{ border-collapse: collapse; width: 100%; }}
+        td, th {{ padding: 6px 12px; text-align:left; border-bottom: 1px solid #21262d; }}
+        th {{ color: #8b949e; text-transform: uppercase; font-size: 0.8em; }}
+        .summary td {{ padding: 4px 12px; }}
+        h2 {{ margin-bottom: 0.2em; }}
+        .sub {{ color: #8b949e; margin-top:0; }}
     </style></head><body>
-    <h2>GGUF Kaggle Proxy Dashboard</h2>
+    <h2>GGUF Kaggle Multi-Worker Proxy Dashboard</h2>
+    <p class="sub">{online_count}/{len(workers)} workers online &middot;
+       total queue depth {total_queue} &middot; total in-flight {total_in_flight}</p>
     <table>
-      <tr><td>Worker online</td><td class="{'ok' if w['online'] else 'bad'}">{w['online']}</td></tr>
-      <tr><td>Worker id</td><td>{w['worker_id']}</td></tr>
-      <tr><td>Transport</td><td>{w['transport']}</td></tr>
-      <tr><td>Status</td><td>{w['status']}</td></tr>
-      <tr><td>Current model</td><td>{w['current_model']}</td></tr>
-      <tr><td>Known models</td><td>{', '.join(w['known_models']) or '(none reported yet)'}</td></tr>
-      <tr><td>Queue depth</td><td>{JOBS.qsize()}</td></tr>
-      <tr><td>Pending jobs (incl. in-flight)</td><td>{pending}</td></tr>
+      <tr>
+        <th>Worker ID</th><th>Online</th><th>Transport</th><th>Status</th>
+        <th>Current Model</th><th>Known Models</th><th>In-Flight</th>
+        <th>Queue</th><th>GPU</th><th>Last HB (s)</th>
+      </tr>
+      {''.join(rows) if rows else '<tr><td colspan="10">No workers have registered yet.</td></tr>'}
     </table>
     </body></html>
     """
@@ -696,25 +906,13 @@ async def dashboard():
 # --------------------------------------------------------------------------- #
 
 
-def apply_worker_hello(worker_id: str, models: dict, transport: str) -> None:
-    WORKER.worker_id = worker_id
-    WORKER.models = models or {}
-    WORKER.transport = transport
-    WORKER.status = "idle"
-    WORKER.touch()
+def apply_worker_hello(worker: WorkerState, models: dict, transport: str) -> None:
+    worker.models = models or {}
+    worker.transport = transport
+    worker.status = "idle"
+    worker.touch()
     logger.info("Worker '%s' registered via %s. Models: %s",
-                worker_id, transport, list(WORKER.models.keys()))
-
-
-async def fail_in_flight_jobs(reason: str) -> None:
-    """Immediately fail/requeue every job that was already delivered to the
-    (now-gone) worker connection, instead of waiting for the watchdog to
-    notice via its timeout. Jobs that are still only queued (never
-    delivered) are left alone -- they'll simply wait for the next worker to
-    connect and pick them up, same as before."""
-    in_flight = [j for j in JOBS.jobs.values() if not j.future.done() and j.delivered]
-    for job in in_flight:
-        await JOBS.requeue_or_fail(job, reason)
+                worker.worker_id, transport, list(worker.models.keys()))
 
 
 # --------------------------------------------------------------------------- #
@@ -727,6 +925,7 @@ async def worker_ws(websocket: WebSocket):
     await websocket.accept()
     authed = False
     worker_id = None
+    worker: Optional[WorkerState] = None
     try:
         # First message must be an auth/hello frame.
         hello_raw = await asyncio.wait_for(websocket.receive_text(), timeout=15)
@@ -734,7 +933,13 @@ async def worker_ws(websocket: WebSocket):
         if hello.get("type") != "hello":
             await websocket.close(code=4001)
             return
-        worker_id = hello.get("worker_id", "kaggle-worker")
+        worker_id = hello.get("worker_id")
+        if not worker_id:
+            await websocket.send_text(json.dumps({
+                "type": "auth_failed", "reason": "worker_id is required",
+            }))
+            await websocket.close(code=4001)
+            return
         timestamp = hello.get("timestamp", "")
         signature = hello.get("signature", "")
         if not verify_worker_auth(worker_id, timestamp, signature):
@@ -742,38 +947,42 @@ async def worker_ws(websocket: WebSocket):
             await websocket.close(code=4003)
             return
 
-        if WORKER.is_online() and WORKER.worker_id and WORKER.worker_id != worker_id:
-            # Enforce "exactly one active worker" -- reject a second worker
-            # while an existing one is alive.
+        worker = await REGISTRY.get_or_create(worker_id)
+
+        if worker.is_online() and worker.ws is not None:
+            # This specific worker_id already has an active connection --
+            # reject the new one rather than silently stealing the slot.
+            # (Unlike the single-worker reference, DIFFERENT worker_ids are
+            # always allowed to be active simultaneously; this check only
+            # guards against the same worker_id double-connecting.)
             await websocket.send_text(json.dumps({
                 "type": "auth_failed",
-                "reason": "another worker is already active",
+                "reason": f"worker_id '{worker_id}' already has an active connection",
             }))
             await websocket.close(code=4009)
             return
 
         authed = True
-        WORKER.ws = websocket
-        apply_worker_hello(worker_id, hello.get("models", {}), "ws")
+        worker.ws = websocket
+        apply_worker_hello(worker, hello.get("models", {}), "ws")
         await websocket.send_text(json.dumps({"type": "hello_ack"}))
 
         heartbeat_timeout = CONFIG["websocket"]["heartbeat_timeout_seconds"]
-        ack_timeout = CONFIG["job_delivery_ack_timeout_seconds"]
 
-        async def dispatcher():
-            """Pulls jobs off the queue and pushes them to this worker one
-            at a time (the GGUF backend processes a single request at a
+        async def dispatcher(w: WorkerState):
+            """Pulls jobs off THIS worker's queue and pushes them to it one
+            at a time (a single GGUF backend processes one request at a
             time), waiting for the result before moving on. For streaming
             jobs, 'done' means the worker sent stream_done/error -- the
             individual tokens themselves are delivered separately via the
             job's stream_queue and consumed directly by the SSE response."""
             while True:
-                job = await JOBS.wait_next_for_delivery(timeout=5)
+                job = await REGISTRY.wait_next_for_delivery(w, timeout=5)
                 if job is None:
-                    if not WORKER.is_online():
+                    if not w.is_online() or w.ws is not websocket:
                         return
                     continue
-                WORKER.status = "busy"
+                w.status = "busy"
                 try:
                     await websocket.send_text(json.dumps({
                         "type": "job",
@@ -781,7 +990,7 @@ async def worker_ws(websocket: WebSocket):
                         "payload": job.payload,
                     }))
                 except Exception as e:
-                    await JOBS.requeue_or_fail(job, f"send failed: {e}")
+                    await REGISTRY.requeue_or_fail(w, job, f"send failed: {e}")
                     return
                 # Wait for the job's future to resolve. The window is
                 # rolling (based on last_activity_at) rather than a single
@@ -789,16 +998,17 @@ async def worker_ws(websocket: WebSocket):
                 # generation doesn't get killed just for taking a while.
                 while not job.future.done():
                     await asyncio.sleep(0.2)
-                    if not WORKER.is_online():
+                    if not w.is_online() or w.ws is not websocket:
                         break
                     last_activity = job.last_activity_at or job.delivered_at or time.time()
                     if time.time() - last_activity > job.timeout:
                         break
                 if not job.future.done():
-                    await JOBS.requeue_or_fail(job, "worker did not respond in time")
-                WORKER.status = "idle"
+                    await REGISTRY.requeue_or_fail(w, job, "worker did not respond in time")
+                w.status = "idle"
 
-        dispatcher_task = asyncio.create_task(dispatcher())
+        dispatcher_task = asyncio.create_task(dispatcher(worker))
+        worker.dispatcher_task = dispatcher_task
 
         try:
             while True:
@@ -806,22 +1016,25 @@ async def worker_ws(websocket: WebSocket):
                 msg = json.loads(raw)
                 mtype = msg.get("type")
                 if mtype == "heartbeat":
-                    WORKER.touch()
-                    WORKER.status = msg.get("status", WORKER.status)
-                    WORKER.current_model = msg.get("current_model", WORKER.current_model)
+                    worker.touch()
+                    worker.status = msg.get("status", worker.status)
+                    worker.current_model = msg.get("current_model", worker.current_model)
+                    gpu_stats = msg.get("gpu_stats")
+                    if isinstance(gpu_stats, dict):
+                        worker.gpu_stats = gpu_stats
                     await websocket.send_text(json.dumps({"type": "heartbeat_ack"}))
                 elif mtype == "ack":
-                    WORKER.touch()  # job delivery acknowledged, nothing else to do
+                    worker.touch()  # job delivery acknowledged, nothing else to do
                 elif mtype == "result":
-                    WORKER.touch()
+                    worker.touch()
                     job_id = msg.get("job_id")
-                    JOBS.complete(job_id, msg.get("result"), msg.get("error"))
+                    REGISTRY.complete(worker, job_id, msg.get("result"), msg.get("error"))
                 elif mtype == "stream_chunk":
                     # A single token/delta for an in-progress streaming job.
-                    WORKER.touch()
+                    worker.touch()
                     job_id = msg.get("job_id")
-                    JOBS.mark_activity(job_id)
-                    job = JOBS.jobs.get(job_id)
+                    REGISTRY.mark_activity(worker, job_id)
+                    job = worker.jobs.get(job_id)
                     if job is not None and job.stream_queue is not None:
                         await job.stream_queue.put({
                             "delta": msg.get("delta", ""),
@@ -831,48 +1044,50 @@ async def worker_ws(websocket: WebSocket):
                     # Streaming job finished successfully -- unblock the SSE
                     # consumer with the end-of-stream sentinel and resolve
                     # the job future (carries aggregated usage, if any).
-                    WORKER.touch()
+                    worker.touch()
                     job_id = msg.get("job_id")
-                    job = JOBS.jobs.get(job_id)
+                    job = worker.jobs.get(job_id)
                     if job is not None and job.stream_queue is not None:
                         await job.stream_queue.put(None)
-                    JOBS.complete(job_id, msg.get("result", {}), None)
+                    REGISTRY.complete(worker, job_id, msg.get("result", {}), None)
                 elif mtype == "error":
                     # Out-of-band error for a job that may be mid-stream.
-                    WORKER.touch()
+                    worker.touch()
                     job_id = msg.get("job_id")
-                    job = JOBS.jobs.get(job_id)
+                    job = worker.jobs.get(job_id)
                     if job is not None and job.stream_queue is not None:
                         await job.stream_queue.put({"error": msg.get("error", "unknown error")})
                         await job.stream_queue.put(None)
-                    JOBS.complete(job_id, None, msg.get("error", "unknown error"))
+                    REGISTRY.complete(worker, job_id, None, msg.get("error", "unknown error"))
                 elif mtype == "models_update":
-                    WORKER.models = msg.get("models", WORKER.models)
+                    worker.models = msg.get("models", worker.models)
                 else:
-                    logger.debug("Unknown WS message type from worker: %s", mtype)
+                    logger.debug("Unknown WS message type from worker '%s': %s",
+                                worker_id, mtype)
         finally:
             dispatcher_task.cancel()
 
     except (WebSocketDisconnect, asyncio.TimeoutError):
         pass
     except Exception as e:
-        logger.warning("Worker WS session error: %s", e)
+        logger.warning("Worker '%s' WS session error: %s", worker_id, e)
     finally:
-        if authed and WORKER.worker_id == worker_id:
-            WORKER.ws = None
-            WORKER.transport = None
+        if authed and worker is not None and worker.ws is websocket:
+            worker.ws = None
+            worker.transport = None
             # Mark offline THE INSTANT the socket is gone -- don't wait for
             # worker_offline_after_seconds. The dispatcher task tied to this
             # connection has already been cancelled above, so nothing will
             # ever pull queued jobs or resolve in-flight ones for this
             # connection; without this, is_online() would keep reporting
             # True for up to worker_offline_after_seconds, so new requests
-            # would be accepted and then hang, and any job that was already
-            # delivered to this worker would just sit until its own
-            # (much longer) per-job timeout expired.
-            WORKER.mark_offline()
+            # would be routed to it and then hang, and any job that was
+            # already delivered would just sit until its own (much longer)
+            # per-job timeout expired.
+            worker.mark_offline()
             logger.info("Worker '%s' disconnected from WebSocket.", worker_id)
-            await fail_in_flight_jobs("worker disconnected mid-request")
+            await REGISTRY.fail_in_flight_jobs_for_worker(
+                worker, "worker disconnected mid-request")
 
 
 # --------------------------------------------------------------------------- #
@@ -883,12 +1098,20 @@ async def worker_ws(websocket: WebSocket):
 @app.post("/worker/register")
 async def worker_register(request: Request):
     body = await request.json()
-    worker_id = body.get("worker_id", "kaggle-worker")
+    worker_id = body.get("worker_id")
+    if not worker_id:
+        raise HTTPException(status_code=400, detail="worker_id is required")
     if not verify_worker_auth(worker_id, body.get("timestamp", ""), body.get("signature", "")):
         raise HTTPException(status_code=401, detail="bad worker signature")
-    if WORKER.is_online() and WORKER.transport == "ws" and WORKER.worker_id != worker_id:
-        raise HTTPException(status_code=409, detail="another worker is already active")
-    apply_worker_hello(worker_id, body.get("models", {}), "poll")
+
+    worker = await REGISTRY.get_or_create(worker_id)
+    if worker.is_online() and worker.transport == "ws":
+        # This worker_id already has a live WebSocket connection; don't let
+        # a stray long-poll registration for the same id silently steal or
+        # confuse routing. Other worker_ids are unaffected.
+        raise HTTPException(status_code=409, detail=(
+            f"worker_id '{worker_id}' already has an active WebSocket connection"))
+    apply_worker_hello(worker, body.get("models", {}), "poll")
     return {"status": "registered"}
 
 
@@ -896,43 +1119,64 @@ async def worker_register(request: Request):
 async def worker_poll(worker_id: str, timestamp: str, signature: str):
     if not verify_worker_auth(worker_id, timestamp, signature):
         raise HTTPException(status_code=401, detail="bad worker signature")
-    WORKER.touch()
-    if WORKER.transport != "ws":
-        WORKER.transport = "poll"
-    WORKER.status = "idle"
-    job = await JOBS.wait_next_for_delivery(timeout=CONFIG["long_poll_timeout_seconds"])
+    worker = REGISTRY.get(worker_id)
+    if worker is None:
+        raise HTTPException(status_code=404, detail=(
+            "worker_id not registered -- call /worker/register first"))
+    worker.touch()
+    if worker.transport != "ws":
+        worker.transport = "poll"
+    worker.status = "idle"
+    job = await REGISTRY.wait_next_for_delivery(
+        worker, timeout=CONFIG["long_poll_timeout_seconds"])
     if job is None:
         return {"job": None}
-    WORKER.status = "busy"
+    worker.status = "busy"
     return {"job": {"job_id": job.id, "payload": job.payload}}
 
 
 @app.post("/worker/result")
 async def worker_result(request: Request):
     body = await request.json()
-    worker_id = body.get("worker_id", "kaggle-worker")
+    worker_id = body.get("worker_id")
+    if not worker_id:
+        raise HTTPException(status_code=400, detail="worker_id is required")
     if not verify_worker_auth(worker_id, body.get("timestamp", ""), body.get("signature", "")):
         raise HTTPException(status_code=401, detail="bad worker signature")
-    WORKER.touch()
-    WORKER.status = "idle"
+    worker = REGISTRY.get(worker_id)
+    if worker is None:
+        raise HTTPException(status_code=404, detail="unknown worker_id")
+    worker.touch()
+    worker.status = "idle"
     job_id = body.get("job_id")
-    ok = JOBS.complete(job_id, body.get("result"), body.get("error"))
+    ok = REGISTRY.complete(worker, job_id, body.get("result"), body.get("error"))
     return {"accepted": ok}
 
 
 @app.post("/worker/heartbeat")
 async def worker_heartbeat(request: Request):
-    """Used by the long-poll worker between jobs so it can be marked online
-    even while /worker/poll is (deliberately) blocked waiting for work."""
+    """Used by long-poll workers between jobs so they're marked online even
+    while /worker/poll is (deliberately) blocked waiting for work. Also
+    carries GPU stats, since long-poll workers have no other channel to
+    push them outside of a job cycle."""
     body = await request.json()
-    worker_id = body.get("worker_id", "kaggle-worker")
+    worker_id = body.get("worker_id")
+    if not worker_id:
+        raise HTTPException(status_code=400, detail="worker_id is required")
     if not verify_worker_auth(worker_id, body.get("timestamp", ""), body.get("signature", "")):
         raise HTTPException(status_code=401, detail="bad worker signature")
-    WORKER.touch()
-    WORKER.status = body.get("status", WORKER.status)
-    WORKER.current_model = body.get("current_model", WORKER.current_model)
+    worker = REGISTRY.get(worker_id)
+    if worker is None:
+        raise HTTPException(status_code=404, detail=(
+            "worker_id not registered -- call /worker/register first"))
+    worker.touch()
+    worker.status = body.get("status", worker.status)
+    worker.current_model = body.get("current_model", worker.current_model)
+    gpu_stats = body.get("gpu_stats")
+    if isinstance(gpu_stats, dict):
+        worker.gpu_stats = gpu_stats
     if "models" in body:
-        WORKER.models = body["models"]
+        worker.models = body["models"]
     return {"status": "ok"}
 
 
@@ -943,15 +1187,18 @@ async def worker_deregister(request: Request):
     about the disconnect immediately instead of relying purely on the
     WebSocket close event or the long-poll heartbeat timeout."""
     body = await request.json()
-    worker_id = body.get("worker_id", "kaggle-worker")
+    worker_id = body.get("worker_id")
+    if not worker_id:
+        raise HTTPException(status_code=400, detail="worker_id is required")
     if not verify_worker_auth(worker_id, body.get("timestamp", ""), body.get("signature", "")):
         raise HTTPException(status_code=401, detail="bad worker signature")
-    if WORKER.worker_id == worker_id:
-        WORKER.ws = None
-        WORKER.transport = None
-        WORKER.mark_offline()
+    worker = REGISTRY.get(worker_id)
+    if worker is not None:
+        worker.ws = None
+        worker.transport = None
+        worker.mark_offline()
         logger.info("Worker '%s' explicitly deregistered.", worker_id)
-        await fail_in_flight_jobs("worker deregistered")
+        await REGISTRY.fail_in_flight_jobs_for_worker(worker, "worker deregistered")
     return {"status": "deregistered"}
 
 
@@ -959,7 +1206,9 @@ async def worker_deregister(request: Request):
 # Background watchdog: fail jobs that were delivered but never completed
 # (covers the case of a worker dying mid-job on either transport, as a
 # backstop for anything the immediate-disconnect handlers above don't catch
-# -- e.g. a long-poll worker that vanishes without ever calling /deregister).
+# -- e.g. a long-poll worker that vanishes without ever calling
+# /worker/deregister). Now iterates every worker's job map, not a single
+# global one.
 # --------------------------------------------------------------------------- #
 
 
@@ -967,25 +1216,40 @@ async def watchdog_loop():
     while True:
         await asyncio.sleep(5)
         now = time.time()
-        for job in list(JOBS.jobs.values()):
-            if job.future.done():
-                continue
-            if job.delivered:
-                last_activity = job.last_activity_at or job.delivered_at or now
-                if (now - last_activity) > job.timeout:
-                    await JOBS.requeue_or_fail(job, "delivery watchdog timeout")
-            elif (now - job.created_at) > job.timeout:
-                if job.stream_queue is not None:
-                    await job.stream_queue.put({"error": "timed out waiting in queue"})
-                    await job.stream_queue.put(None)
-                job.future.set_exception(RuntimeError("timed out waiting in queue"))
-        JOBS.cleanup()
+        for worker in REGISTRY.all_workers():
+            for job in list(worker.jobs.values()):
+                if job.future.done():
+                    continue
+                if job.delivered:
+                    last_activity = job.last_activity_at or job.delivered_at or now
+                    if (now - last_activity) > job.timeout:
+                        await REGISTRY.requeue_or_fail(worker, job, "delivery watchdog timeout")
+                elif (now - job.created_at) > job.timeout:
+                    if job.stream_queue is not None:
+                        await job.stream_queue.put({"error": "timed out waiting in queue"})
+                        await job.stream_queue.put(None)
+                    job.future.set_exception(RuntimeError("timed out waiting in queue"))
+                    worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+            # A worker whose heartbeat has gone stale (e.g. a long-poll
+            # worker that stopped calling /worker/heartbeat or /worker/poll
+            # without ever hitting /worker/deregister) should be swept to
+            # offline here too, so routing stops sending it new work even
+            # before worker_offline_after_seconds would naturally expire on
+            # its own via is_online()'s own check. (is_online() already
+            # handles the expiry math; this block only handles failing its
+            # in-flight jobs once that expiry has occurred.)
+            if not worker.is_online() and worker.in_flight_jobs > 0:
+                await REGISTRY.fail_in_flight_jobs_for_worker(
+                    worker, "worker heartbeat expired")
+        REGISTRY.cleanup()
+        REGISTRY.prune_dead_workers()
 
 
 @app.on_event("startup")
 async def on_startup():
     asyncio.create_task(watchdog_loop())
-    logger.info("Proxy server started on %s:%s", CONFIG["host"], CONFIG["port"])
+    logger.info("Multi-worker proxy server started on %s:%s",
+                CONFIG["host"], CONFIG["port"])
 
 
 if __name__ == "__main__":

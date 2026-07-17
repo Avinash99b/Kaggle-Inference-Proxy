@@ -1,0 +1,39 @@
+{
+  "host": "0.0.0.0",
+  "port": 8000,
+  "client_api_keys": [
+    "sk-your-api-key-here"
+  ],
+  "worker_shared_secret": "change-me-worker-secret",
+  "max_queue_size_per_worker": 100,
+  "request_timeout_seconds": 300,
+  "long_poll_timeout_seconds": 40,
+  "job_delivery_ack_timeout_seconds": 15,
+  "worker_offline_after_seconds": 90,
+  "auth_timestamp_skew_seconds": 300,
+  "websocket": {
+    "heartbeat_interval_seconds": 20,
+    "heartbeat_timeout_seconds": 60
+  },
+  "retry": {
+    "max_job_retries": 1
+  },
+  "routing": {
+    "prefer_least_busy_gpu": true,
+    "fallback_to_round_robin": true
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "proxy_server.log"
+  },
+  "dashboard": {
+    "enabled": true,
+    "refresh_seconds": 5
+  },
+  "cors": {
+    "enabled": true,
+    "allow_origins": [
+      "*"
+    ]
+  }
+}

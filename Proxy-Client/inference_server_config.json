@@ -1,130 +1,50 @@
 {
-  "proxy_url": "https://kaggle-inference-proxy.onrender.com",
-  "worker_id": "kaggle-worker-1",
-  "worker_shared_secret": "change-me-worker-secret",
-  "huggingface_token": "",
   "model_cache_dir": "/tmp/gguf_models",
-
-  "models": {
-    "general-qwen3-30b": {
-      "repo": "Qwen/Qwen3-30B-A3B-GGUF",
-      "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
-      "description": "Best default general chat/reasoning model; enable/disable thinking according to your frontend."
-    },
-    "general-qwen3-30b-q5": {
-      "repo": "Qwen/Qwen3-30B-A3B-GGUF",
-      "file": "Qwen3-30B-A3B-Q5_K_M.gguf",
-      "description": "Higher-quality general Qwen3 option; use only if your context length and runtime overhead still fit."
-    },
-    "coding-qwen3-coder-30b": {
-      "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
-      "file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
-      "description": "Primary coding, repository edits, debugging, tool use, and agentic programming."
-    },
-    "coding-qwen3-coder-30b-long-context": {
-      "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-1M-GGUF",
-      "file": "Qwen3-Coder-30B-A3B-Instruct-1M-Q4_K_M.gguf",
-      "description": "Coding model variant intended for very large-context workflows; VRAM limits will constrain usable context."
-    },
-    "coding-qwen3-coder-next": {
-      "repo": "Qwen/Qwen3-Coder-Next-GGUF",
-      "file": "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-00001-of-00003.gguf",
-      "description": "Alternative coding-agent model. Use the first shard only; llama.cpp loads the remaining shards automatically."
-    },
-    "roleplay-qwen3-30b-abliterated": {
-      "repo": "mradermacher/Qwen3-30B-A3B-abliterated-GGUF",
-      "file": "Qwen3-30B-A3B-abliterated.Q4_K_M.gguf",
-      "description": "Creative, less-refusal-prone chat/roleplay option. Treat it as an unaligned model and keep normal safety boundaries."
-    },
-    "roleplay-mistral-rp-24b": {
-      "repo": "mradermacher/Mistral-RP-24b-karcher-pro-GGUF",
-      "file": "Mistral-RP-24b-karcher-pro.Q5_K_M.gguf",
-      "description": "Dedicated roleplay/storytelling alternative; Q5 is a good target on 30 GB VRAM."
-    },
-    "roleplay-mistral-small-24b": {
-      "repo": "jerkar/Mistral-Small-24B-Roleplay-V6-Q6_K-GGUF",
-      "file": "Mistral-Small-24B-Roleplay-V6-Q6_K.gguf",
-      "description": "Higher-fidelity 24B roleplay model; use Q6 only with moderate context."
-    },
-    "creative-hexis-24b": {
-      "repo": "WasamiKirua/Hexis-Pure-Soul-24B-GGUF",
-      "file": "Hexis-Pure-Soul-24B-Q5_K_M.gguf",
-      "description": "Creative/persona-heavy chat and long-form character interaction."
-    },
-    "fast-general-qwen3-14b": {
-      "repo": "Qwen/Qwen3-14B-GGUF",
-      "file": "Qwen3-14B-Q8_0.gguf",
-      "description": "Fast, high-quality general model with much more KV-cache headroom than 30B MoE models."
-    },
-    "fast-coder-qwen2.5-coder-14b": {
-      "repo": "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF",
-      "file": "qwen2.5-coder-14b-instruct-q8_0.gguf",
-      "description": "Reliable lower-latency coding fallback, especially for medium-sized files and interactive work."
-    },
-    "small-fast-qwen3-8b": {
-      "repo": "Qwen/Qwen3-8B-GGUF",
-      "file": "Qwen3-8B-Q8_0.gguf",
-      "description": "Fast general assistant and utility model with generous context capacity."
-    },
-    "small-fast-qwen2.5-coder-7b": {
-      "repo": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
-      "file": "qwen2.5-coder-7b-instruct-q8_0.gguf",
-      "description": "Lightweight coding fallback for quick completions, scripts, and lower latency."
-    }
-  },
-
   "default_generation": {
     "temperature": 0.8,
     "top_p": 0.95,
     "max_tokens": 512
   },
-
   "transport": {
     "prefer_websocket": true,
     "ws_path": "/worker/ws",
-    "heartbeat_interval_seconds": 15,
+    "heartbeat_interval_seconds": 5,
     "reconnect_initial_backoff_seconds": 2,
     "reconnect_max_backoff_seconds": 60,
     "ws_failure_threshold_before_poll_fallback": 3,
     "poll_interval_seconds": 2,
     "long_poll_wait_seconds": 40
   },
-
   "download": {
     "max_retries": 4,
     "retry_backoff_seconds": 5
   },
-
   "disk_management": {
     "enabled": true,
     "safety_margin_gb": 2,
     "min_free_space_gb": 5,
     "monitor_interval_seconds": 30
   },
-
   "vram_management": {
     "headroom_fraction": 0.05,
     "min_n_ctx": 256,
     "oom_shrink_factor": 0.75,
-    "max_oom_retries": 4
+    "max_oom_retries": 4,
+    "max_auto_n_ctx": 32768
   },
-
   "backend_build": {
     "prefer_prebuilt_wheel": true,
     "cmake_cuda_args": "-DGGML_CUDA=on"
   },
-
   "gpu": {
     "attempt_dual_gpu_split": true,
-    "n_ctx": 4096,
+    "n_ctx": "max",
     "n_batch": 512,
     "n_threads": 0,
     "n_gpu_layers": -1
   },
-
   "logging": {
     "level": "INFO",
-    "file": "worker.log"
+    "file": "/tmp/inference_server.log"
   }
 }
-
