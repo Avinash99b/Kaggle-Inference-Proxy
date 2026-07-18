@@ -517,15 +517,15 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument(
         "--url",
-        default="http://localhost:8000/v1/chat/completions",
+        default="https://kaggle-inference-proxy.onrender.com/v1/chat/completions",
         help="Chat completions endpoint",
     )
     p.add_argument(
         "--dashboard-url",
-        default="http://localhost:8000/dashboard",
+        default="https://kaggle-inference-proxy.onrender.com/dashboard",
         help="Proxy dashboard URL",
     )
-    p.add_argument("--api-key", default="sk-your-api-key-here", help="Bearer token")
+    p.add_argument("--api-key", default="sk-change-me-client-key", help="Bearer token")
     p.add_argument(
         "--model",
         default="Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf",

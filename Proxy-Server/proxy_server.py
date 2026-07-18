@@ -36,6 +36,22 @@ Unlike the single-worker reference, MANY workers may be connected and
 routed to exactly one worker's queue based on the scoring function below and
 never migrates between workers mid-flight (especially not mid-stream).
 
+Config loading:
+    Config is normally read from (and, if missing, written to) the JSON file
+    at PROXY_CONFIG_PATH (default "proxy_server_config.json"). If the
+    PROXY_SERVER_CONFIG environment variable is set, it takes priority over
+    the file entirely: its value is expected to be a base64-encoded JSON
+    document containing the config (or a partial config to overlay onto the
+    defaults), and no file is read or written in that case.
+
+Worker reconnect handling:
+    If a worker's connection drops while it still has queued or in-flight
+    jobs, the proxy gives it a grace window (worker_reconnect_grace_seconds,
+    default 30s) to reconnect (same worker_id, either transport). If the
+    worker has not come back online by the time that window elapses, ALL of
+    its remaining jobs (queued and in-flight) are cancelled with an error,
+    and the worker is removed from the registry entirely.
+
 Run:
     pip install fastapi "uvicorn[standard]" websockets
     python proxy_server_multi.py
@@ -44,6 +60,8 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import itertools
@@ -66,6 +84,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 # --------------------------------------------------------------------------- #
 
 CONFIG_PATH = os.environ.get("PROXY_CONFIG_PATH", "proxy_server_config.json")
+CONFIG_ENV_VAR = "PROXY_SERVER_CONFIG"
 
 DEFAULT_CONFIG = {
     "host": "0.0.0.0",
@@ -77,6 +96,7 @@ DEFAULT_CONFIG = {
     "long_poll_timeout_seconds": 40,
     "job_delivery_ack_timeout_seconds": 15,
     "worker_offline_after_seconds": 90,
+    "worker_reconnect_grace_seconds": 30,
     "auth_timestamp_skew_seconds": 300,
     "websocket": {
         "heartbeat_interval_seconds": 20,
@@ -104,24 +124,71 @@ DEFAULT_CONFIG = {
 }
 
 
+def _merge_config(defaults: dict, overlay: dict) -> dict:
+    """Deep-merge `overlay` onto `defaults` (one level of nested dicts, which
+    is all this config shape uses), without mutating either input."""
+    merged = json.loads(json.dumps(defaults))
+    merged.update(overlay)
+    for k, v in defaults.items():
+        if isinstance(v, dict) and isinstance(overlay.get(k), dict):
+            merged[k] = {**v, **overlay[k]}
+    return merged
+
+
+def load_config_from_env(var_name: str, defaults: dict) -> Optional[dict]:
+    """If `var_name` is set, decode it as base64-encoded JSON and merge it
+    onto `defaults`. Returns None if the env var isn't set, so the caller
+    can fall back to file-based config. Raises a clear error if the env var
+    is set but malformed, rather than silently ignoring it."""
+    raw = os.environ.get(var_name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        decoded = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise RuntimeError(
+            f"Environment variable {var_name} is set but is not valid "
+            f"base64: {e}") from e
+    try:
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise RuntimeError(
+            f"Environment variable {var_name} decoded from base64 but is "
+            f"not valid JSON: {e}") from e
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"Environment variable {var_name} must decode to a JSON object, "
+            f"got {type(parsed).__name__}.")
+    print(f"[proxy_server_multi] Loaded config from ${var_name} "
+          f"(base64-encoded JSON env var); ignoring '{CONFIG_PATH}'.")
+    return _merge_config(defaults, parsed)
+
+
 def load_or_create_config(path: str, defaults: dict) -> dict:
-    """Load JSON config, or write out a default one and tell the user to edit it."""
+    """Load config with the following precedence:
+
+    1. PROXY_SERVER_CONFIG env var (base64-encoded JSON) if set -- no file
+       is read or written in this case.
+    2. JSON config file at `path`, backfilling any missing keys from
+       `defaults` without clobbering user edits.
+    3. If neither is present, write out a default config file to `path` and
+       use the defaults, same as before.
+    """
+    from_env = load_config_from_env(CONFIG_ENV_VAR, defaults)
+    if from_env is not None:
+        return from_env
+
     if not os.path.exists(path):
         with open(path, "w") as f:
             json.dump(defaults, f, indent=2)
-        print(f"[proxy_server_multi] No config found at '{path}'. A default "
-              f"config has been created. Please review/edit it (API keys, "
-              f"secrets, ports) before exposing this server publicly.")
+        print(f"[proxy_server_multi] No config found at '{path}' and "
+              f"${CONFIG_ENV_VAR} is not set. A default config has been "
+              f"created. Please review/edit it (API keys, secrets, ports) "
+              f"before exposing this server publicly.")
         return json.loads(json.dumps(defaults))
     with open(path, "r") as f:
         cfg = json.load(f)
-    # Backfill any missing keys from defaults without clobbering user edits.
-    merged = json.loads(json.dumps(defaults))
-    merged.update(cfg)
-    for k, v in defaults.items():
-        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-            merged[k] = {**v, **cfg[k]}
-    return merged
+    return _merge_config(defaults, cfg)
 
 
 CONFIG = load_or_create_config(CONFIG_PATH, DEFAULT_CONFIG)
@@ -239,6 +306,15 @@ class WorkerState:
         # Bookkeeping for the WS dispatcher task tied to this connection.
         self.dispatcher_task: Optional["asyncio.Task"] = None
 
+        # Set the instant we positively learn the worker's connection is
+        # gone (WS close, explicit deregister, or heartbeat staleness during
+        # a sweep). Used by the reconnect-grace watchdog below to decide
+        # when a disconnected worker has been gone too long and should be
+        # torn down entirely, rather than left around indefinitely with a
+        # dead queue. Cleared (set back to None) the moment the worker
+        # successfully re-registers, on either transport.
+        self.disconnected_at: Optional[float] = None
+
     def is_online(self) -> bool:
         if self.last_heartbeat == 0:
             return False
@@ -246,14 +322,19 @@ class WorkerState:
 
     def touch(self) -> None:
         self.last_heartbeat = time.time()
+        self.disconnected_at = None
 
     def mark_offline(self) -> None:
         """Immediately mark the worker offline instead of waiting for the
         worker_offline_after_seconds grace window to elapse. Used whenever we
         positively know the connection is gone (WS close, explicit
-        deregister, or heartbeat staleness during a sweep)."""
+        deregister, or heartbeat staleness during a sweep). Also stamps
+        disconnected_at (if not already stamped), which starts the
+        reconnect-grace clock consulted by reap_unreconnected_workers()."""
         self.last_heartbeat = 0.0
         self.status = "unknown"
+        if self.disconnected_at is None:
+            self.disconnected_at = time.time()
 
     def qsize(self) -> int:
         return self.queue.qsize()
@@ -271,6 +352,8 @@ class WorkerState:
             "queue_depth": self.qsize(),
             "last_heartbeat_age_seconds": round(time.time() - self.last_heartbeat, 1)
             if self.last_heartbeat else None,
+            "disconnected_for_seconds": round(time.time() - self.disconnected_at, 1)
+            if self.disconnected_at else None,
         }
 
 
@@ -479,11 +562,76 @@ class WorkerRegistry:
         this (now-gone) worker connection, instead of waiting for the
         watchdog to notice via its timeout. Jobs still only queued (never
         delivered) are left in this worker's queue -- if the worker comes
-        back online they'll be picked up then; the watchdog will eventually
-        fail them too if the worker stays offline past their own timeout."""
+        back online within the reconnect grace window they'll be picked up
+        then; if it doesn't come back within that window,
+        cancel_all_jobs_for_worker() below will cancel those too and the
+        worker will be removed entirely."""
         in_flight = [j for j in worker.jobs.values() if not j.future.done() and j.delivered]
         for job in in_flight:
             await self.requeue_or_fail(worker, job, reason)
+
+    async def cancel_all_jobs_for_worker(self, worker: WorkerState, reason: str) -> int:
+        """Forcefully cancels every still-pending job owned by this worker
+        (both delivered/in-flight and merely queued-but-undelivered), used
+        when a disconnected worker has exceeded its reconnect grace window
+        and is about to be removed from the registry entirely. Unlike
+        requeue_or_fail, this never retries -- the worker is being deleted,
+        so there is nowhere left to requeue to. Returns the number of jobs
+        cancelled."""
+        cancelled = 0
+        for job in list(worker.jobs.values()):
+            if job.future.done():
+                continue
+            if job.stream_queue is not None:
+                await job.stream_queue.put({"error": reason})
+                await job.stream_queue.put(None)
+            job.future.set_exception(RuntimeError(reason))
+            cancelled += 1
+        worker.in_flight_jobs = 0
+        # Drain the queue itself so nothing lingers referencing job ids that
+        # are about to be discarded along with the worker.
+        while not worker.queue.empty():
+            try:
+                worker.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        return cancelled
+
+    async def reap_unreconnected_workers(self, grace_seconds: float, reason: str) -> List[str]:
+        """Watchdog helper: for every worker that has been continuously
+        disconnected for longer than `grace_seconds`, cancel all of its
+        pending/in-flight jobs and remove it from the registry entirely
+        (rather than leaving a dead entry around whose queue nothing will
+        ever service again). Returns the list of worker_ids that were
+        removed."""
+        now = time.time()
+        to_remove = [
+            w for w in self.workers.values()
+            if w.disconnected_at is not None
+            and (now - w.disconnected_at) >= grace_seconds
+        ]
+        removed_ids: List[str] = []
+        for worker in to_remove:
+            # Re-check online status defensively -- a worker could have
+            # reconnected (which clears disconnected_at via touch()) between
+            # building the list above and getting here.
+            if worker.is_online() or worker.disconnected_at is None:
+                continue
+            n = await self.cancel_all_jobs_for_worker(worker, reason)
+            if n:
+                logger.warning(
+                    "Worker '%s' did not reconnect within %.0fs of "
+                    "disconnecting; cancelled %d pending job(s) and "
+                    "removed the worker from the registry.",
+                    worker.worker_id, grace_seconds, n)
+            else:
+                logger.info(
+                    "Worker '%s' did not reconnect within %.0fs of "
+                    "disconnecting; removed the worker from the registry.",
+                    worker.worker_id, grace_seconds)
+            self.workers.pop(worker.worker_id, None)
+            removed_ids.append(worker.worker_id)
+        return removed_ids
 
     def cleanup(self, max_age: float = 3600) -> None:
         now = time.time()
@@ -497,7 +645,11 @@ class WorkerRegistry:
         """Drop bookkeeping for workers that have been offline for a very
         long time, so the registry doesn't grow unbounded across many
         Kaggle session churns. Only prunes workers with no in-flight/queued
-        jobs left."""
+        jobs left. In normal operation, reap_unreconnected_workers() (30s
+        grace window, or as configured) will have already removed and
+        cancelled any disconnected worker with pending jobs long before
+        this much slower long-horizon prune ever runs; this remains as a
+        backstop for workers that disconnect cleanly with no pending work."""
         now = time.time()
         dead = []
         for wid, w in self.workers.items():
@@ -1083,7 +1235,10 @@ async def worker_ws(websocket: WebSocket):
             # True for up to worker_offline_after_seconds, so new requests
             # would be routed to it and then hang, and any job that was
             # already delivered would just sit until its own (much longer)
-            # per-job timeout expired.
+            # per-job timeout expired. mark_offline() also stamps
+            # disconnected_at, which starts the reconnect-grace clock used
+            # by the watchdog to decide when to cancel remaining jobs and
+            # remove this worker entirely if it never comes back.
             worker.mark_offline()
             logger.info("Worker '%s' disconnected from WebSocket.", worker_id)
             await REGISTRY.fail_in_flight_jobs_for_worker(
@@ -1208,11 +1363,16 @@ async def worker_deregister(request: Request):
 # backstop for anything the immediate-disconnect handlers above don't catch
 # -- e.g. a long-poll worker that vanishes without ever calling
 # /worker/deregister). Now iterates every worker's job map, not a single
-# global one.
+# global one. It also enforces the reconnect grace window: any worker that
+# has been continuously disconnected for longer than
+# worker_reconnect_grace_seconds (default 30s) has ALL of its remaining
+# jobs cancelled and is removed from the registry outright, rather than
+# lingering with a queue nothing will ever service.
 # --------------------------------------------------------------------------- #
 
 
 async def watchdog_loop():
+    reconnect_grace = CONFIG.get("worker_reconnect_grace_seconds", 30)
     while True:
         await asyncio.sleep(5)
         now = time.time()
@@ -1237,10 +1397,21 @@ async def watchdog_loop():
             # before worker_offline_after_seconds would naturally expire on
             # its own via is_online()'s own check. (is_online() already
             # handles the expiry math; this block only handles failing its
-            # in-flight jobs once that expiry has occurred.)
+            # in-flight jobs once that expiry has occurred, and stamping
+            # disconnected_at so the reconnect-grace reaper below can
+            # eventually pick it up too.)
             if not worker.is_online() and worker.in_flight_jobs > 0:
                 await REGISTRY.fail_in_flight_jobs_for_worker(
                     worker, "worker heartbeat expired")
+                if worker.disconnected_at is None:
+                    worker.disconnected_at = now
+        # Any worker that has now been disconnected continuously for at
+        # least `reconnect_grace` seconds gets its remaining jobs cancelled
+        # (queued ones included, not just in-flight) and is dropped from
+        # the registry entirely -- it does not get to sit around waiting
+        # for a reconnect that isn't guaranteed to come.
+        await REGISTRY.reap_unreconnected_workers(
+            reconnect_grace, "worker did not reconnect within the grace period")
         REGISTRY.cleanup()
         REGISTRY.prune_dead_workers()
 

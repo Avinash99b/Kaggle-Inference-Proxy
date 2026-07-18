@@ -4,14 +4,31 @@ orchestrator.py
 Multi-account Kaggle deployment orchestrator: manages GPU quotas, deploys
 inference servers, tracks deployment status via REST API + WebSocket.
 
-AUTH DESIGN: kaggle==2.2.3 (kagglesdk-backed) authenticates via a single
-KGAT_-prefixed token through the KAGGLE_API_TOKEN env var. Rather than
-seeding a placeholder at import time, this file never imports `kaggle` at
-module load. Each authenticated call sets KAGGLE_API_TOKEN to that
-account's real token, then (re)imports the kaggle module tree fresh, so
-kagglesdk's eager credential check always sees a valid token and no
+AUTH DESIGN (Kaggle): kaggle==2.2.3 (kagglesdk-backed) authenticates via a
+single KGAT_-prefixed token through the KAGGLE_API_TOKEN env var. Rather
+than seeding a placeholder at import time, this file never imports
+`kaggle` at module load. Each authenticated call sets KAGGLE_API_TOKEN to
+that account's real token, then (re)imports the kaggle module tree fresh,
+so kagglesdk's eager credential check always sees a valid token and no
 account's credentials or cached client state can leak into another
 account's call.
+
+AUTH DESIGN (Orchestrator API): every REST endpoint under /api and the
+/ws WebSocket endpoint require the orchestrator's own shared secret
+(`orchestrator_api_shared_secret` in config). REST calls send it as a
+standard `Authorization: Bearer <secret>` header, checked by the
+`require_shared_secret` FastAPI dependency using a constant-time
+comparison. Native WebSocket clients can't set arbitrary headers during
+the handshake in a browser, so the same secret is instead accepted as a
+`?secret=` (or `?token=`) query parameter on the `/ws` connection URL;
+the connection is accepted only if it matches, and closed immediately
+(policy-violation close code) otherwise.
+
+CONFIG LOADING: orchestrator_config.json is no longer read from disk.
+The full config JSON is instead read from the `ORCHESTRATOR_CONFIG`
+environment variable, base64-encoded, and decoded once at startup (see
+`_load_config`). This keeps secrets (Kaggle tokens, the shared secret
+itself, HF token, proxy shared secret) out of any file on disk.
 
 NOTEBOOK FORMAT: the generated notebook mirrors the known-working
 `inferece.ipynb` two-cell shape exactly:
@@ -35,8 +52,10 @@ deployment_status_loop / crash state persistence.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import enum
-import importlib
+import hmac
 import json
 import logging
 import os
@@ -51,14 +70,18 @@ from typing import Dict, List, Optional, Set
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi.security.utils import get_authorization_scheme_param
 import uvicorn
 
 ###############################################################################
 # Constants
 ###############################################################################
 
-CONFIG_FILE = "orchestrator_config.json"
+# The config used to be read from this file on disk; it is now read from
+# the ORCHESTRATOR_CONFIG env var (base64-encoded JSON) instead. The
+# constant is kept only as a label for error messages.
+CONFIG_ENV_VAR = "ORCHESTRATOR_CONFIG"
 STATE_FILE = "orchestrator_state.json"
 KERNELS_WORKDIR = "/tmp/orchestrator_kernels"
 
@@ -72,6 +95,9 @@ VALID_MACHINE_SHAPES = {
     "NvidiaTpuVmV38",
     "None",
 }
+
+# WebSocket close code for auth failures (policy violation).
+WS_CLOSE_POLICY_VIOLATION = 1008
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -161,7 +187,7 @@ class AccountState:
 
 @dataclass
 class OrchestratorConfig:
-    """Loaded from orchestrator_config.json"""
+    """Loaded from the base64-encoded JSON in the ORCHESTRATOR_CONFIG env var."""
 
     proxy_url: str
     proxy_shared_secret: str
@@ -171,11 +197,81 @@ class OrchestratorConfig:
     notebook_template_url: str
     quota_refresh_interval_minutes: int
     deployment_status_check_interval_seconds: int
+    # Shared secret required to call any /api/* endpoint (as
+    # `Authorization: Bearer <secret>`) or open the /ws WebSocket (as
+    # `?secret=<secret>`, since browsers can't set custom headers on
+    # the WebSocket handshake). Required -- the orchestrator refuses to
+    # start without it, since running the API unauthenticated would
+    # expose Kaggle tokens, HF token, and the proxy shared secret.
+    orchestrator_api_shared_secret: str = ""
     # GPU shape requested on kernel push. Must be one of
     # VALID_MACHINE_SHAPES. Defaults to a T4 (the shape used by the
     # known-working reference config).
     machine_shape: str = "NvidiaTeslaT4"
     enable_tpu: bool = False
+
+
+###############################################################################
+# Auth helpers
+###############################################################################
+
+
+def _constant_time_eq(a: str, b: str) -> bool:
+    """Constant-time string comparison to avoid timing side-channels on secret checks."""
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+def require_shared_secret(authorization: Optional[str] = Header(default=None)) -> None:
+    """
+    FastAPI dependency enforcing `Authorization: Bearer <orchestrator_api_shared_secret>`
+    on every /api/* endpoint. Raises 401 on any mismatch, missing header,
+    wrong scheme, or (defensively) if the orchestrator's own secret isn't
+    configured -- an unconfigured secret must never be treated as "auth
+    disabled".
+    """
+    configured_secret = orch.config.orchestrator_api_shared_secret if orch.config else ""
+
+    if not configured_secret:
+        # Defense in depth: startup() already refuses to boot without a
+        # configured secret, but if this is ever reached anyway, fail
+        # closed rather than silently allowing every request through.
+        logger.error("require_shared_secret: no orchestrator_api_shared_secret configured; denying request.")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+    scheme, credentials = get_authorization_scheme_param(authorization or "")
+    if not authorization or scheme.lower() != "bearer" or not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed Authorization header; expected 'Bearer <token>'.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    print(f"require_shared_secret: provided={credentials!r}, configured={configured_secret!r}")
+    if not _constant_time_eq(credentials, configured_secret):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def _websocket_secret_is_valid(websocket: WebSocket) -> bool:
+    """
+    Checks the `secret` (or `token`) query parameter on a WebSocket
+    connection against orchestrator_api_shared_secret. Browsers cannot
+    set arbitrary headers during the WS handshake, so the secret travels
+    as a query param here instead of an Authorization header.
+    """
+    configured_secret = orch.config.orchestrator_api_shared_secret if orch.config else ""
+    if not configured_secret:
+        logger.error("_websocket_secret_is_valid: no orchestrator_api_shared_secret configured; denying connection.")
+        return False
+
+    provided = websocket.query_params.get("secret") or websocket.query_params.get("token")
+    if not provided:
+        return False
+
+    return _constant_time_eq(provided, configured_secret)
 
 
 ###############################################################################
@@ -803,8 +899,17 @@ class Orchestrator:
     async def startup(self):
         """Initialize orchestrator on startup."""
         try:
-            logger.info("Loading config...")
+            logger.info(f"Loading config from {CONFIG_ENV_VAR} env var...")
             self.config = self._load_config()
+
+            if not self.config.orchestrator_api_shared_secret:
+                # Fail closed: refuse to serve an unauthenticated API
+                # rather than silently starting with auth disabled.
+                raise RuntimeError(
+                    "orchestrator_api_shared_secret is not set in the ORCHESTRATOR_CONFIG "
+                    "payload. Refusing to start with the API unauthenticated."
+                )
+
             self.generator = NotebookGenerator(self.config.notebook_template_url)
             self.hf = HuggingFaceService(self.config.hf_token)
 
@@ -840,7 +945,7 @@ class Orchestrator:
                 token = self.accounts[account_id].kaggle_api_token
                 if not token:
                     logger.warning(
-                        f"Account {account_id} has no kaggle_api_token set in {CONFIG_FILE}. "
+                        f"Account {account_id} has no kaggle_api_token set in {CONFIG_ENV_VAR}. "
                         f"Kernel push/status calls will fail until it's added."
                     )
                 elif not token.startswith("KGAT_"):
@@ -873,15 +978,33 @@ class Orchestrator:
             raise
 
     def _load_config(self) -> OrchestratorConfig:
-        """Loads orchestrator_config.json. kaggle_api_token must be a KGAT_ token per account."""
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                config_dict = json.load(f)
+        """
+        Loads config from the ORCHESTRATOR_CONFIG env var: base64-encoded
+        JSON, decoded once here. orchestrator_api_shared_secret must be
+        set; kaggle_api_token must be a KGAT_ token per account.
+        """
+        raw_env_value = os.environ.get(CONFIG_ENV_VAR)
+        if not raw_env_value:
+            logger.error(f"{CONFIG_ENV_VAR} env var is not set.")
+            raise HTTPException(status_code=500, detail=f"{CONFIG_ENV_VAR} env var is not set")
 
+        try:
+            decoded_bytes = base64.b64decode(raw_env_value, validate=True)
+        except (binascii.Error, ValueError) as e:
+            logger.error(f"{CONFIG_ENV_VAR} is not valid base64: {e}")
+            raise HTTPException(status_code=500, detail=f"{CONFIG_ENV_VAR} is not valid base64")
+
+        try:
+            config_dict = json.loads(decoded_bytes.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.error(f"{CONFIG_ENV_VAR} did not decode to valid JSON: {e}")
+            raise HTTPException(status_code=500, detail=f"{CONFIG_ENV_VAR} did not decode to valid JSON")
+
+        try:
             machine_shape = config_dict.get("machine_shape", "NvidiaTeslaT4")
             if machine_shape not in VALID_MACHINE_SHAPES:
                 logger.warning(
-                    f"{CONFIG_FILE} machine_shape={machine_shape!r} is not one of "
+                    f"{CONFIG_ENV_VAR} machine_shape={machine_shape!r} is not one of "
                     f"{sorted(VALID_MACHINE_SHAPES)}; using it as-is, but double-check "
                     f"it matches what Kaggle expects."
                 )
@@ -895,12 +1018,15 @@ class Orchestrator:
                 notebook_template_url=config_dict.get("notebook_template_url", ""),
                 quota_refresh_interval_minutes=config_dict.get("quota_refresh_interval_minutes", 10),
                 deployment_status_check_interval_seconds=config_dict.get("deployment_status_check_interval_seconds", 30),
+                orchestrator_api_shared_secret=config_dict.get("orchestrator_api_shared_secret", ""),
                 machine_shape=machine_shape,
                 enable_tpu=config_dict.get("enable_tpu", False),
             )
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Failed to load config: {e}")
-            raise HTTPException(status_code=500, detail="Config load failed")
+            logger.error(f"Failed to parse config: {e}")
+            raise HTTPException(status_code=500, detail="Config parse failed")
 
     async def refresh_quotas(self):
         """Refresh GPU quotas for all accounts."""
@@ -1005,7 +1131,7 @@ class Orchestrator:
         if not account.kaggle_api_token:
             raise HTTPException(
                 status_code=400,
-                detail=f"Account {account_id} has no kaggle_api_token configured in {CONFIG_FILE}."
+                detail=f"Account {account_id} has no kaggle_api_token configured in {CONFIG_ENV_VAR}."
             )
 
         quota_needed = estimated_hours * 3600
@@ -1150,7 +1276,7 @@ async def startup():
 ###############################################################################
 
 
-@app.get("/api/accounts")
+@app.get("/api/accounts", dependencies=[Depends(require_shared_secret)])
 async def list_accounts():
     """Return all accounts sorted by remaining quota (ascending)."""
     accounts_list = sorted(
@@ -1183,7 +1309,7 @@ async def list_accounts():
 ###############################################################################
 
 
-@app.get("/api/deployments")
+@app.get("/api/deployments", dependencies=[Depends(require_shared_secret)])
 async def list_deployments():
     """Return all deployments."""
     return {
@@ -1209,7 +1335,7 @@ async def list_deployments():
     }
 
 
-@app.get("/api/deployments/{deployment_id}")
+@app.get("/api/deployments/{deployment_id}", dependencies=[Depends(require_shared_secret)])
 async def get_deployment(deployment_id: str):
     """Get single deployment status."""
     if deployment_id not in orch.deployments:
@@ -1234,7 +1360,7 @@ async def get_deployment(deployment_id: str):
     }
 
 
-@app.post("/api/deployments")
+@app.post("/api/deployments", dependencies=[Depends(require_shared_secret)])
 async def deploy(body: dict):
     """Create new deployment."""
     try:
@@ -1273,14 +1399,14 @@ async def deploy(body: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/api/deployments/{deployment_id}")
+@app.delete("/api/deployments/{deployment_id}", dependencies=[Depends(require_shared_secret)])
 async def undeploy(deployment_id: str):
     """Stop deployment (deletes the underlying Kaggle kernel)."""
     await orch.delete_deployment(deployment_id)
     return {"status": "stopped"}
 
 
-@app.post("/api/deployments/{deployment_id}/refresh-status")
+@app.post("/api/deployments/{deployment_id}/refresh-status", dependencies=[Depends(require_shared_secret)])
 async def refresh_status(deployment_id: str):
     """Force status refresh."""
     await orch.refresh_deployment(deployment_id)
@@ -1292,7 +1418,7 @@ async def refresh_status(deployment_id: str):
 ###############################################################################
 
 
-@app.get("/api/models/list-files")
+@app.get("/api/models/list-files", dependencies=[Depends(require_shared_secret)])
 async def list_model_files(repo: str):
     """List GGUF files in HuggingFace repo."""
     try:
@@ -1310,7 +1436,7 @@ async def list_model_files(repo: str):
 ###############################################################################
 
 
-@app.get("/api/health")
+@app.get("/api/health", dependencies=[Depends(require_shared_secret)])
 async def health():
     """Orchestrator health status."""
     deployments_running = sum(
@@ -1338,7 +1464,21 @@ async def health():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time updates."""
+    """
+    WebSocket endpoint for real-time updates.
+
+    Auth: browsers can't attach an Authorization header to a WebSocket
+    handshake, so the client must instead connect with the shared secret
+    as a query parameter, e.g. `wss://host/ws?secret=<orchestrator_api_shared_secret>`.
+    The connection is rejected (closed with policy-violation code 1008)
+    before being added to the broadcast set if the secret is missing or
+    wrong.
+    """
+    if not _websocket_secret_is_valid(websocket):
+        await websocket.close(code=WS_CLOSE_POLICY_VIOLATION)
+        logger.warning("WebSocket connection rejected: missing or invalid secret query param.")
+        return
+
     await orch.websocket.connect(websocket)
 
     try:
@@ -1359,11 +1499,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     try:
-        with open(CONFIG_FILE, 'r') as f:
-            config_dict = json.load(f)
+        raw_env_value = os.environ.get(CONFIG_ENV_VAR, "")
+        config_dict = json.loads(base64.b64decode(raw_env_value).decode("utf-8")) if raw_env_value else {}
         port = config_dict.get("orchestrator_port", 5000)
     except Exception as e:
-        print(f"Warning: Could not load config, using default port 5000: {e}")
+        print(f"Warning: Could not read {CONFIG_ENV_VAR}, using default port 5000: {e}")
         port = 5000
 
     print(f"Starting Kaggle Orchestrator on port {port}...")
