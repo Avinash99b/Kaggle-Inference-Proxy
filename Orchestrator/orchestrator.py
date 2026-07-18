@@ -71,6 +71,7 @@ from datetime import datetime, timezone
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.utils import get_authorization_scheme_param
 import uvicorn
 
@@ -235,7 +236,6 @@ def require_shared_secret(authorization: Optional[str] = Header(default=None)) -
         # Defense in depth: startup() already refuses to boot without a
         # configured secret, but if this is ever reached anyway, fail
         # closed rather than silently allowing every request through.
-        logger.error("require_shared_secret: no orchestrator_api_shared_secret configured; denying request.")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
     scheme, credentials = get_authorization_scheme_param(authorization or "")
@@ -1263,6 +1263,15 @@ class Orchestrator:
 ###############################################################################
 
 app = FastAPI(title="Kaggle Orchestrator")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
 orch = Orchestrator()
 
 

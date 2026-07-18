@@ -1,0 +1,326 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: Orchestrator Dashboard API — proxies to the remote orchestrator
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: accounts
+    description: Kaggle account management
+  - name: deployments
+    description: Model deployment management
+  - name: models
+    description: Model file listing
+
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /accounts:
+    get:
+      operationId: listAccounts
+      tags: [accounts]
+      summary: List all Kaggle accounts
+      description: Returns all Kaggle accounts with GPU quota information
+      responses:
+        "200":
+          description: List of accounts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountsResponse"
+        "502":
+          description: Orchestrator unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /deployments:
+    get:
+      operationId: listDeployments
+      tags: [deployments]
+      summary: List all active deployments
+      description: Returns all model deployments with their current status
+      responses:
+        "200":
+          description: List of deployments
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentsResponse"
+        "502":
+          description: Orchestrator unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    post:
+      operationId: createDeployment
+      tags: [deployments]
+      summary: Deploy a model to a Kaggle account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeploymentInput"
+      responses:
+        "200":
+          description: Deployment created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentResult"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Orchestrator unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /deployments/{deploymentId}:
+    delete:
+      operationId: stopDeployment
+      tags: [deployments]
+      summary: Stop a deployment
+      parameters:
+        - name: deploymentId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deployment stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StopResult"
+        "404":
+          description: Deployment not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Orchestrator unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /models/list-files:
+    get:
+      operationId: listModelFiles
+      tags: [models]
+      summary: List GGUF files in a Hugging Face model repo
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          schema:
+            type: string
+          description: HuggingFace repo ID, e.g. "Qwen/Qwen3-8B-GGUF"
+      responses:
+        "200":
+          description: List of GGUF files in the repo
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelFilesResponse"
+        "400":
+          description: Invalid repo
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Orchestrator unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+
+    Account:
+      type: object
+      properties:
+        account_id:
+          type: string
+        username:
+          type: string
+        gpu_quota_total_seconds:
+          type: number
+        gpu_quota_used_seconds:
+          type: number
+        gpu_quota_remaining_seconds:
+          type: number
+        gpu_quota_refresh_time:
+          type: string
+        last_quota_update:
+          type: number
+        has_deployment:
+          type: boolean
+      required:
+        - account_id
+        - username
+        - gpu_quota_total_seconds
+        - gpu_quota_used_seconds
+        - gpu_quota_remaining_seconds
+        - gpu_quota_refresh_time
+        - last_quota_update
+        - has_deployment
+
+    AccountsResponse:
+      type: object
+      properties:
+        accounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Account"
+      required:
+        - accounts
+
+    Deployment:
+      type: object
+      properties:
+        deployment_id:
+          type: string
+        account_id:
+          type: string
+        model_repo:
+          type: string
+        model_file:
+          type: string
+        model_name:
+          type: string
+        notebook_url:
+          type: ["string", "null"]
+        status:
+          type: string
+          enum: [created, running, stopped, error]
+        created_at:
+          type: number
+        started_at:
+          type: ["number", "null"]
+        error_message:
+          type: ["string", "null"]
+      required:
+        - deployment_id
+        - account_id
+        - model_repo
+        - model_file
+        - model_name
+        - notebook_url
+        - status
+        - created_at
+
+    DeploymentsResponse:
+      type: object
+      properties:
+        deployments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Deployment"
+      required:
+        - deployments
+
+    DeploymentInput:
+      type: object
+      properties:
+        account_id:
+          type: string
+        model_repo:
+          type: string
+        model_file:
+          type: string
+        model_name:
+          type: string
+        estimated_quota_hours:
+          type: number
+      required:
+        - account_id
+        - model_repo
+        - model_file
+        - model_name
+        - estimated_quota_hours
+
+    DeploymentResult:
+      type: object
+      properties:
+        deployment_id:
+          type: string
+        account_id:
+          type: string
+        notebook_url:
+          type: ["string", "null"]
+        status:
+          type: string
+        worker_id:
+          type: ["string", "null"]
+      required:
+        - deployment_id
+        - account_id
+        - notebook_url
+        - status
+
+    StopResult:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    ModelFilesResponse:
+      type: object
+      properties:
+        repo:
+          type: string
+        files:
+          type: array
+          items:
+            type: string
+      required:
+        - repo
+        - files
