@@ -9,10 +9,10 @@ import { useLiveClock } from '@/hooks/useLiveClock';
 import {
   getSessionInfo,
   formatDuration,
-  SESSION_LIMIT_SECONDS,
   URGENCY_COLORS,
   type SessionUrgency,
 } from '@/lib/sessionLimit';
+import { useSettings } from '@/context/SettingsContext';
 
 // ---------------------------------------------------------------------------
 // Single deployment row
@@ -20,8 +20,9 @@ import {
 
 function DeploymentRow({ dep }: { dep: Deployment }) {
   const now = useLiveClock(1000);
+  const { sessionLimitSeconds } = useSettings();
   const sinceUnix = dep.started_at ?? dep.created_at;
-  const { elapsedSeconds, remainingSeconds, progressFraction, urgency } = getSessionInfo(sinceUnix, now);
+  const { elapsedSeconds, remainingSeconds, progressFraction, urgency } = getSessionInfo(sinceUnix, now, sessionLimitSeconds);
   const colors = URGENCY_COLORS[urgency];
   const pct = Math.round(progressFraction * 100);
 
@@ -81,7 +82,7 @@ function DeploymentRow({ dep }: { dep: Deployment }) {
             {formatDuration(elapsedSeconds)} elapsed
           </span>
           <span className="text-[11px] text-muted-foreground/40 font-mono">
-            / {formatDuration(SESSION_LIMIT_SECONDS)}
+            / {formatDuration(sessionLimitSeconds)}
           </span>
         </div>
 
@@ -172,6 +173,7 @@ TriggerButton.displayName = 'TriggerButton';
 export function RunningDeploymentsPanel() {
   const { data } = useListDeployments({ query: { refetchInterval: 10000 } });
   const now = useLiveClock(10_000); // coarse clock for urgency classification
+  const { sessionLimitSeconds } = useSettings();
 
   const running = useMemo(
     () =>
@@ -190,15 +192,15 @@ export function RunningDeploymentsPanel() {
   // Determine the highest urgency across all running deployments
   const topUrgency: SessionUrgency | null = useMemo(() => {
     if (count === 0) return null;
-    const urgencies = running.map((d) => getSessionInfo(d.started_at ?? d.created_at, now).urgency);
+    const urgencies = running.map((d) => getSessionInfo(d.started_at ?? d.created_at, now, sessionLimitSeconds).urgency);
     if (urgencies.includes('critical')) return 'critical';
     if (urgencies.includes('warning')) return 'warning';
     return 'safe';
   }, [running, now]);
 
   const criticalCount = useMemo(
-    () => running.filter((d) => getSessionInfo(d.started_at ?? d.created_at, now).urgency === 'critical').length,
-    [running, now],
+    () => running.filter((d) => getSessionInfo(d.started_at ?? d.created_at, now, sessionLimitSeconds).urgency === 'critical').length,
+    [running, now, sessionLimitSeconds],
   );
 
   return (

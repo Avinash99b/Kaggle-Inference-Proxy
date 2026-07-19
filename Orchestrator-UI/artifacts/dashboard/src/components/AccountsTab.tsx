@@ -19,10 +19,10 @@ import { useQueryClient } from '@tanstack/react-query';
 import { getListAccountsQueryKey } from '@workspace/api-client-react';
 import { cn } from '@/lib/utils';
 import { useLiveClock } from '@/hooks/useLiveClock';
+import { useSettings } from '@/context/SettingsContext';
 import {
   getSessionInfo,
   formatDuration,
-  SESSION_LIMIT_SECONDS,
   URGENCY_COLORS,
 } from '@/lib/sessionLimit';
 
@@ -36,8 +36,9 @@ interface SessionCellProps {
 
 function SessionCell({ deployment }: SessionCellProps) {
   const now = useLiveClock(10_000); // re-render every 10 s — enough for a progress bar
+  const { sessionLimitSeconds } = useSettings();
   const sinceUnix = deployment.started_at ?? deployment.created_at;
-  const { remainingSeconds, progressFraction, urgency } = getSessionInfo(sinceUnix, now);
+  const { remainingSeconds, progressFraction, urgency } = getSessionInfo(sinceUnix, now, sessionLimitSeconds);
   const colors = URGENCY_COLORS[urgency];
   const pct = Math.round(progressFraction * 100);
 
@@ -48,7 +49,7 @@ function SessionCell({ deployment }: SessionCellProps) {
           {formatDuration(remainingSeconds)} left
         </span>
         <span className="text-muted-foreground/50 font-mono text-[10px]">
-          / {formatDuration(SESSION_LIMIT_SECONDS)}
+          / {formatDuration(sessionLimitSeconds)}
         </span>
       </div>
 

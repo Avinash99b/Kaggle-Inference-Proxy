@@ -3,16 +3,18 @@ import { QueryClient, QueryClientProvider, QueryCache, MutationCache } from '@ta
 import { Toaster } from '@/components/ui/toaster';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { Route, Switch, Router as WouterRouter, useLocation } from 'wouter';
-import { Terminal, Wifi, WifiOff, Loader2, LogOut } from 'lucide-react';
+import { Terminal, Wifi, WifiOff, Loader2, LogOut, Settings } from 'lucide-react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Button } from '@/components/ui/button';
 
 import { AccountsTab } from './components/AccountsTab';
 import { DeploymentsTab } from './components/DeploymentsTab';
+import { SettingsTab } from './components/SettingsTab';
 import { RunningDeploymentsPanel } from './components/RunningDeploymentsPanel';
 import { useWebSocket } from './hooks/useWebSocket';
 import { LoginPage } from './pages/LoginPage';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import { SettingsProvider } from './context/SettingsContext';
 
 // ---------------------------------------------------------------------------
 // QueryClient — dispatch auth:expired on 401 / 403 so AuthContext can logout
@@ -101,7 +103,7 @@ function Dashboard() {
       <main className="flex-1 container mx-auto px-4 py-8 max-w-6xl">
         <Tabs defaultValue="accounts" className="w-full">
           <div className="flex justify-center mb-8">
-            <TabsList className="grid w-full max-w-md grid-cols-2 bg-card border border-border/60 shadow-sm p-1">
+            <TabsList className="grid w-full max-w-lg grid-cols-3 bg-card border border-border/60 shadow-sm p-1">
               <TabsTrigger
                 value="accounts"
                 className="data-[state=active]:bg-background data-[state=active]:shadow-sm text-sm"
@@ -116,6 +118,14 @@ function Dashboard() {
               >
                 Deployments
               </TabsTrigger>
+              <TabsTrigger
+                value="settings"
+                className="data-[state=active]:bg-background data-[state=active]:shadow-sm text-sm gap-1.5"
+                data-testid="tab-settings"
+              >
+                <Settings className="w-3.5 h-3.5" />
+                Settings
+              </TabsTrigger>
             </TabsList>
           </div>
 
@@ -124,6 +134,9 @@ function Dashboard() {
           </TabsContent>
           <TabsContent value="deployments" className="mt-0 focus-visible:outline-none focus-visible:ring-0">
             <DeploymentsTab />
+          </TabsContent>
+          <TabsContent value="settings" className="mt-0 focus-visible:outline-none focus-visible:ring-0">
+            <SettingsTab />
           </TabsContent>
         </Tabs>
       </main>
@@ -211,9 +224,11 @@ function InnerApp() {
   );
 
   return (
-    <AuthProvider onLogout={handleLogout}>
-      <AppRoutes authError={authError} onClearAuthError={() => setAuthError(false)} />
-    </AuthProvider>
+    <SettingsProvider>
+      <AuthProvider onLogout={handleLogout}>
+        <AppRoutes authError={authError} onClearAuthError={() => setAuthError(false)} />
+      </AuthProvider>
+    </SettingsProvider>
   );
 }
 

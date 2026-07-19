@@ -439,6 +439,43 @@ class KaggleSessionManager:
         self._loaded = False
         self._playwright = None  # lazily started, shared across calls
 
+        # CRITICAL: Playwright's sync API is greenlet-based and binds its
+        # internal dispatch loop to whichever OS thread called
+        # sync_playwright().start(). asyncio's default executor
+        # (run_in_executor(None, ...)) is a ThreadPoolExecutor that can
+        # (and, under any concurrent load, will) run different calls on
+        # different worker threads -- the moment a *second* Playwright
+        # call lands on a thread other than the one that started the
+        # driver, you get
+        #   greenlet.error: Cannot switch to a different thread
+        # which looks exactly like an auth failure from the caller's
+        # point of view (get_quota's except-Exception catches it) and
+        # was incorrectly marking healthy sessions as SESSION_EXPIRED.
+        #
+        # Fix: every single Playwright call in this class -- driver
+        # start, browser launch, quota fetch, login -- is funneled
+        # through this dedicated ONE-worker executor, so it's always
+        # literally the same thread. Never pass this thread pool's
+        # worker count as anything but 1.
+        import concurrent.futures
+        self._pw_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="kaggle-playwright"
+        )
+
+    def _run_on_playwright_thread(self, fn, *args, **kwargs):
+        """
+        Runs `fn(*args, **kwargs)` on this manager's single dedicated
+        Playwright thread and blocks (from the calling thread) until it
+        completes. This is a plain concurrent.futures call, not asyncio
+        -- callers awaiting this from async code should wrap it in
+        `await loop.run_in_executor(None, self._run_on_playwright_thread, fn, ...)`
+        is WRONG (that reintroduces the multi-thread problem); instead
+        use `await asyncio.wrap_future(self._pw_executor.submit(fn, *args, **kwargs))`,
+        which is exactly what get_quota does below.
+        """
+        future = self._pw_executor.submit(fn, *args, **kwargs)
+        return future.result()
+
     # -- Loading -------------------------------------------------------
 
     def load_from_env(self) -> None:
@@ -569,20 +606,42 @@ class KaggleSessionManager:
     # -- Playwright plumbing ---------------------------------------------
 
     def _ensure_playwright(self):
-        """Lazily starts a single shared Playwright driver, reused across calls."""
+        """
+        Lazily starts a single shared Playwright driver, reused across
+        calls. MUST only ever be called from within a function submitted
+        to self._pw_executor (the one dedicated Playwright thread) --
+        never directly from an asyncio task or a general-purpose
+        executor thread, or you'll hit the greenlet cross-thread error
+        this class exists to avoid.
+        """
         if self._playwright is None:
             from playwright.sync_api import sync_playwright
             self._playwright = sync_playwright().start()
         return self._playwright
 
     def close(self):
-        """Cleanup on process shutdown."""
+        """
+        Cleanup on process shutdown. Stopping Playwright must happen on
+        the same dedicated thread it was started on (same greenlet
+        constraint as everything else in this class), so this is
+        submitted to _pw_executor rather than calling
+        self._playwright.stop() directly from whatever thread close()
+        happens to be called from.
+        """
         if self._playwright is not None:
+            def _stop():
+                try:
+                    self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+
             try:
-                self._playwright.stop()
+                self._pw_executor.submit(_stop).result(timeout=10)
             except Exception:
                 pass
-            self._playwright = None
+
+        self._pw_executor.shutdown(wait=False, cancel_futures=True)
 
     @contextmanager
     def _browser_context(self, storage_state: Optional[dict]):
@@ -1265,11 +1324,25 @@ class KaggleService:
             )
             return None
 
-        def _fetch():
-            return self.session_manager.get_quota(account)
+        # IMPORTANT: this must run on KaggleSessionManager's own
+        # dedicated single-worker executor (_pw_executor), NOT on
+        # asyncio's default run_in_executor(None, ...) pool. The
+        # default pool can (and under concurrent quota refreshes,
+        # eventually will) run this call on a different OS thread than
+        # the one that originally started the shared Playwright driver,
+        # which raises `greenlet.error: Cannot switch to a different
+        # thread` -- a failure that looked identical to an auth failure
+        # from here, incorrectly flipping healthy accounts to
+        # SESSION_EXPIRED. Every Playwright call for every account is
+        # serialized through that one thread; this is deliberately not
+        # parallel across accounts, which is fine given the refresh
+        # interval is minutes, not seconds, and this environment's tiny
+        # CPU/RAM budget (0.1 vCPU / 512MB) can't run concurrent
+        # browsers anyway.
+        future = self.session_manager._pw_executor.submit(self.session_manager.get_quota, account)
 
         try:
-            quota = await asyncio.get_event_loop().run_in_executor(None, _fetch)
+            quota = await asyncio.wrap_future(future)
         except KaggleSessionError as e:
             logger.warning(f"refresh_quota: skipping {account.account_id}: {e}")
             return None
