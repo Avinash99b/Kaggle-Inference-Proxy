@@ -124,6 +124,7 @@ DEFAULT_CONFIG = {
     "worker_reconnect_grace_seconds": 30,
     "auth_timestamp_skew_seconds": 300,
     "client_disconnect_check_interval_seconds": 1.0,
+    "stream_ping_interval_seconds": 1.0,
     "websocket": {
         "heartbeat_interval_seconds": 20,
         "heartbeat_timeout_seconds": 60,
@@ -1038,38 +1039,93 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
     The job (and therefore the stream) never migrates to a different
     worker mid-flight.
 
-    Two independent disconnect signals feed into the same
-    abandon-this-job path:
+    THREE layered disconnect signals feed into the same abandon-this-job
+    path. This is deliberately redundant: request.is_disconnected() alone
+    is NOT reliable for a pure send-side SSE stream -- see the long
+    comment on WorkerRegistry.watch_job_liveness for the mechanism (it
+    only reflects a receive-channel message that, on many deployments
+    including behind a reverse proxy like Render, is never generated in
+    the first place once the request body has already been consumed and
+    nothing calls receive() again). So detection here does NOT depend on
+    that alone:
 
-    1. job.liveness_task (started in submit_job) polls
+    1. Active keepalive pings (this function, below): every
+       stream_ping_interval_seconds (default well under a second of real
+       generation gaps -- but also fires between tokens during active
+       generation) we WRITE an SSE comment line (": ping\\n\\n") even if no
+       token is ready yet. This is the one thing that reliably surfaces a
+       dead connection: is_disconnected() *reads* a channel that may never
+       receive a fresh event; a periodic *write* forces the OS/ASGI server
+       to actually attempt delivery on the socket, which is what surfaces
+       a broken pipe. We wrap that write in a try/except -- if it raises,
+       the connection is definitively gone and we abandon the job right
+       there, with zero dependency on is_disconnected() ever firing.
+    2. job.liveness_task (started in submit_job) polls
        request.is_disconnected() once a second for this job's entire
-       lifetime, in a separate task, and marks job.abandoned + cancels on
-       the worker the moment it observes a disconnect.
-    2. GeneratorExit, caught here: when uvicorn/Starlette actually tears
-       down this async generator early (which happens once the ASGI
-       server itself gives up on the connection -- e.g. the underlying
-       socket write fails), Python raises GeneratorExit into wherever
-       we're suspended (the `await job.stream_queue.get()` below). This
-       is a strictly stronger signal than is_disconnected() polling: it
-       fires exactly when the server has concluded the connection is
-       actually dead, rather than relying on a receive-channel probe that
-       may never get scheduled again for a send-only stream. We use it as
-       an immediate trigger for the same worker-side cancel rather than
-       waiting for the next 1s poll tick to catch up.
+       lifetime as a secondary, cheap signal -- still useful for the
+       subset of disconnects it does catch (e.g. before any bytes have
+       been sent), and for jobs still sitting in queue with no stream
+       open yet.
+    3. GeneratorExit, caught here: when uvicorn/Starlette actually tears
+       this async generator down (e.g. after its own internal
+       listen_for_disconnect task sees an http.disconnect message), we
+       catch that and fire the same abandon path immediately rather than
+       waiting for a timer.
     """
     role_sent = False
     exiting_via_generator_exit = False
+    ping_interval = CONFIG.get("stream_ping_interval_seconds", 1.0)
+
+    async def abandon(reason: str) -> None:
+        if job.future.done():
+            return
+        job.abandoned = True
+        logger.info("No live return path for job %s (%s); marking abandoned and "
+                    "halting on worker '%s'.", job.id, reason, worker.worker_id)
+        await REGISTRY.cancel_job_on_worker(worker, job, f"no return path: {reason}")
+        worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+        try:
+            job.future.set_exception(RuntimeError(f"client disconnected: {reason}"))
+        except asyncio.InvalidStateError:
+            pass
+
     try:
         while True:
             try:
-                item = await asyncio.wait_for(job.stream_queue.get(), timeout=job.timeout)
+                item = await asyncio.wait_for(job.stream_queue.get(), timeout=ping_interval)
             except asyncio.TimeoutError:
-                err = openai_error(
-                    "Timed out waiting for streamed tokens from the worker.",
-                    "server_error")
-                yield f"data: {json.dumps(err)}\n\n"
-                await REGISTRY.cancel_job_on_worker(worker, job, "stream token timeout")
-                break
+                # No token arrived within the ping interval -- either the
+                # worker is still generating (normal) or the job has been
+                # sitting for a while. Either way, actively probe the
+                # connection by writing an SSE comment. If the client is
+                # genuinely gone, this write is what will actually fail
+                # (or, for transports that buffer silently, this at least
+                # gives is_disconnected()/GeneratorExit more opportunities
+                # to catch up) -- and if job.timeout has fully elapsed
+                # with no worker activity at all, treat it as a stalled
+                # job same as before.
+                if job.last_activity_at is not None:
+                    stalled_for = time.time() - job.last_activity_at
+                else:
+                    stalled_for = time.time() - (job.delivered_at or job.created_at)
+                if stalled_for > job.timeout:
+                    err = openai_error(
+                        "Timed out waiting for streamed tokens from the worker.",
+                        "server_error")
+                    yield f"data: {json.dumps(err)}\n\n"
+                    await REGISTRY.cancel_job_on_worker(worker, job, "stream token timeout")
+                    break
+                try:
+                    yield ": ping\n\n"
+                except Exception:
+                    # The write itself failed -- this IS the connection
+                    # being confirmed dead, no polling needed. Re-raise so
+                    # the outer GeneratorExit/Exception handling below
+                    # (or, if this isn't a GeneratorExit, the generic
+                    # except clause) can run the same abandon path.
+                    await abandon("keepalive write failed")
+                    raise
+                continue
 
             if item is None:
                 break  # normal end-of-stream sentinel (includes the
@@ -1109,26 +1165,14 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
     except GeneratorExit:
         # The ASGI server just tore this generator down early -- the
         # connection is confirmed gone. Fire the same abandon path
-        # immediately rather than waiting for the polling liveness task to
-        # notice on its next tick. We must NOT yield again after this (the
-        # generator is being closed, not paused -- attempting to yield
-        # would raise "generator ignored GeneratorExit"), so the `finally`
-        # below skips its usual DONE sentinel in this specific case.
+        # immediately rather than waiting for the polling liveness task or
+        # the next ping tick to catch up. We must NOT yield again after
+        # this (the generator is being closed, not paused -- attempting to
+        # yield would raise "generator ignored GeneratorExit"), so the
+        # `finally` below skips its usual DONE sentinel in this case.
         exiting_via_generator_exit = True
         if not job.future.done():
-            job.abandoned = True
-            logger.info(
-                "GeneratorExit for job %s (connection torn down); "
-                "marking abandoned and halting on worker '%s'.",
-                job.id, worker.worker_id)
-            asyncio.create_task(
-                REGISTRY.cancel_job_on_worker(worker, job, "no return path: generator closed"))
-            worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
-            try:
-                job.future.set_exception(
-                    RuntimeError("client disconnected: generator closed"))
-            except asyncio.InvalidStateError:
-                pass
+            asyncio.create_task(abandon("generator closed"))
         raise
     finally:
         if job.liveness_task is not None and not job.liveness_task.done():
