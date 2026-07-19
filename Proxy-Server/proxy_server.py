@@ -1071,10 +1071,31 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
        listen_for_disconnect task sees an http.disconnect message), we
        catch that and fire the same abandon path immediately rather than
        waiting for a timer.
+
+    IMPORTANT FIX: the keepalive write (#1, the only signal that reliably
+    surfaces a dead socket) used to only run inside the `except
+    asyncio.TimeoutError` branch below -- i.e. only on loop iterations
+    where `job.stream_queue.get()` did NOT return a real token within
+    ping_interval. That meant it never ran at all while the model was
+    actively streaming tokens faster than ping_interval, which is the
+    normal case: a queue read that keeps succeeding means TimeoutError
+    never fires, so the one check capable of detecting a closed socket
+    was starved out for the entire duration of an active stream. A
+    client that disconnected mid-stream would then only be caught by the
+    unreliable is_disconnected()/GeneratorExit signals (or not at all
+    until request_timeout_seconds / stalled-job detection much later) --
+    matching the exact symptom of streaming cancellation not firing
+    while non-streaming worked fine. Fixed by tracking last_ping_at
+    independently of whether a token arrived, and bounding the queue
+    wait to whatever time remains until the next ping is due, so a ping
+    fires on schedule even when tokens are flowing continuously.
     """
     role_sent = False
     exiting_via_generator_exit = False
     ping_interval = CONFIG.get("stream_ping_interval_seconds", 1.0)
+    last_ping_at = time.time()
+    _PING_DUE = object()  # sentinel; stream_queue itself only ever holds
+                          # dict items or None, so this can't collide
 
     async def abandon(reason: str) -> None:
         if job.future.done():
@@ -1091,19 +1112,28 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
 
     try:
         while True:
+            # Wait for the *shorter* of "next token" and "next ping is
+            # due" -- not a fresh ping_interval from now, or a steady
+            # stream of sub-interval tokens would keep pushing the
+            # deadline out forever and we'd be back to never probing.
+            wait_budget = max(0.01, ping_interval - (time.time() - last_ping_at))
             try:
-                item = await asyncio.wait_for(job.stream_queue.get(), timeout=ping_interval)
+                item = await asyncio.wait_for(job.stream_queue.get(), timeout=wait_budget)
             except asyncio.TimeoutError:
-                # No token arrived within the ping interval -- either the
-                # worker is still generating (normal) or the job has been
-                # sitting for a while. Either way, actively probe the
-                # connection by writing an SSE comment. If the client is
-                # genuinely gone, this write is what will actually fail
-                # (or, for transports that buffer silently, this at least
-                # gives is_disconnected()/GeneratorExit more opportunities
-                # to catch up) -- and if job.timeout has fully elapsed
-                # with no worker activity at all, treat it as a stalled
-                # job same as before.
+                item = _PING_DUE
+
+            if item is _PING_DUE:
+                # Either no token arrived within the remaining budget, or
+                # a token stream has been flowing continuously and it's
+                # simply time to probe again regardless. Either way,
+                # actively probe the connection by writing an SSE
+                # comment. If the client is genuinely gone, this write is
+                # what will actually fail (or, for transports that
+                # buffer silently, this at least gives
+                # is_disconnected()/GeneratorExit more opportunities to
+                # catch up) -- and if job.timeout has fully elapsed with
+                # no worker activity at all, treat it as a stalled job
+                # same as before.
                 if job.last_activity_at is not None:
                     stalled_for = time.time() - job.last_activity_at
                 else:
@@ -1117,6 +1147,7 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
                     break
                 try:
                     yield ": ping\n\n"
+                    last_ping_at = time.time()
                 except Exception:
                     # The write itself failed -- this IS the connection
                     # being confirmed dead, no polling needed. Re-raise so
