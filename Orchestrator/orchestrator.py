@@ -1451,6 +1451,26 @@ class KaggleService:
             logger.error(f"Failed to upload notebook: {e}")
             raise HTTPException(status_code=500, detail=f"Notebook upload failed: {e}")
 
+    async def get_notebook_last_run_time(
+        self, notebook_slug: str, account: AccountState
+    ) -> Optional[float]:
+        """
+        Looks up `notebook_slug`'s last_run_time (epoch seconds) directly
+        from Kaggle via list_notebooks, so callers can set/refresh
+        DeploymentState.started_at from Kaggle's own clock instead of
+        the orchestrator's local time.time() -- which only reflects when
+        *this process* happened to push/notice the kernel, not when it
+        actually started running on Kaggle.
+
+        Returns None if the kernel isn't found or list_notebooks itself
+        fails (already logged there); never raises.
+        """
+        notebooks = await self.list_notebooks(account)
+        for nb in notebooks:
+            if nb.get("slug") == notebook_slug:
+                return nb.get("last_run_time")
+        return None
+
     async def get_notebook_status(self, deployment: DeploymentState, account: Optional[AccountState] = None) -> str:
         """Queries kernels_status; falls back to a timing-based mock if no account is available."""
         if not deployment.notebook_id or account is None:
@@ -1913,6 +1933,12 @@ class Orchestrator:
                 # Build a throwaway DeploymentState just to drive the
                 # existing get_notebook_status() call, which only needs
                 # notebook_id + started_at off the object it's given.
+                # started_at is seeded from Kaggle's own last_run_time
+                # (already fetched above as part of `nb`) rather than
+                # local time.time(), so uptime reflects when Kaggle
+                # itself last ran the kernel, not when this process
+                # happened to notice it.
+                kaggle_last_run = nb.get("last_run_time")
                 probe = DeploymentState(
                     deployment_id=deployment_id,
                     account_id=account.account_id,
@@ -1924,7 +1950,7 @@ class Orchestrator:
                     notebook_status="unknown",
                     worker_id=account.account_id,
                     created_at=time.time(),
-                    started_at=time.time(),
+                    started_at=kaggle_last_run if kaggle_last_run is not None else time.time(),
                 )
                 live_status = await self.kaggle.get_notebook_status(probe, account)
 
@@ -1943,6 +1969,12 @@ class Orchestrator:
                     existing.account_id = account.account_id
                     existing.worker_id = existing.worker_id or account.account_id
                     existing.last_status_check = time.time()
+                    # Always prefer Kaggle's own last_run_time over
+                    # whatever local started_at was previously recorded --
+                    # it's the authoritative "when did this actually start
+                    # running" answer.
+                    if kaggle_last_run is not None:
+                        existing.started_at = kaggle_last_run
                     deployment = existing
                 else:
                     deployment = DeploymentState(
@@ -1956,7 +1988,7 @@ class Orchestrator:
                         notebook_status=live_status,
                         worker_id=account.account_id,
                         created_at=time.time(),
-                        started_at=None,
+                        started_at=kaggle_last_run,
                         error_message=None,
                         quota_reserved_seconds=0,
                     )
@@ -2225,7 +2257,15 @@ class Orchestrator:
             deployment.notebook_id = notebook_id
             deployment.notebook_url = notebook_url
             deployment.notebook_status = "created"
-            deployment.started_at = time.time()
+
+            # Prefer Kaggle's own last_run_time as the source of truth for
+            # "when did this notebook actually start running" -- a fresh
+            # push may not have a last_run_time yet (Kaggle hasn't
+            # started executing it), in which case local time.time() is
+            # used only as a placeholder until the next status/reconcile
+            # pass picks up the real value.
+            kaggle_last_run = await self.kaggle.get_notebook_last_run_time(notebook_id, account)
+            deployment.started_at = kaggle_last_run if kaggle_last_run is not None else time.time()
 
             self.deployments[deployment_id] = deployment
             account.deployment = deployment
