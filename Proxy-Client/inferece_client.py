@@ -1190,15 +1190,28 @@ async def disk_monitor_loop():
         return
     interval = disk_cfg.get("monitor_interval_seconds", 30)
     min_free_bytes = int(disk_cfg.get("min_free_space_gb", 5) * (1024 ** 3))
+    loop = asyncio.get_event_loop()
+
+    def _check_and_evict() -> None:
+        free = MODELS.disk_cache.free_space_bytes(MODELS.cache_dir)
+        if free < min_free_bytes:
+            protect = {MODELS.current_local_path} if MODELS.current_local_path else set()
+            logger.info("Disk monitor: %.2f GB free < %.2f GB minimum; evicting LRU cached models.",
+                        free / (1024 ** 3), min_free_bytes / (1024 ** 3))
+            MODELS.disk_cache.ensure_space_for(min_free_bytes, protect_paths=protect)
+
     while True:
         await asyncio.sleep(interval)
         try:
-            free = MODELS.disk_cache.free_space_bytes(MODELS.cache_dir)
-            if free < min_free_bytes:
-                protect = {MODELS.current_local_path} if MODELS.current_local_path else set()
-                logger.info("Disk monitor: %.2f GB free < %.2f GB minimum; evicting LRU cached models.",
-                            free / (1024 ** 3), min_free_bytes / (1024 ** 3))
-                MODELS.disk_cache.ensure_space_for(min_free_bytes, protect_paths=protect)
+            # free_space_bytes() alone is normally a cheap syscall, but
+            # ensure_space_for() can synchronously os.remove() multi-GB
+            # cached model files and rewrite cache metadata under a lock.
+            # Both are pushed to the executor so a slow/networked disk
+            # can never stall the event loop that also owns the worker's
+            # WebSocket connection (a stall here reads as a missed
+            # ping/pong and kills the connection with "keepalive ping
+            # timeout", exactly like the earlier nvidia-smi issue).
+            await loop.run_in_executor(None, _check_and_evict)
         except Exception as e:
             logger.warning("Disk monitor loop error: %s", e)
 
