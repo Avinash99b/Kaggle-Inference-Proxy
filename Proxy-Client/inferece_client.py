@@ -43,6 +43,7 @@ enabled):
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gc
 import hashlib
 import hmac
@@ -136,6 +137,16 @@ DEFAULT_CONFIG = {
         "ws_failure_threshold_before_poll_fallback": 3,
         "poll_interval_seconds": 2,
         "long_poll_wait_seconds": 40,
+        # Belt-and-suspenders local watchdog for a single streaming job: if
+        # no token (and no done/error) arrives from the runner subprocess
+        # for this long, the job is treated as stalled and force-cancelled
+        # locally rather than waiting indefinitely for the proxy's own
+        # request_timeout_seconds cancel to arrive. This matters because,
+        # after the run_websocket_forever fix below, an in-flight job no
+        # longer blocks the WS receive loop -- but without this timeout a
+        # single wedged job could still sit forever waiting on its own
+        # queue if a cancel frame were somehow lost.
+        "stream_token_stall_timeout_seconds": 120,
     },
     "download": {"max_retries": 4, "retry_backoff_seconds": 5},
     "disk_management": {
@@ -1371,6 +1382,21 @@ class ProxyClient:
         self.seen_job_ids: set = set()
         self.ws_failures = 0
         self.loop = asyncio.get_event_loop()
+        # Dedicated single-thread executor for aggregate_gpu_stats(), kept
+        # separate from the default run_in_executor(None, ...) pool used by
+        # job execution (run_inference / process_job). Sharing one pool
+        # meant a heartbeat's nvidia-smi call could queue up behind (or
+        # alongside) job-execution work, delaying heartbeat frames right
+        # when a job is busy -- the opposite of what a keepalive is for.
+        self._gpu_stats_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="gpu-stats")
+        # job_id -> asyncio.Task for every job currently being handled on
+        # the active WS connection (streaming or not). Tracked so that an
+        # incoming "cancel" frame can also cancel the *task* awaiting the
+        # result, not just the underlying subprocess -- and so a dropped
+        # connection can clean up cleanly instead of leaking task refs
+        # across reconnects.
+        self.active_job_tasks: Dict[str, asyncio.Task] = {}
 
     async def _ws_send(self, ws, payload: dict) -> None:
         """The only way any code in this class should write to `ws`. Takes
@@ -1400,8 +1426,12 @@ class ProxyClient:
         # its own ping/pong bookkeeping, so a slow nvidia-smi call during a
         # busy generation can silently blow through ping_timeout and get
         # the connection killed with "keepalive ping timeout", right when
-        # a job is in flight. Always run it in the executor instead.
-        gpu_stats = await self.loop.run_in_executor(None, aggregate_gpu_stats)
+        # a job is in flight. Always run it in the executor instead --
+        # specifically the dedicated single-thread self._gpu_stats_executor
+        # (not the shared default pool), so this call can never queue up
+        # behind job-execution work on the default executor (see the
+        # comment where that executor is created in __init__).
+        gpu_stats = await self.loop.run_in_executor(self._gpu_stats_executor, aggregate_gpu_stats)
         return {
             "type": "heartbeat",
             "worker_id": self.worker_id,
@@ -1429,6 +1459,20 @@ class ProxyClient:
         result = await self.loop.run_in_executor(None, run_inference, payload, job_id)
         return {"job_id": job_id, **result}
 
+    async def _run_and_send_job(self, ws, job_id: str, payload: dict) -> None:
+        """Wrapper used to run a non-streaming job as its own asyncio task
+        (see run_websocket_forever) instead of being awaited inline in the
+        WS receive loop. Sends the result itself once process_job resolves.
+        Swallows send failures (e.g. the connection dropped while the job
+        was running) since there's nothing useful left to do with a result
+        nobody can receive -- the proxy's own watchdog/reconnect handling
+        takes it from there."""
+        try:
+            result = await self.process_job(job_id, payload)
+            await self._ws_send(ws, {"type": "result", **result})
+        except Exception as e:
+            logger.warning("Could not deliver result for job %s: %s", job_id, e)
+
     async def process_stream_job(self, ws, job_id: str, payload: dict) -> None:
         if self._check_and_mark_duplicate(job_id):
             await self._ws_send(ws, {
@@ -1438,6 +1482,7 @@ class ProxyClient:
 
         queue: "asyncio.Queue" = asyncio.Queue()
         loop = self.loop
+        stall_timeout = self.config["transport"].get("stream_token_stall_timeout_seconds", 120)
 
         def on_token(delta: str, finish_reason: Optional[str]) -> None:
             loop.call_soon_threadsafe(
@@ -1468,7 +1513,25 @@ class ProxyClient:
         completion_tokens = 0
         try:
             while True:
-                item = await queue.get()
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=stall_timeout)
+                except asyncio.TimeoutError:
+                    # No token, done, or error event for stall_timeout
+                    # seconds -- the runner subprocess is wedged (or its
+                    # pipe is). Don't wait forever on a queue nothing will
+                    # ever fill: hard-kill the subprocess ourselves (same
+                    # action a proxy-issued "cancel" would trigger) and
+                    # report the failure, freeing this connection to serve
+                    # the next job instead of sitting stuck indefinitely.
+                    logger.warning(
+                        "Streaming job %s produced no output for %ss; treating as stalled.",
+                        job_id, stall_timeout)
+                    await self.loop.run_in_executor(None, cancel_job, job_id)
+                    await self._ws_send(ws, {
+                        "type": "error", "job_id": job_id,
+                        "error": f"inference_error: no output for {stall_timeout}s, job stalled",
+                    })
+                    return
                 if item.get("__done__"):
                     await self._ws_send(ws, {
                         "type": "stream_done", "job_id": job_id,
@@ -1538,13 +1601,35 @@ class ProxyClient:
                             msg = json.loads(raw)
                             mtype = msg.get("type")
                             if mtype == "job":
+                                job_id = msg["job_id"]
                                 payload = msg["payload"]
-                                await self._ws_send(ws, {"type": "ack", "job_id": msg["job_id"]})
+                                await self._ws_send(ws, {"type": "ack", "job_id": job_id})
+                                # Dispatched as its own task rather than
+                                # awaited here. PersistentRunner.run_job()
+                                # still serializes actual GPU work one job
+                                # at a time (job_lock), so this doesn't
+                                # change execution order -- it only keeps
+                                # this receive loop free to keep reading
+                                # incoming frames (a "cancel" for this same
+                                # job, or anything else) and free for the
+                                # `websockets` library to service its own
+                                # ping/pong bookkeeping, instead of being
+                                # blocked awaiting the job for however long
+                                # it takes. That decoupling is what fixes
+                                # the "keepalive ping timeout" disconnects:
+                                # previously, if a job ever stalled, this
+                                # loop could never read the proxy's cancel
+                                # frame because it was stuck waiting on the
+                                # very job it needed to be told to cancel.
                                 if payload.get("stream"):
-                                    await self.process_stream_job(ws, msg["job_id"], payload)
+                                    task = asyncio.create_task(
+                                        self.process_stream_job(ws, job_id, payload))
                                 else:
-                                    result = await self.process_job(msg["job_id"], payload)
-                                    await self._ws_send(ws, {"type": "result", **result})
+                                    task = asyncio.create_task(
+                                        self._run_and_send_job(ws, job_id, payload))
+                                self.active_job_tasks[job_id] = task
+                                task.add_done_callback(
+                                    lambda t, jid=job_id: self.active_job_tasks.pop(jid, None))
                             elif mtype == "cancel":
                                 # Client disconnected or the job timed out on
                                 # the proxy side -- the eventual result is
@@ -1554,6 +1639,13 @@ class ProxyClient:
                                 job_id = msg.get("job_id")
                                 if job_id:
                                     await self.loop.run_in_executor(None, cancel_job, job_id)
+                                    # Also cancel the asyncio task itself, in
+                                    # case it's awaiting something other than
+                                    # the subprocess pipe (belt-and-suspenders
+                                    # alongside cancel_job() above).
+                                    task = self.active_job_tasks.get(job_id)
+                                    if task is not None and not task.done():
+                                        task.cancel()
                             elif mtype == "heartbeat_ack":
                                 pass
                             else:
