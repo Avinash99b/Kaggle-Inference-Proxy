@@ -303,6 +303,19 @@ class Job:
     stream_queue: Optional["asyncio.Queue"] = None   # only set for true (WS) streaming jobs
     cancel_requested: bool = False             # True once we've asked the worker to abort this job
 
+    # -- Return-path liveness -------------------------------------------- #
+    # abandoned=True means the client that wanted this job's output is
+    # confirmed gone (its request.is_disconnected() came back true during
+    # our once-a-second liveness check -- see watch_job_liveness() below).
+    # Once set, this job must never be handed to a worker: if it's still
+    # sitting in worker.queue, the dispatcher discards it on pop instead of
+    # delivering it; if it's already delivered/running, the owning worker
+    # is told to hard-kill it. This is the single source of truth the
+    # dispatcher consults -- there is no other path by which a job with no
+    # live return path is allowed to occupy the runner.
+    abandoned: bool = False
+    liveness_task: "Optional[asyncio.Task]" = None
+
 
 # --------------------------------------------------------------------------- #
 # Per-worker state
@@ -536,7 +549,7 @@ class WorkerRegistry:
         return scored[0][1]
 
     async def submit_job(self, worker: WorkerState, kind: str, payload: dict,
-                          stream: bool) -> Job:
+                          stream: bool, request: Optional[Request] = None) -> Job:
         if worker.queue.full():
             raise HTTPException(status_code=429, detail=openai_error(
                 "Selected inference server's queue is full. Please retry shortly.",
@@ -558,7 +571,55 @@ class WorkerRegistry:
                     "(in_flight=%d, gpu_util=%s%%)",
                     job.id, kind, payload.get("model"), worker.worker_id,
                     worker.in_flight_jobs, worker.gpu_stats.get("utilization_percent"))
+        # Start the once-a-second return-path liveness check for the FULL
+        # lifetime of this job (queued AND delivered), not just while it's
+        # actively running. This is the single rule that replaces the old
+        # per-endpoint disconnect watchers: from the moment a job exists,
+        # if there is ever no live client connection to deliver its output
+        # to, the job is marked abandoned and torn down immediately --
+        # cancelled on the worker if it's already delivered/running, and
+        # made ineligible for delivery if it's still sitting in the queue.
+        if request is not None:
+            job.liveness_task = asyncio.create_task(
+                self.watch_job_liveness(worker, job, request))
         return job
+
+    async def watch_job_liveness(self, worker: WorkerState, job: Job,
+                                  request: Request) -> None:
+        """Polls request.is_disconnected() once a second for as long as
+        `job` is neither finished nor already abandoned. This is the ONE
+        rule the proxy enforces for every job it holds, queued or
+        delivered: no live return path -> halt immediately. The moment
+        disconnection is observed, the job is marked abandoned (so the
+        dispatcher will never deliver it if it hasn't been already) and,
+        if it has already been delivered to a worker, that worker is told
+        to hard-kill it right away."""
+        interval = CONFIG.get("client_disconnect_check_interval_seconds", 1.0)
+        try:
+            while not job.future.done() and not job.abandoned:
+                await asyncio.sleep(interval)
+                if job.future.done():
+                    return
+                if await request.is_disconnected():
+                    job.abandoned = True
+                    logger.info(
+                        "No live return path for job %s (client disconnected); "
+                        "marking abandoned and halting on worker '%s'.",
+                        job.id, worker.worker_id)
+                    await self.cancel_job_on_worker(
+                        worker, job, "no return path: client disconnected")
+                    if job.stream_queue is not None and not job.future.done():
+                        await job.stream_queue.put({"error": "client disconnected"})
+                        await job.stream_queue.put(None)
+                    if not job.future.done():
+                        job.future.set_exception(
+                            RuntimeError("client disconnected: no return path for job output"))
+                        worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+                    return
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning("Liveness watcher for job %s crashed: %s", job.id, e)
 
     def find_job(self, job_id: str) -> Tuple[Optional[WorkerState], Optional[Job]]:
         """Locate a job (and its owning worker) by id, searching across all
@@ -571,33 +632,51 @@ class WorkerRegistry:
         return None, None
 
     def pop_next_for_delivery(self, worker: WorkerState) -> Optional[Job]:
-        """Non-blocking pop from this worker's queue."""
-        try:
-            job_id = worker.queue.get_nowait()
-        except asyncio.QueueEmpty:
-            return None
-        job = worker.jobs.get(job_id)
-        if job is None or job.future.done():
-            return None
-        job.delivered = True
-        job.delivered_at = time.time()
-        job.last_activity_at = job.delivered_at
-        return job
+        """Non-blocking pop from this worker's queue. Skips (drains without
+        delivering) any job that has already been marked abandoned by its
+        liveness watcher -- a job with no live return path must never reach
+        the worker, queued or not."""
+        while True:
+            try:
+                job_id = worker.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return None
+            job = worker.jobs.get(job_id)
+            if job is None or job.future.done():
+                continue
+            if job.abandoned:
+                logger.info("Dropping queued job %s before delivery: no live return path.", job_id)
+                continue
+            job.delivered = True
+            job.delivered_at = time.time()
+            job.last_activity_at = job.delivered_at
+            return job
 
     async def wait_next_for_delivery(self, worker: WorkerState, timeout: float) -> Optional[Job]:
         """Blocking (up to timeout) pop from this worker's queue, used by
-        both the WS dispatcher loop and the long-poll endpoint."""
-        try:
-            job_id = await asyncio.wait_for(worker.queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return None
-        job = worker.jobs.get(job_id)
-        if job is None or job.future.done():
-            return None
-        job.delivered = True
-        job.delivered_at = time.time()
-        job.last_activity_at = job.delivered_at
-        return job
+        both the WS dispatcher loop and the long-poll endpoint. Skips any
+        job already marked abandoned by its liveness watcher, same as
+        pop_next_for_delivery -- a job that has no live return path never
+        gets handed to the worker."""
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            try:
+                job_id = await asyncio.wait_for(worker.queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return None
+            job = worker.jobs.get(job_id)
+            if job is None or job.future.done():
+                continue
+            if job.abandoned:
+                logger.info("Dropping queued job %s before delivery: no live return path.", job_id)
+                continue
+            job.delivered = True
+            job.delivered_at = time.time()
+            job.last_activity_at = job.delivered_at
+            return job
 
     def mark_activity(self, worker: WorkerState, job_id: str) -> None:
         """Called whenever a streamed token arrives, so long-running streams
@@ -904,20 +983,6 @@ def to_stream_text_chunk(job_id: str, model: str, result: dict) -> dict:
     }
 
 
-async def _cancel_job_for_disconnect(job: Job, worker: Optional[WorkerState], where: str) -> None:
-    """Shared helper: the client that wanted `job` is gone, so ask the
-    owning worker to hard-kill whatever compute is happening for it. Safe
-    to call regardless of whether the job has already completed (no-op in
-    that case) -- callers don't need to check job.future.done() first."""
-    if job.future.done():
-        return
-    if worker is None:
-        return
-    logger.info("Client disconnected (%s) for job %s; requesting cancellation on worker '%s'.",
-                where, job.id, worker.worker_id)
-    await REGISTRY.cancel_job_on_worker(worker, job, f"client disconnected ({where})")
-
-
 async def real_stream_generator(job: Job, model: str, kind: str, request: Request,
                                  worker: WorkerState):
     """True token-by-token SSE stream for jobs delivered over a worker's
@@ -927,23 +992,15 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
     The job (and therefore the stream) never migrates to a different
     worker mid-flight.
 
-    Also watches for the client disconnecting mid-stream (StreamingResponse
-    keeps running server-side even after the client goes away unless we
-    check explicitly): if that happens, the worker is told to cancel the
-    job immediately rather than continuing to generate tokens nobody will
-    receive.
+    Disconnect handling is NOT done here anymore -- job.liveness_task
+    (started in submit_job) already polls request.is_disconnected() once a
+    second for this job's entire lifetime and will mark job.abandoned +
+    cancel it on the worker the moment the client is gone, which unblocks
+    the stream_queue.get() below via the future/queue sentinel this
+    generator is already watching. This loop only needs to notice that
+    happened and stop yielding.
     """
     role_sent = False
-    disconnect_check_interval = CONFIG.get("client_disconnect_check_interval_seconds", 1.0)
-
-    async def watch_for_disconnect():
-        while True:
-            await asyncio.sleep(disconnect_check_interval)
-            if await request.is_disconnected():
-                await _cancel_job_for_disconnect(job, worker, "stream")
-                return
-
-    watcher = asyncio.create_task(watch_for_disconnect())
     try:
         while True:
             try:
@@ -957,7 +1014,8 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
                 break
 
             if item is None:
-                break  # normal end-of-stream sentinel
+                break  # normal end-of-stream sentinel (includes the
+                       # abandoned-job sentinel pushed by watch_job_liveness)
 
             if "error" in item:
                 err = openai_error(f"Worker streaming error: {item['error']}", "server_error")
@@ -991,7 +1049,8 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
                 }
             yield f"data: {json.dumps(chunk)}\n\n"
     finally:
-        watcher.cancel()
+        if job.liveness_task is not None and not job.liveness_task.done():
+            job.liveness_task.cancel()
         yield "data: [DONE]\n\n"
 
 
@@ -1033,21 +1092,19 @@ def route_or_503(model: str) -> WorkerState:
 async def run_job_and_wait(worker: WorkerState, kind: str, payload: dict,
                             request: Request) -> Tuple[Job, dict]:
     """Non-streaming (or poll-fallback) path: submit a job to a specific
-    worker's queue and block until that worker returns the full result --
-    OR the client disconnects, in which case the worker is told to cancel
-    the job and we stop waiting rather than sitting on a connection nobody
-    is reading the response from."""
-    job = await REGISTRY.submit_job(worker, kind, payload, stream=False)
-    disconnect_check_interval = CONFIG.get("client_disconnect_check_interval_seconds", 1.0)
+    worker's queue and block until that worker returns the full result.
 
-    async def watch_for_disconnect():
-        while True:
-            await asyncio.sleep(disconnect_check_interval)
-            if await request.is_disconnected():
-                await _cancel_job_for_disconnect(job, worker, "request")
-                return
-
-    watcher = asyncio.create_task(watch_for_disconnect())
+    Disconnect handling is NOT done here anymore -- job.liveness_task
+    (started inside submit_job, since it's passed `request`) already polls
+    request.is_disconnected() once a second for this job's ENTIRE
+    lifetime, including however long it sits queued before a worker ever
+    picks it up. The moment it sees the client is gone, it marks the job
+    abandoned, cancels it on the worker if already delivered, and resolves
+    job.future with an exception -- which is exactly what unblocks the
+    await below. This function just needs to translate that outcome into
+    an HTTP response.
+    """
+    job = await REGISTRY.submit_job(worker, kind, payload, stream=False, request=request)
     try:
         result = await asyncio.wait_for(job.future, timeout=job.timeout)
     except asyncio.TimeoutError:
@@ -1059,7 +1116,8 @@ async def run_job_and_wait(worker: WorkerState, kind: str, payload: dict,
         raise HTTPException(status_code=502, detail=openai_error(
             f"Worker failed to process the request: {e}", "server_error"))
     finally:
-        watcher.cancel()
+        if job.liveness_task is not None and not job.liveness_task.done():
+            job.liveness_task.cancel()
     return job, result
 
 
@@ -1087,7 +1145,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             "kind": "chat", "model": model, "messages": messages, "stream": True,
             "params": normalize_generation_params(body),
         }
-        job = await REGISTRY.submit_job(worker, "chat", payload, stream=True)
+        job = await REGISTRY.submit_job(worker, "chat", payload, stream=True, request=request)
         return StreamingResponse(
             real_stream_generator(job, model, "chat", request, worker),
             media_type="text/event-stream",
@@ -1126,7 +1184,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
             "kind": "completion", "model": model, "prompt": prompt, "stream": True,
             "params": normalize_generation_params(body),
         }
-        job = await REGISTRY.submit_job(worker, "completions", payload, stream=True)
+        job = await REGISTRY.submit_job(worker, "completions", payload, stream=True, request=request)
         return StreamingResponse(
             real_stream_generator(job, model, "completion", request, worker),
             media_type="text/event-stream",
@@ -1387,6 +1445,11 @@ async def worker_ws(websocket: WebSocket):
                 # rolling (based on last_activity_at) rather than a single
                 # fixed deadline, so a long but actively-streaming
                 # generation doesn't get killed just for taking a while.
+                # Note: job.liveness_task resolves job.future immediately
+                # (not after job.timeout) the moment it detects no live
+                # return path, so an abandoned job falls out of this loop
+                # on the very next 0.2s tick rather than waiting out the
+                # full timeout window.
                 while not job.future.done():
                     await asyncio.sleep(0.2)
                     if not w.is_online() or w.ws is not websocket:
