@@ -4,14 +4,27 @@ orchestrator.py
 Multi-account Kaggle deployment orchestrator: manages GPU quotas, deploys
 inference servers, tracks deployment status via REST API + WebSocket.
 
-AUTH DESIGN (Kaggle): kaggle==2.2.3 (kagglesdk-backed) authenticates via a
-single KGAT_-prefixed token through the KAGGLE_API_TOKEN env var. Rather
-than seeding a placeholder at import time, this file never imports
-`kaggle` at module load. Each authenticated call sets KAGGLE_API_TOKEN to
-that account's real token, then (re)imports the kaggle module tree fresh,
-so kagglesdk's eager credential check always sees a valid token and no
-account's credentials or cached client state can leak into another
-account's call.
+AUTH DESIGN (Kaggle, kernel push/status/delete): kaggle==2.2.3
+(kagglesdk-backed) authenticates via a single KGAT_-prefixed token
+through the KAGGLE_API_TOKEN env var. Rather than seeding a placeholder
+at import time, this file never imports `kaggle` at module load. Each
+authenticated call sets KAGGLE_API_TOKEN to that account's real token,
+then (re)imports the kaggle module tree fresh, so kagglesdk's eager
+credential check always sees a valid token and no account's credentials
+or cached client state can leak into another account's call.
+
+AUTH DESIGN (Kaggle, GPU quota scraping): quota is scraped from
+Kaggle's web UI (there is no quota field in the official kaggle API),
+which used to mean a fresh Playwright browser login on every single
+quota refresh cycle. That is no longer how this works. See
+`KaggleSessionManager` below -- the orchestrator instead loads
+pre-generated Playwright `storage_state` blobs (one per account) from
+the KAGGLE_SESSIONS_JSON env var once at startup, keeps them in memory,
+and opens an already-authenticated browser context per quota check.
+Playwright login (username/password) is now a rare fallback path, only
+ever attempted when an account's own randomized reauth window has
+elapsed *and* the stored session has actually stopped working -- never
+on a fixed schedule, never on every refresh.
 
 AUTH DESIGN (Orchestrator API): every REST endpoint under /api and the
 /ws WebSocket endpoint require the orchestrator's own shared secret
@@ -28,7 +41,17 @@ CONFIG LOADING: orchestrator_config.json is no longer read from disk.
 The full config JSON is instead read from the `ORCHESTRATOR_CONFIG`
 environment variable, base64-encoded, and decoded once at startup (see
 `_load_config`). This keeps secrets (Kaggle tokens, the shared secret
-itself, HF token, proxy shared secret) out of any file on disk.
+itself, HF token, proxy shared secret, account passwords) out of any
+file on disk.
+
+SESSIONS LOADING (new): a second env var, KAGGLE_SESSIONS_JSON, holds a
+base64-encoded JSON blob of pre-generated Playwright storage states,
+one per Kaggle account, produced offline by the sibling script
+`generate_kaggle_sessions_env.py`. This is decoded exactly once at
+startup (see `KaggleSessionManager.load_from_env`) and kept in memory
+for the lifetime of the process; it is never re-read from the env var
+after that. Startup fails fast if this env var is missing or malformed,
+mirroring how ORCHESTRATOR_CONFIG is handled.
 
 NOTEBOOK FORMAT: the generated notebook mirrors the known-working
 `inferece.ipynb` two-cell shape exactly:
@@ -73,6 +96,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import sys
 import threading
 import time
@@ -80,8 +104,9 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Set
-from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Set
+from datetime import datetime, timedelta, timezone
+from urllib.parse import unquote
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -97,6 +122,15 @@ import uvicorn
 # the ORCHESTRATOR_CONFIG env var (base64-encoded JSON) instead. The
 # constant is kept only as a label for error messages.
 CONFIG_ENV_VAR = "ORCHESTRATOR_CONFIG"
+
+# Base64-encoded JSON blob of pre-generated Playwright storage states,
+# one per Kaggle account. Produced offline by
+# generate_kaggle_sessions_env.py. Decoded exactly once at startup by
+# KaggleSessionManager.load_from_env and kept in memory -- never
+# re-read from the env var afterwards. See module docstring
+# "SESSIONS LOADING" section above.
+SESSIONS_ENV_VAR = "KAGGLE_SESSIONS_JSON"
+
 STATE_FILE = "orchestrator_state.json"
 KERNELS_WORKDIR = "/tmp/orchestrator_kernels"
 
@@ -120,6 +154,28 @@ VALID_MACHINE_SHAPES = {
 
 # WebSocket close code for auth failures (policy violation).
 WS_CLOSE_POLICY_VIOLATION = 1008
+
+# Reauthentication window: each account is given its own random interval
+# in this range (in days) for how long its stored Playwright session is
+# trusted before the orchestrator is even willing to consider a fresh
+# Playwright login. This is intentionally randomized per-account (see
+# KaggleSessionManager._random_reauth_interval) so accounts don't all
+# attempt reauthentication in lockstep.
+REAUTH_MIN_DAYS = 2.0
+REAUTH_MAX_DAYS = 5.0
+
+# Kaggle homepage used purely as an "are we actually logged in" probe
+# after loading a storage_state into a fresh browser context, and to
+# get a live page context to read the XSRF cookie from, before calling
+# the real quota endpoint.
+KAGGLE_HOMEPAGE_URL = "https://www.kaggle.com/"
+
+# Kaggle's actual internal quota RPC (there is no public REST quota
+# endpoint). Matches the original KaggleQuotaProvider exactly: POST
+# with a JSON body of "{}" and an x-xsrf-token header sourced from the
+# session's own XSRF/CSRF cookie.
+KAGGLE_BASE = "https://www.kaggle.com"
+QUOTA_ENDPOINT = "/api/i/kernels.KernelsService/GetAcceleratorQuotaStatistics"
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -180,6 +236,16 @@ def _deployment_id_from_slug(slug: str) -> Optional[str]:
     return deployment_id or None
 
 
+def _parse_iso8601(value: Optional[str]) -> Optional[datetime]:
+    """Best-effort ISO-8601 -> aware datetime parse. Returns None on any failure."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 ###############################################################################
 # Dataclasses
 ###############################################################################
@@ -215,6 +281,8 @@ class AccountState:
     kaggle_username: str
     # KGAT_-prefixed token from kaggle.com/settings/api -> "Generate New
     # Token". Authenticated via KAGGLE_API_TOKEN, set fresh per call.
+    # (Used only for the official kaggle API -- kernel push/status/
+    # delete -- never for quota scraping.)
     kaggle_api_token: str
     gpu_quota_total_seconds: int
     gpu_quota_used_seconds: int
@@ -222,6 +290,16 @@ class AccountState:
     gpu_quota_refresh_time: str
     last_quota_update: float
     deployment: Optional[DeploymentState] = None
+    # Playwright-session-based quota auth bookkeeping. None of this is
+    # persisted to orchestrator_state.json's schema in a way that's load
+    # bearing -- KaggleSessionManager is the source of truth for
+    # storage_state/next_reauth_after in memory; these fields just mirror
+    # the account's current session status for API visibility
+    # (/api/accounts) and logging.
+    session_status: str = "unknown"  # "ok" | "SESSION_EXPIRED" | "unknown"
+    session_last_verified: Optional[str] = None
+    session_next_reauth_after: Optional[str] = None
+    session_last_auth_failure: Optional[str] = None
 
 
 @dataclass
@@ -251,7 +329,7 @@ class OrchestratorConfig:
 
 
 ###############################################################################
-# Auth helpers
+# Auth helpers (Orchestrator REST/WS API)
 ###############################################################################
 
 
@@ -309,6 +387,509 @@ def _websocket_secret_is_valid(websocket: WebSocket) -> bool:
         return False
 
     return _constant_time_eq(provided, configured_secret)
+
+
+###############################################################################
+# Kaggle Session Manager (Playwright storage-state based quota auth)
+###############################################################################
+
+
+class KaggleSessionError(Exception):
+    """Raised internally for session-auth problems; always caught and handled."""
+
+
+class KaggleSessionManager:
+    """
+    Owns every account's Playwright `storage_state` in memory, loaded
+    once at startup from KAGGLE_SESSIONS_JSON (base64-encoded JSON, see
+    module docstring). This class is the entire replacement for
+    "log into Kaggle with Playwright on every quota refresh":
+
+        Render startup -> decode KAGGLE_SESSIONS_JSON once -> keep in
+        memory -> per quota refresh, open a browser context from the
+        stored storage_state (no login page, no password field, no
+        CAPTCHA) -> call the quota endpoint -> done.
+
+    Reauthentication (an actual Playwright login with username/
+    password) is a rare fallback, gated by BOTH of:
+      1. wall-clock time has passed this account's own randomized
+         `next_reauth_after` (2-5 days out, different per account -- see
+         `_random_reauth_interval`), AND
+      2. the stored session has been tried and has actually failed.
+
+    Neither condition alone triggers a login. An expired-but-still-
+    working session is left alone; a failing-but-not-yet-expired
+    session is marked SESSION_EXPIRED and simply skipped (quota refresh
+    for that account is skipped) until its window opens -- Kaggle is
+    never hammered with repeated login attempts.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # account_id (kaggle_username) -> session dict:
+        #   {
+        #     "storage_state": {...},
+        #     "generated_at": "...",
+        #     "last_verified": "...",
+        #     "next_reauth_after": "...",  (ISO-8601)
+        #     "last_auth_failure": None | "...",
+        #     "status": "ok" | "SESSION_EXPIRED",
+        #   }
+        self._sessions: Dict[str, dict] = {}
+        self._loaded = False
+        self._playwright = None  # lazily started, shared across calls
+
+    # -- Loading -------------------------------------------------------
+
+    def load_from_env(self) -> None:
+        """
+        Decodes KAGGLE_SESSIONS_JSON exactly once and populates
+        self._sessions. Raises RuntimeError with a clear message on any
+        problem (missing env var, bad base64, bad JSON, bad schema) --
+        callers (Orchestrator.startup) should let this abort startup,
+        the same way a missing ORCHESTRATOR_CONFIG does.
+        """
+        raw_env_value = os.environ.get(SESSIONS_ENV_VAR)
+        if not raw_env_value:
+            raise RuntimeError(
+                f"{SESSIONS_ENV_VAR} env var is not set. Generate it locally with "
+                f"generate_kaggle_sessions_env.py and set it before starting the "
+                f"orchestrator -- the server no longer logs into Kaggle on its own "
+                f"for quota refreshes."
+            )
+
+        try:
+            decoded_bytes = base64.b64decode(raw_env_value, validate=True)
+        except (binascii.Error, ValueError) as e:
+            raise RuntimeError(f"{SESSIONS_ENV_VAR} is not valid base64: {e}")
+
+        try:
+            payload = json.loads(decoded_bytes.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise RuntimeError(f"{SESSIONS_ENV_VAR} did not decode to valid JSON: {e}")
+
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{SESSIONS_ENV_VAR} must decode to a JSON object.")
+
+        accounts = payload.get("accounts")
+        if not isinstance(accounts, dict) or not accounts:
+            raise RuntimeError(
+                f"{SESSIONS_ENV_VAR} is missing a non-empty 'accounts' object."
+            )
+
+        sessions: Dict[str, dict] = {}
+        for account_id, entry in accounts.items():
+            if not isinstance(entry, dict) or "storage_state" not in entry:
+                raise RuntimeError(
+                    f"{SESSIONS_ENV_VAR}.accounts[{account_id!r}] is missing "
+                    f"required field 'storage_state'."
+                )
+            storage_state = entry["storage_state"]
+            if not isinstance(storage_state, dict):
+                raise RuntimeError(
+                    f"{SESSIONS_ENV_VAR}.accounts[{account_id!r}].storage_state "
+                    f"must be a JSON object (a Playwright storage_state)."
+                )
+
+            next_reauth_after = entry.get("next_reauth_after") or self._format_iso(
+                self._random_reauth_deadline()
+            )
+
+            sessions[account_id] = {
+                "storage_state": storage_state,
+                "generated_at": entry.get("generated_at"),
+                "last_verified": entry.get("last_verified"),
+                "next_reauth_after": next_reauth_after,
+                "last_auth_failure": entry.get("last_auth_failure"),
+                "status": "ok",
+            }
+
+        with self._lock:
+            self._sessions = sessions
+            self._loaded = True
+
+        logger.info(
+            f"KaggleSessionManager: loaded {len(sessions)} account session(s) from "
+            f"{SESSIONS_ENV_VAR} (decoded once; kept in memory only)."
+        )
+
+    @property
+    def loaded(self) -> bool:
+        return self._loaded
+
+    def has_session(self, account_id: str) -> bool:
+        with self._lock:
+            return account_id in self._sessions
+
+    def get_status_snapshot(self, account_id: str) -> dict:
+        """Read-only snapshot for API/logging surfaces; never mutated by the caller."""
+        with self._lock:
+            entry = self._sessions.get(account_id)
+            if not entry:
+                return {
+                    "status": "unknown",
+                    "last_verified": None,
+                    "next_reauth_after": None,
+                    "last_auth_failure": None,
+                }
+            return {
+                "status": entry.get("status", "unknown"),
+                "last_verified": entry.get("last_verified"),
+                "next_reauth_after": entry.get("next_reauth_after"),
+                "last_auth_failure": entry.get("last_auth_failure"),
+            }
+
+    # -- Random reauth scheduling ---------------------------------------
+
+    @staticmethod
+    def _random_reauth_deadline(now: Optional[datetime] = None) -> datetime:
+        """
+        Picks a fresh random 2-5 day deadline from `now` (default: now),
+        independently per call -- this is what gives each account its
+        own different interval (e.g. 2.3 days, 4.8 days, 3.1 days)
+        rather than every account expiring in lockstep.
+        """
+        now = now or datetime.now(timezone.utc)
+        days = random.uniform(REAUTH_MIN_DAYS, REAUTH_MAX_DAYS)
+        return now + timedelta(days=days)
+
+    @staticmethod
+    def _format_iso(dt: datetime) -> str:
+        return dt.astimezone(timezone.utc).isoformat()
+
+    def _reauth_window_open(self, entry: dict) -> bool:
+        """True only if wall-clock time is past this account's next_reauth_after."""
+        deadline = _parse_iso8601(entry.get("next_reauth_after"))
+        if deadline is None:
+            # No parseable deadline -- treat conservatively as "not yet
+            # open" rather than reauthenticating immediately/erroneously.
+            return False
+        return datetime.now(timezone.utc) > deadline
+
+    # -- Playwright plumbing ---------------------------------------------
+
+    def _ensure_playwright(self):
+        """Lazily starts a single shared Playwright driver, reused across calls."""
+        if self._playwright is None:
+            from playwright.sync_api import sync_playwright
+            self._playwright = sync_playwright().start()
+        return self._playwright
+
+    def close(self):
+        """Cleanup on process shutdown."""
+        if self._playwright is not None:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+
+    @contextmanager
+    def _browser_context(self, storage_state: Optional[dict]):
+        """
+        Yields a Playwright browser context, optionally pre-loaded with
+        `storage_state` (skips the login page entirely when provided).
+        Guarantees the browser and context are always closed, even on
+        exceptions raised inside the `with` block.
+        """
+        pw = self._ensure_playwright()
+        browser = pw.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(storage_state=storage_state) if storage_state else browser.new_context()
+            try:
+                yield context
+            finally:
+                context.close()
+        finally:
+            browser.close()
+
+    # -- Quota scraping using a stored session ---------------------------
+
+    @staticmethod
+    def _get_xsrf_token(page) -> str:
+        """
+        Reads the XSRF/CSRF token out of the page's own cookies via a
+        page.evaluate call (i.e. from inside the authenticated browser
+        context), exactly the way the original KaggleQuotaProvider did
+        it -- this is required by GetAcceleratorQuotaStatistics, which
+        401s without a matching x-xsrf-token header even with valid
+        session cookies present.
+        """
+        token = page.evaluate(
+            """
+            () => {
+            const cookies = document.cookie.split(';').map(c => c.trim());
+            const pick = (name) => {
+                const hit = cookies.find(c => c.startsWith(name + '='));
+                return hit ? hit.slice(name.length + 1) : '';
+            };
+            return pick('XSRF-TOKEN') || pick('CSRF-TOKEN') || pick('__Host-XSRF-TOKEN');
+            }
+            """
+        )
+        if not token:
+            return ""
+        try:
+            return unquote(token)
+        except Exception:
+            return token
+
+    def _try_quota_with_storage_state(self, storage_state: dict) -> dict:
+        """
+        Opens an authenticated context from `storage_state`, visits the
+        Kaggle homepage (to obtain a live page whose cookies we can read
+        the XSRF token from, and as a liveness probe for the session
+        itself), then calls Kaggle's real internal quota RPC --
+        POST {KAGGLE_BASE}{QUOTA_ENDPOINT}
+        ("/api/i/kernels.KernelsService/GetAcceleratorQuotaStatistics")
+        -- the same endpoint and calling convention
+        (fetch() from page.evaluate, credentials: 'include', JSON body
+        "{}", x-xsrf-token header) used by the original
+        KaggleQuotaProvider.scrape_usage. There is no public REST quota
+        endpoint; this internal RPC is the only source for it.
+
+        Raises KaggleSessionError if anything indicates the session is
+        no longer authenticated (redirected to login, non-2xx from the
+        quota RPC, or an unparseable response).
+
+        Returns the raw quota JSON (matching KaggleQuotas.from_api_response's
+        expected shape: quotaRefreshTime / tpuQuota / gpuQuota) on success.
+        """
+        with self._browser_context(storage_state) as context:
+            page = context.new_page()
+            try:
+                response = page.goto(KAGGLE_HOMEPAGE_URL, wait_until="domcontentloaded", timeout=30_000)
+                if response is None:
+                    raise KaggleSessionError("No response loading Kaggle homepage.")
+
+                final_url = page.url or ""
+                if "/account/login" in final_url or "/account/sign-in" in final_url:
+                    raise KaggleSessionError(
+                        "Redirected to Kaggle login page -- stored session is no longer authenticated."
+                    )
+
+                xsrf = self._get_xsrf_token(page)
+                if not xsrf:
+                    logger.warning(
+                        "No XSRF token found in cookies for quota check; proceeding without "
+                        "it (endpoint may reject the request)."
+                    )
+
+                try:
+                    quota_json = page.evaluate(
+                        """
+                        async ({ endpoint, xsrf }) => {
+                        const res = await fetch(endpoint, {
+                            method: 'POST',
+                            headers: {
+                            'content-type': 'application/json',
+                            ...(xsrf ? { 'x-xsrf-token': xsrf } : {})
+                            },
+                            credentials: 'include',
+                            body: '{}'
+                        });
+
+                        const text = await res.text();
+                        if (!res.ok) {
+                            throw new Error(`HTTP ${res.status}: ${text}`);
+                        }
+
+                        try {
+                            return JSON.parse(text);
+                        } catch (e) {
+                            throw new Error(`Failed to parse JSON: ${text}`);
+                        }
+                        }
+                        """,
+                        {"endpoint": f"{KAGGLE_BASE}{QUOTA_ENDPOINT}", "xsrf": xsrf},
+                    )
+                except Exception as e:
+                    message = str(e)
+                    if "HTTP 401" in message or "HTTP 403" in message:
+                        raise KaggleSessionError(
+                            f"Quota endpoint rejected the request -- session no longer "
+                            f"authenticated: {message}"
+                        )
+                    raise KaggleSessionError(f"Quota endpoint call failed: {message}")
+
+                if not isinstance(quota_json, dict):
+                    raise KaggleSessionError(
+                        f"Quota endpoint returned unexpected shape (not a JSON object): {quota_json!r}"
+                    )
+
+                return quota_json
+            finally:
+                page.close()
+
+    def get_quota(self, account: "AccountState") -> dict:
+        """
+        Main entry point used by KaggleService.refresh_quota. Returns
+        the raw quota JSON dict on success.
+
+        Flow:
+          1. Load the stored storage_state for this account.
+          2. Try it (no login page visited).
+          3. On auth failure, retry once with a brand-new browser
+             context using the same storage_state (covers transient
+             issues, not stale credentials).
+          4. If it still fails:
+               - If the account's reauth window is open (time expired
+                 AND this failure), attempt exactly one Playwright
+                 login using username/password, update the in-memory
+                 session + a fresh random next_reauth_after on success.
+               - Otherwise, mark the account SESSION_EXPIRED and skip
+                 (raise KaggleSessionError so the caller skips this
+                 refresh cycle) -- never hammer Kaggle with repeated
+                 logins outside the account's own window.
+
+        Passwords are only ever touched inside the reauthentication
+        branch below -- never during the normal storage_state path.
+        """
+        with self._lock:
+            entry = self._sessions.get(account.account_id)
+
+        if entry is None:
+            raise KaggleSessionError(
+                f"No stored Playwright session for account {account.account_id!r} in "
+                f"{SESSIONS_ENV_VAR}. Run generate_kaggle_sessions_env.py to add it."
+            )
+
+        storage_state = entry["storage_state"]
+
+        # Attempt 1, then one retry with a fresh context on the same
+        # storage_state (transient-failure tolerant; still never touches
+        # the login page or a password).
+        last_error: Optional[Exception] = None
+        for attempt in (1, 2):
+            try:
+                quota_json = self._try_quota_with_storage_state(storage_state)
+                self._mark_verified(account.account_id)
+                return quota_json
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"KaggleSessionManager: quota check attempt {attempt}/2 failed for "
+                    f"{account.account_id}: {e}"
+                )
+
+        # Both attempts failed. Only now do we even consider a login,
+        # and only if this account's randomized window has elapsed.
+        reauth_open = self._reauth_window_open(entry)
+
+        if not reauth_open:
+            self._mark_expired(account.account_id, str(last_error))
+            raise KaggleSessionError(
+                f"Stored session for {account.account_id} failed and reauth window is "
+                f"not yet open (next_reauth_after={entry.get('next_reauth_after')}); "
+                f"skipping quota refresh for this account without logging in."
+            )
+
+        logger.info(
+            f"KaggleSessionManager: reauth window open for {account.account_id} and "
+            f"stored session failed -- attempting one Playwright login."
+        )
+        try:
+            new_storage_state = self._login_and_capture_storage_state(account)
+        except Exception as e:
+            self._mark_expired(account.account_id, str(e))
+            raise KaggleSessionError(
+                f"Reauthentication failed for {account.account_id}: {e}"
+            )
+
+        # Reauth succeeded: persist updated storage_state, generated_at,
+        # and a fresh randomized next_reauth_after into memory. No env
+        # var is rewritten -- this is in-memory only, as specified.
+        now_iso = self._format_iso(datetime.now(timezone.utc))
+        new_deadline = self._format_iso(self._random_reauth_deadline())
+        with self._lock:
+            self._sessions[account.account_id] = {
+                "storage_state": new_storage_state,
+                "generated_at": now_iso,
+                "last_verified": now_iso,
+                "next_reauth_after": new_deadline,
+                "last_auth_failure": None,
+                "status": "ok",
+            }
+        logger.info(
+            f"KaggleSessionManager: session refreshed via Playwright login for "
+            f"{account.account_id}; next_reauth_after={new_deadline}"
+        )
+
+        # Use the freshly-logged-in session to actually answer this
+        # quota request too, rather than making the caller wait another
+        # cycle.
+        try:
+            quota_json = self._try_quota_with_storage_state(new_storage_state)
+            self._mark_verified(account.account_id)
+            return quota_json
+        except Exception as e:
+            # Reauth "succeeded" but the very next call still failed --
+            # be conservative and mark expired rather than looping.
+            self._mark_expired(account.account_id, str(e))
+            raise KaggleSessionError(
+                f"Quota check failed even immediately after a successful reauth for "
+                f"{account.account_id}: {e}"
+            )
+
+    def _login_and_capture_storage_state(self, account: "AccountState") -> dict:
+        """
+        The one and only place password material is used at server
+        runtime. Performs an interactive Playwright login using
+        account.username / account.password, waits for confirmation of
+        an authenticated state, and returns the resulting storage_state
+        dict. Headless -- this runtime path assumes credentials alone
+        are sufficient (no CAPTCHA-solving here); if Kaggle presents a
+        CAPTCHA at runtime, this will fail and the account is correctly
+        marked SESSION_EXPIRED rather than hanging the server waiting
+        for manual input. (Manual CAPTCHA-assisted login is supported
+        only in the offline generate_kaggle_sessions_env.py helper,
+        which runs headed/interactively for exactly this reason.)
+        """
+        if not account.username or not account.password:
+            raise KaggleSessionError(
+                f"Account {account.account_id} has no username/password configured; "
+                f"cannot reauthenticate."
+            )
+
+        pw = self._ensure_playwright()
+        browser = pw.chromium.launch(headless=True)
+        try:
+            context = browser.new_context()
+            try:
+                page = context.new_page()
+                page.goto("https://www.kaggle.com/account/login", wait_until="domcontentloaded", timeout=30_000)
+
+                page.fill('input[name="email"]', account.username, timeout=15_000)
+                page.fill('input[name="password"]', account.password, timeout=15_000)
+                page.click('button[type="submit"]', timeout=15_000)
+
+                page.wait_for_url(lambda url: "/account/login" not in url, timeout=30_000)
+
+                final_url = page.url or ""
+                if "/account/login" in final_url:
+                    raise KaggleSessionError("Still on login page after submit -- credentials rejected or CAPTCHA required.")
+
+                return context.storage_state()
+            finally:
+                context.close()
+        finally:
+            browser.close()
+
+    def _mark_verified(self, account_id: str) -> None:
+        with self._lock:
+            entry = self._sessions.get(account_id)
+            if entry is not None:
+                entry["status"] = "ok"
+                entry["last_verified"] = self._format_iso(datetime.now(timezone.utc))
+                entry["last_auth_failure"] = None
+
+    def _mark_expired(self, account_id: str, error_detail: str) -> None:
+        with self._lock:
+            entry = self._sessions.get(account_id)
+            if entry is not None:
+                entry["status"] = "SESSION_EXPIRED"
+                entry["last_auth_failure"] = self._format_iso(datetime.now(timezone.utc))
+        logger.error(f"KaggleSessionManager: marking {account_id} SESSION_EXPIRED: {error_detail}")
 
 
 ###############################################################################
@@ -534,6 +1115,12 @@ class KaggleService:
     account's existing kernels so orchestrator-created notebooks can be
     recognized by slug prefix even if orchestrator_state.json is stale,
     missing, or was wiped.
+
+    GPU QUOTA: unlike kernel push/status/delete (which use the official
+    KAGGLE_API_TOKEN-based kaggle API), quota has no such endpoint and
+    is fetched via KaggleSessionManager, which uses a pre-generated
+    Playwright storage_state instead of logging in on every call. See
+    `refresh_quota` below and the KaggleSessionManager docstring.
     """
 
     # Modules to purge on each call so a fresh `import kaggle` re-runs its
@@ -541,24 +1128,29 @@ class KaggleService:
     # returning a cached client bound to a different account.
     _KAGGLE_MODULE_PREFIXES = ("kaggle", "kagglesdk")
 
-    def __init__(self):
+    def __init__(self, session_manager: Optional["KaggleSessionManager"] = None):
         # Guards the env-var + reimport window below; os.environ and
         # sys.modules are both process-global, and calls run on a shared
         # thread pool executor.
         self._kaggle_env_lock = threading.Lock()
+        # Owns Playwright storage-state-based quota auth. Injected by
+        # Orchestrator.startup after KaggleSessionManager.load_from_env
+        # succeeds; refresh_quota requires this to be set (there is no
+        # more username/password-per-refresh fallback).
+        self.session_manager = session_manager
 
     @staticmethod
     def _parse_seconds(s) -> int:
         """
         Normalizes a quota value to whole seconds.
 
-        Two shapes have been observed from KaggleQuotaProvider's scrape:
+        Two shapes have been observed from Kaggle's quota JSON:
           - "3600s"  -- a duration-string with a trailing "s", already
             in seconds (protobuf Duration JSON mapping style).
           - "18.896" -- a bare decimal with NO unit suffix, which is
             hours (matches what Kaggle's own quota UI shows, e.g.
-            "18.9 / 30 hrs"). This is what triggered the crash: the old
-            code assumed every string had a trailing "s" and called
+            "18.9 / 30 hrs"). This is what triggered a crash historically:
+            code that assumed every string had a trailing "s" and called
             int() directly on "18.896", which isn't a valid int literal.
 
         Bare ints/floats (no trailing "s") are treated the same as the
@@ -571,7 +1163,7 @@ class KaggleService:
                 # "3600s" style -- already seconds.
                 return int(float(stripped[:-1]))
             # "18.896" style -- decimal hours, no unit suffix.
-            return int(round(stripped))
+            return int(round(float(stripped) * 3600))
         # Non-string numeric: same decimal-hours assumption.
         return int(round(float(s) * 3600))
 
@@ -603,6 +1195,10 @@ class KaggleService:
         block too, since kagglesdk resolves credentials lazily rather
         than caching them at authenticate() time. Env vars and modules
         are restored/purged again on exit so the next call starts clean.
+
+        (This is the official-kaggle-API path for kernel push/status/
+        delete -- unrelated to quota scraping, which never touches this
+        method.)
         """
         if not account.kaggle_api_token:
             raise HTTPException(
@@ -648,30 +1244,56 @@ class KaggleService:
 
                 self._purge_kaggle_modules()
 
-    async def refresh_quota(self, account: AccountState) -> tuple:
+    async def refresh_quota(self, account: AccountState) -> Optional[tuple]:
+        """
+        Fetches GPU quota for `account` using the pre-generated
+        Playwright storage_state via KaggleSessionManager -- no
+        per-refresh Kaggle login. Returns (total, used, remaining,
+        refresh_time) on success, or None if this account's session is
+        unavailable/expired and should simply be skipped this cycle
+        (the caller -- Orchestrator.refresh_quotas -- treats None as
+        "leave existing quota fields as-is, log, move on").
+
+        Passwords are never read or used here; they are only ever
+        touched inside KaggleSessionManager's rare reauthentication
+        fallback, gated by that account's own randomized reauth window.
+        """
+        if self.session_manager is None or not self.session_manager.loaded:
+            logger.error(
+                f"refresh_quota: no KaggleSessionManager loaded; cannot fetch quota "
+                f"for {account.account_id} without KAGGLE_SESSIONS_JSON."
+            )
+            return None
+
+        def _fetch():
+            return self.session_manager.get_quota(account)
+
         try:
-            try:
-                from kaggle_quota_provider import KaggleQuotaProvider
-
-                def _scrape():
-                    with KaggleQuotaProvider() as scraper:
-                        return scraper.login_and_scrape(account.username, account.password)
-
-                quota = await asyncio.get_event_loop().run_in_executor(None, _scrape)
-
-                total = self._parse_seconds(quota.gpu_quota["totalTimeAllowed"])
-                used = self._parse_seconds(quota.gpu_quota["timeUsed"])
-                remaining = total - used
-                refresh_time = quota.quota_refresh_time
-
-                return total, used, remaining, refresh_time
-            except ImportError:
-                logger.warning("KaggleQuotaProvider not available, using mock quota")
-                return 108000, 0, 108000, datetime.now(timezone.utc).isoformat()
-
+            quota = await asyncio.get_event_loop().run_in_executor(None, _fetch)
+        except KaggleSessionError as e:
+            logger.warning(f"refresh_quota: skipping {account.account_id}: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Failed to refresh quota for {account.account_id}: {e}", exc_info=True)
-            raise
+            logger.error(f"refresh_quota: unexpected error for {account.account_id}: {e}", exc_info=True)
+            return None
+
+        try:
+            # Real Kaggle response shape (matches KaggleQuotas.from_api_response
+            # in the reference KaggleQuotaProvider): the GPU quota fields
+            # are nested under a top-level "gpuQuota" object, not at the
+            # response's top level.
+            gpu_quota = quota["gpuQuota"]
+            total = self._parse_seconds(gpu_quota["totalTimeAllowed"])
+            used = self._parse_seconds(gpu_quota["timeUsed"])
+            remaining = total - used
+            refresh_time = quota.get("quotaRefreshTime") or ""
+            return total, used, remaining, refresh_time
+        except Exception as e:
+            logger.error(
+                f"refresh_quota: quota JSON for {account.account_id} had unexpected "
+                f"shape: {e}. Raw: {quota!r}"
+            )
+            return None
 
     async def upload_notebook(
         self,
@@ -938,6 +1560,14 @@ class StateManager:
                 account_data["gpu_quota_refresh_time"] = ""
                 account_data["last_quota_update"] = 0
                 account_data.setdefault("kaggle_api_token", "")
+                # Session-status fields are informational mirrors of
+                # KaggleSessionManager's in-memory state; never trusted
+                # from disk either -- reset and let the session manager
+                # (re)populate them as quota checks happen.
+                account_data["session_status"] = "unknown"
+                account_data["session_last_verified"] = None
+                account_data["session_next_reauth_after"] = None
+                account_data["session_last_auth_failure"] = None
 
                 account = AccountState(**account_data)
 
@@ -1011,7 +1641,8 @@ class Orchestrator:
         self.deployments: Dict[str, DeploymentState] = {}
         self.websocket = WebSocketManager()
         self.state = StateManager()
-        self.kaggle = KaggleService()
+        self.sessions = KaggleSessionManager()
+        self.kaggle = KaggleService(session_manager=self.sessions)
         self.hf = HuggingFaceService()
         self.generator: Optional[NotebookGenerator] = None
         self.background_tasks: List[asyncio.Task] = []
@@ -1029,6 +1660,14 @@ class Orchestrator:
                     "orchestrator_api_shared_secret is not set in the ORCHESTRATOR_CONFIG "
                     "payload. Refusing to start with the API unauthenticated."
                 )
+
+            logger.info(f"Loading Kaggle sessions from {SESSIONS_ENV_VAR} env var...")
+            # Decoded exactly once here and kept in memory for the life
+            # of the process -- see module docstring "SESSIONS LOADING".
+            # Startup intentionally fails hard if this is missing or
+            # malformed, the same way a missing ORCHESTRATOR_CONFIG does,
+            # since there is no more automatic-login fallback.
+            self.sessions.load_from_env()
 
             self.generator = NotebookGenerator(self.config.notebook_template_url)
             self.hf = HuggingFaceService(self.config.hf_token)
@@ -1074,7 +1713,14 @@ class Orchestrator:
                         f"and may not authenticate correctly."
                     )
 
-            logger.info("Refreshing quotas (live, not from cached state)...")
+                if not self.sessions.has_session(account_id):
+                    logger.warning(
+                        f"Account {account_id} has no entry in {SESSIONS_ENV_VAR}; quota "
+                        f"refresh will be skipped for this account until a session is "
+                        f"generated for it via generate_kaggle_sessions_env.py."
+                    )
+
+            logger.info("Refreshing quotas (using stored Playwright sessions, not live login)...")
             await self.refresh_quotas()
 
             logger.info("Reconciling deployments against live Kaggle state...")
@@ -1093,6 +1739,13 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Startup failed: {e}")
             raise
+
+    async def shutdown(self):
+        """Cleanup on process shutdown (closes the shared Playwright driver, if started)."""
+        try:
+            self.sessions.close()
+        except Exception as e:
+            logger.warning(f"Error during KaggleSessionManager shutdown: {e}")
 
     async def discover_existing_deployments(self):
         """
@@ -1328,10 +1981,35 @@ class Orchestrator:
             raise HTTPException(status_code=500, detail="Config parse failed")
 
     async def refresh_quotas(self):
-        """Refresh GPU quotas for all accounts."""
+        """
+        Refresh GPU quotas for all accounts using stored Playwright
+        sessions (KaggleSessionManager) rather than logging into Kaggle.
+        Accounts whose session is missing/expired and not yet in their
+        reauth window are simply skipped for this cycle -- their last-
+        known quota fields are left untouched, and this is logged, but
+        it never blocks other accounts or raises out of this loop.
+        """
         for account in self.accounts.values():
             try:
-                total, used, remaining, refresh_time = await self.kaggle.refresh_quota(account)
+                result = await self.kaggle.refresh_quota(account)
+
+                # Mirror the session manager's current view of this
+                # account into AccountState, purely for /api/accounts
+                # visibility and operator debugging.
+                snapshot = self.sessions.get_status_snapshot(account.account_id)
+                account.session_status = snapshot["status"]
+                account.session_last_verified = snapshot["last_verified"]
+                account.session_next_reauth_after = snapshot["next_reauth_after"]
+                account.session_last_auth_failure = snapshot["last_auth_failure"]
+
+                if result is None:
+                    logger.info(
+                        f"Skipping quota update for {account.account_id} this cycle "
+                        f"(session unavailable/expired; status={account.session_status})."
+                    )
+                    continue
+
+                total, used, remaining, refresh_time = result
                 account.gpu_quota_total_seconds = total
                 account.gpu_quota_used_seconds = used
                 account.gpu_quota_remaining_seconds = remaining
@@ -1579,6 +2257,11 @@ async def startup():
     await orch.startup()
 
 
+@app.on_event("shutdown")
+async def shutdown():
+    await orch.shutdown()
+
+
 ###############################################################################
 # Accounts Endpoints
 ###############################################################################
@@ -1606,6 +2289,10 @@ async def list_accounts():
                 "last_quota_update": a.last_quota_update,
                 "has_deployment": a.deployment is not None,
                 "deployment_id": a.deployment.deployment_id if a.deployment else None,
+                "session_status": a.session_status,
+                "session_last_verified": a.session_last_verified,
+                "session_next_reauth_after": a.session_next_reauth_after,
+                "session_last_auth_failure": a.session_last_auth_failure,
             }
             for a in accounts_list
         ]
@@ -1755,6 +2442,10 @@ async def health():
         1 for d in orch.deployments.values()
         if d.notebook_status == "idle"
     )
+    sessions_expired = sum(
+        1 for a in orch.accounts.values()
+        if a.session_status == "SESSION_EXPIRED"
+    )
 
     return {
         "status": "ok",
@@ -1762,6 +2453,7 @@ async def health():
         "deployments_running": deployments_running,
         "deployments_idle": deployments_idle,
         "total_deployments": len(orch.deployments),
+        "sessions_expired": sessions_expired,
     }
 
 

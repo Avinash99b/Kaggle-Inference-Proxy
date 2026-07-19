@@ -2,3 +2,4 @@ orchestrator_config.json
 orchestrator_state.json
 __pycache__/
 diagnostics/
+kaggle_sessions.json
