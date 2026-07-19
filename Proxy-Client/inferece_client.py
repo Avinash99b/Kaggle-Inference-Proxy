@@ -1063,6 +1063,7 @@ class PersistentRunner:
             self._current_job_id = None
             proc = self.proc
 
+        vram_cfg = CONFIG.get("vram_management", {})
         load_req = {
             "type": "load",
             "model_path": MODELS.current_local_path,
@@ -1071,6 +1072,15 @@ class PersistentRunner:
             "n_threads": MODELS.n_threads,
             "n_gpu_layers": MODELS.n_gpu_layers,
             "tensor_split": MODELS.tensor_split,
+            # The startup probe's n_ctx can go stale by the time a per-job
+            # runner actually allocates its own llama_context (VRAM
+            # fragmentation, other processes claiming memory between probe
+            # time and now). Let the runner itself retry at a smaller
+            # n_ctx on load failure instead of treating the parent's
+            # single cached value as gospel.
+            "min_ctx": vram_cfg.get("min_n_ctx", 256),
+            "oom_shrink_factor": vram_cfg.get("oom_shrink_factor", 0.75),
+            "max_load_retries": vram_cfg.get("max_oom_retries", 4),
         }
         assert proc.stdin is not None and proc.stdout is not None
         proc.stdin.write(json.dumps(load_req) + "\n")
@@ -1085,6 +1095,13 @@ class PersistentRunner:
             raise RuntimeError(f"Runner subprocess failed to load model: {event.get('error')}")
         if event.get("type") != "loaded":
             raise RuntimeError(f"Runner subprocess sent unexpected startup event: {event}")
+        actual_n_ctx = event.get("n_ctx")
+        if actual_n_ctx and actual_n_ctx != MODELS.n_ctx:
+            logger.warning(
+                "Runner subprocess loaded with n_ctx=%d after shrinking from the cached "
+                "n_ctx=%d; adopting the smaller value for future respawns.",
+                actual_n_ctx, MODELS.n_ctx)
+            MODELS.n_ctx = actual_n_ctx
         logger.info("Persistent runner subprocess loaded and ready (pid=%s).", proc.pid)
 
     def _teardown(self, reason: str) -> None:

@@ -164,24 +164,63 @@ def main() -> None:
         _emit({"type": "load_error", "error": f"could not import llama_cpp: {e}"})
         return
 
-    try:
-        kwargs = dict(
-            model_path=model_path,
-            n_ctx=n_ctx,
-            n_batch=n_batch,
-            n_threads=n_threads,
-            n_gpu_layers=n_gpu_layers,
-            verbose=False,
-        )
-        if tensor_split:
-            llm = Llama(tensor_split=tensor_split, **kwargs)
-        else:
-            llm = Llama(**kwargs)
-    except Exception as e:
-        _emit({"type": "load_error", "error": f"model load failed in runner: {e}\n{traceback.format_exc()}"})
-        return
+    # The n_ctx we're handed here was validated once by the parent's
+    # startup probe, but that validation can go stale by the time this
+    # (freshly spawned, separate) process actually tries to allocate its
+    # own llama_context: VRAM fragments, other Kaggle processes claim
+    # memory, or the compute-buffer allocation is simply right on the
+    # edge (see "sched_reserve: compute buffer allocation failed,
+    # retrying without pipeline parallelism" in worker logs -- that retry
+    # already tells you the probe barely fit). Rather than treating a
+    # single failed attempt at the parent's cached n_ctx as fatal, retry
+    # a few times with a smaller n_ctx, same as the parent's own
+    # load_startup_model() OOM-shrink loop.
+    min_ctx = load_req.get("min_ctx", 256)
+    shrink_factor = load_req.get("oom_shrink_factor", 0.75)
+    max_retries = load_req.get("max_load_retries", 3)
 
-    _emit({"type": "loaded"})
+    attempts = 0
+    last_error = None
+    llm = None
+    cur_ctx = n_ctx
+    while True:
+        attempts += 1
+        try:
+            kwargs = dict(
+                model_path=model_path,
+                n_ctx=cur_ctx,
+                n_batch=n_batch,
+                n_threads=n_threads,
+                n_gpu_layers=n_gpu_layers,
+                verbose=False,
+            )
+            if tensor_split:
+                llm = Llama(tensor_split=tensor_split, **kwargs)
+            else:
+                llm = Llama(**kwargs)
+            break
+        except Exception as e:
+            last_error = f"{e}\n{traceback.format_exc()}"
+            if attempts >= max_retries + 1 or cur_ctx <= min_ctx:
+                _emit({"type": "load_error",
+                       "error": f"model load failed in runner after {attempts} attempt(s) "
+                                f"(last n_ctx={cur_ctx}): {last_error}"})
+                return
+            new_ctx = max(min_ctx, int(cur_ctx * shrink_factor))
+            sys.stderr.write(
+                f"[runner] load failed at n_ctx={cur_ctx} (attempt {attempts}/{max_retries + 1}); "
+                f"retrying at n_ctx={new_ctx}\n")
+            sys.stderr.flush()
+            cur_ctx = new_ctx
+
+    if cur_ctx != n_ctx:
+        # Tell the parent what we actually ended up loading with, so its
+        # dashboard/state (MODELS.n_ctx) doesn't keep reporting a context
+        # size that no longer matches what's actually loaded -- otherwise
+        # the next respawn will just repeat this same failed attempt.
+        _emit({"type": "loaded", "n_ctx": cur_ctx})
+    else:
+        _emit({"type": "loaded"})
 
     # Main job loop: block waiting for the next job, run it, emit results,
     # repeat. Exits cleanly on EOF (parent closed stdin, e.g. during a
