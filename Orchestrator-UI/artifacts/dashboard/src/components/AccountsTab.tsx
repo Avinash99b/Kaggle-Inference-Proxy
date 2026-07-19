@@ -169,7 +169,7 @@ export function AccountsTab() {
               </TableRow>
             ) : (
               sortedAccounts.map((account) => {
-                const isOnline = (Date.now() / 1000) - account.last_quota_update < 300;
+                const isOnline = (Date.now() / 1000) - account.last_quota_update < 720;
                 const runningDep = runningByAccount.get(account.account_id);
 
                 return (
