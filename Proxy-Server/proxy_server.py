@@ -125,6 +125,12 @@ DEFAULT_CONFIG = {
     "auth_timestamp_skew_seconds": 300,
     "client_disconnect_check_interval_seconds": 1.0,
     "stream_ping_interval_seconds": 1.0,
+    # How long a streaming job's SSE generator can go with no successful
+    # ping/token write before watchdog_loop treats its driving coroutine
+    # as wedged and force-fails the job directly (see watchdog_loop).
+    # Deliberately much shorter than request_timeout_seconds -- this
+    # catches a stuck writer within seconds/tens-of-seconds, not minutes.
+    "stalled_stream_grace_seconds": 15,
     "websocket": {
         "heartbeat_interval_seconds": 20,
         "heartbeat_timeout_seconds": 60,
@@ -344,6 +350,17 @@ class Job:
     last_is_disconnected_check_at: Optional[float] = None
     last_is_disconnected_result: Optional[bool] = None
 
+    # True timestamp of the last write that ACTUALLY succeeded against the
+    # real client socket -- set on every successful yield out of
+    # real_stream_generator(), ping or content alike. This is deliberately
+    # separate from last_activity_at (which is refreshed purely by tokens
+    # ARRIVING FROM THE WORKER over the WS 'stream_chunk' handler, i.e. is
+    # producer-side and says nothing about whether anyone downstream is
+    # still receiving them). See watchdog_loop()'s staleness check for why
+    # conflating the two lets a dead-consumer/live-producer job run
+    # forever undetected.
+    last_client_write_at: Optional[float] = None
+
     def diagnostic_snapshot(self) -> dict:
         """Everything the dashboard's per-worker detail dialog shows about
         this job's stream-receiver / disconnect-detection state. Purely
@@ -384,6 +401,8 @@ class Job:
             "last_ping_failed_at": self.last_ping_failed_at,
             "generator_exit_at": self.generator_exit_at,
             "generator_exit_age_seconds": age(self.generator_exit_at),
+            "last_client_write_at": self.last_client_write_at,
+            "last_client_write_age_seconds": age(self.last_client_write_at),
             # Only meaningful while stream_response_active is False (see
             # watch_job_liveness): once the SSE generator takes over, this
             # stops updating on purpose, to avoid racing the generator's
@@ -1030,6 +1049,23 @@ class WorkerRegistry:
             for jid in stale:
                 del w.jobs[jid]
 
+    def prune_finished_jobs_for_worker(self, worker: WorkerState, keep: int = 3) -> None:
+        """Keep only the `keep` most-recently-created FINISHED jobs for
+        this worker; drop older finished ones. Never touches a job that
+        isn't done yet (still queued or in-flight), regardless of age --
+        this is purely about not letting old, already-resolved job
+        history pile up in worker.jobs (which cleanup() also does, on a
+        much longer 1-hour horizon; this is the tighter, dashboard-facing
+        version of the same idea, called on-demand from the detail
+        endpoint so the dialog never shows more than a handful of stale
+        past jobs for a long-running worker)."""
+        finished = [j for j in worker.jobs.values() if j.future.done()]
+        if len(finished) <= keep:
+            return
+        finished.sort(key=lambda j: j.created_at, reverse=True)
+        for j in finished[keep:]:
+            worker.jobs.pop(j.id, None)
+
     def prune_dead_workers(self, max_age: float = 24 * 3600) -> None:
         """Drop bookkeeping for workers that have been offline for a very
         long time, so the registry doesn't grow unbounded across many
@@ -1213,6 +1249,13 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
     """
     role_sent = False
     exiting_via_generator_exit = False
+    # Set the instant ANY write to the client fails for a reason other than
+    # GeneratorExit (ping OR content). Distinct from exiting_via_generator_exit
+    # because a plain write failure (BrokenPipeError / ConnectionResetError /
+    # anyio's BrokenResourceError, depending on the ASGI server) is not
+    # guaranteed to arrive as a GeneratorExit -- see the long comment above
+    # the content-yield try/except below for why that gap mattered.
+    had_fatal_write_error = False
     ping_interval = CONFIG.get("stream_ping_interval_seconds", 1.0)
     last_ping_at = time.time()
     _PING_DUE = object()  # sentinel; stream_queue itself only ever holds
@@ -1282,15 +1325,19 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
                     yield ": ping\n\n"
                     last_ping_at = time.time()
                     job.last_ping_ok_at = last_ping_at
+                    job.last_client_write_at = last_ping_at
                     job.stream_ping_ok_count += 1
                 except Exception:
                     # The write itself failed -- this IS the connection
-                    # being confirmed dead, no polling needed. Re-raise so
-                    # the outer GeneratorExit/Exception handling below
-                    # (or, if this isn't a GeneratorExit, the generic
-                    # except clause) can run the same abandon path.
+                    # being confirmed dead, no polling needed. abandon()
+                    # is called HERE, synchronously, rather than relying on
+                    # the outer except GeneratorExit below, because a raw
+                    # write failure is not guaranteed to be a GeneratorExit
+                    # (see the content-yield try/except further down for
+                    # the full explanation -- this mirrors that fix).
                     job.last_ping_failed_at = time.time()
                     job.stream_ping_failed_count += 1
+                    had_fatal_write_error = True
                     await abandon("keepalive write failed")
                     raise
                 continue
@@ -1314,8 +1361,8 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
                         "created": int(time.time()), "model": model,
                         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
                     }
-                    yield f"data: {json.dumps(first)}\n\n"
-                    role_sent = True
+                else:
+                    first = None
                 delta_obj = {"content": delta_text} if delta_text else {}
                 chunk = {
                     "id": f"chatcmpl-{job.id}", "object": "chat.completion.chunk",
@@ -1323,13 +1370,58 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
                     "choices": [{"index": 0, "delta": delta_obj, "finish_reason": finish_reason}],
                 }
             else:
+                first = None
                 chunk = {
                     "id": f"cmpl-{job.id}", "object": "text_completion",
                     "created": int(time.time()), "model": model,
                     "choices": [{"index": 0, "text": delta_text, "logprobs": None,
                                  "finish_reason": finish_reason}],
                 }
-            yield f"data: {json.dumps(chunk)}\n\n"
+
+            # THE ACTUAL BUG: these writes used to be bare yields with no
+            # try/except at all, while the keepalive ping (above) was
+            # carefully wrapped. But content tokens are what's actually
+            # being written on nearly every loop iteration during active
+            # generation -- the ping only fires on gaps -- so a failed
+            # write almost always surfaces HERE first in practice, not on
+            # a ping. Depending on the ASGI server, a write into a dead
+            # socket can raise a plain exception (BrokenPipeError,
+            # ConnectionResetError, anyio's BrokenResourceError) rather
+            # than manifesting as GeneratorExit -- GeneratorExit is only
+            # guaranteed once Starlette's own listen_for_disconnect task
+            # notices the disconnect AND tears this generator down; the
+            # two can race, and a raw write failure can beat it. An
+            # unwrapped yield meant that exception sailed past `except
+            # GeneratorExit` below untouched (wrong exception type),
+            # straight into `finally`, where the old code -- seeing
+            # exiting_via_generator_exit was still False -- tried to
+            # yield "data: [DONE]\n\n" as if the stream had ended
+            # normally. That yield-in-finally swallowed the original
+            # exception, cancel_job_on_worker()/abandon() was never
+            # called, and the runner subprocess kept generating into
+            # job.stream_queue indefinitely: each new token still updates
+            # job.last_activity_at (that update comes from the WS
+            # 'stream_chunk' handler on the PRODUCER side -- see
+            # worker_ws() -- and has nothing to do with whether this
+            # consumer is even still running), so even
+            # watchdog_loop()'s stalled_stream_grace backstop never
+            # tripped. Mirroring the ping's try/except closes exactly
+            # that gap.
+            try:
+                if first is not None:
+                    yield f"data: {json.dumps(first)}\n\n"
+                    role_sent = True
+                yield f"data: {json.dumps(chunk)}\n\n"
+                job.last_client_write_at = time.time()
+            except Exception:
+                # GeneratorExit is a BaseException, not an Exception, so it
+                # is never caught here -- it still falls through to the
+                # `except GeneratorExit` clause below exactly as before.
+                # Every other write failure now abandons the job
+                # immediately instead of silently running to completion.
+                had_fatal_write_error = True
+                await abandon("content write failed")
+                raise
     except GeneratorExit:
         # The ASGI server just tore this generator down early -- the
         # connection is confirmed gone. Fire the same abandon path
@@ -1346,7 +1438,7 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
     finally:
         if job.liveness_task is not None and not job.liveness_task.done():
             job.liveness_task.cancel()
-        if not exiting_via_generator_exit:
+        if not exiting_via_generator_exit and not had_fatal_write_error:
             yield "data: [DONE]\n\n"
 
 
@@ -1567,16 +1659,21 @@ async def kill_all():
 @app.get("/worker/{worker_id}/detail")
 async def worker_detail(worker_id: str):
     """Everything the dashboard's per-worker detail dialog shows: the
-    worker's own snapshot() plus a diagnostic_snapshot() for every job it
-    currently owns (queued or in-flight), most-recent first. This is what
-    lets an operator see, live, whether a streaming job's SSE receiver is
-    still considered connected, when it last got a ping through
-    successfully, whether GeneratorExit has fired, etc. -- instead of only
-    being able to infer it indirectly from worker-side logs."""
+    worker's own snapshot() plus a diagnostic_snapshot() for its 3 most
+    recent jobs (queued or in-flight jobs are always included regardless
+    of age; only finished jobs are subject to the cap -- see
+    REGISTRY.prune_finished_jobs_for_worker, called here so the dialog
+    never shows more than 3 finished jobs' worth of history even for a
+    worker that's been running a long time). This is what lets an
+    operator see, live, whether a streaming job's SSE receiver is still
+    considered connected, when it last got a ping through successfully,
+    whether GeneratorExit has fired, etc. -- instead of only being able to
+    infer it indirectly from worker-side logs."""
     worker = REGISTRY.get(worker_id)
     if worker is None:
         raise HTTPException(status_code=404, detail=f"unknown worker_id '{worker_id}'")
-    jobs = sorted(worker.jobs.values(), key=lambda j: j.created_at, reverse=True)
+    REGISTRY.prune_finished_jobs_for_worker(worker, keep=3)
+    jobs = sorted(worker.jobs.values(), key=lambda j: j.created_at, reverse=True)[:3]
     return {
         "worker": worker.snapshot(),
         "jobs": [j.diagnostic_snapshot() for j in jobs],
@@ -1799,7 +1896,8 @@ async def dashboard():
                         <td class="${{genExitCls}}">${{job.generator_exit_at ? fmtAge(job.generator_exit_age_seconds) : 'no'}}</td></tr>
                     <tr><td>Last is_disconnected() check</td>
                         <td class="${{disconnCls}}">${{job.last_is_disconnected_result === null || job.last_is_disconnected_result === undefined ? 'never checked' : (job.last_is_disconnected_result + ', ' + fmtAge(job.last_is_disconnected_check_age_seconds))}}</td></tr>
-                    <tr><td>Last token activity</td><td>${{fmtAge(job.last_activity_age_seconds)}}</td></tr>
+                    <tr><td>Last token activity (from worker)</td><td>${{fmtAge(job.last_activity_age_seconds)}}</td></tr>
+                    <tr><td>Last successful write (to client)</td><td>${{fmtAge(job.last_client_write_age_seconds)}}</td></tr>
                   </table>
                 </div>`;
         }}
@@ -2224,6 +2322,17 @@ async def worker_deregister(request: Request):
 
 async def watchdog_loop():
     reconnect_grace = CONFIG.get("worker_reconnect_grace_seconds", 30)
+    # How long a streaming job's SSE generator is allowed to go without a
+    # successful ping/token write before we conclude its coroutine is
+    # wedged (e.g. stuck forever on a hung `send()` into a dead
+    # connection whose closure the transport never surfaced as an
+    # exception) and force it closed from here instead. Deliberately much
+    # shorter than job.timeout/request_timeout_seconds (default 300s):
+    # this isn't "the job is taking a long time", it's "the one write
+    # that's supposed to happen every ~stream_ping_interval_seconds
+    # hasn't happened in several multiples of that interval", which is a
+    # much stronger and much faster signal that something is stuck.
+    stalled_stream_grace = CONFIG.get("stalled_stream_grace_seconds", 15)
     while True:
         await asyncio.sleep(5)
         now = time.time()
@@ -2235,6 +2344,65 @@ async def watchdog_loop():
                     last_activity = job.last_activity_at or job.delivered_at or now
                     if (now - last_activity) > job.timeout:
                         await REGISTRY.requeue_or_fail(worker, job, "delivery watchdog timeout")
+                        continue
+                    # INDEPENDENT staleness check for streaming jobs. This
+                    # does NOT depend on real_stream_generator() ever
+                    # running again to notice anything -- if that
+                    # coroutine is wedged (permanently suspended inside a
+                    # `send()` that will never return because the
+                    # transport swallowed the disconnect instead of
+                    # raising, which is exactly what a hung yield looks
+                    # like from the outside), nothing inside that
+                    # generator can ever fire again, including its own
+                    # ping logic, its GeneratorExit handler, or its
+                    # exception handling. This loop runs as a genuinely
+                    # separate task, so it can still notice and act.
+                    if job.stream_response_active:
+                        # Deliberately NOT including job.last_activity_at
+                        # here. That field is refreshed by the WS
+                        # 'stream_chunk' handler purely on tokens ARRIVING
+                        # FROM THE WORKER (producer side) -- see
+                        # worker_ws() -- and keeps ticking forward even
+                        # when the SSE generator that's supposed to write
+                        # those tokens to the actual client has already
+                        # died. Using it here would mean this backstop can
+                        # never trip for the exact "consumer is dead but
+                        # the worker is still merrily generating" case it
+                        # exists to catch: a live producer would mask a
+                        # dead consumer forever. last_client_write_at only
+                        # advances on a write that ACTUALLY succeeded
+                        # against the real client socket (ping or
+                        # content), so it's the only signal here that
+                        # reflects consumer liveness rather than worker
+                        # liveness.
+                        last_signal = max(
+                            job.last_ping_ok_at or 0,
+                            job.last_client_write_at or 0,
+                            job.delivered_at or 0,
+                        )
+                        stale_for = now - last_signal
+                        if stale_for > stalled_stream_grace:
+                            logger.warning(
+                                "Job %s on worker '%s' has had no successful write to "
+                                "its client for %.1fs (last signal at %.1fs ago) while "
+                                "its SSE generator is marked active -- treating its "
+                                "driving coroutine as wedged and force-failing the "
+                                "job directly instead of waiting on it.",
+                                job.id, worker.worker_id, stale_for, stale_for)
+                            if job.stream_queue is not None:
+                                await job.stream_queue.put(
+                                    {"error": "stream generator stalled (no activity)"})
+                                await job.stream_queue.put(None)
+                            try:
+                                job.future.set_exception(
+                                    RuntimeError("stream generator stalled: no ping or "
+                                                 "token activity for "
+                                                 f"{stale_for:.0f}s"))
+                            except asyncio.InvalidStateError:
+                                pass
+                            worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+                            await REGISTRY.cancel_job_on_worker(
+                                worker, job, "stalled stream generator")
                 elif (now - job.created_at) > job.timeout:
                     if job.stream_queue is not None:
                         await job.stream_queue.put({"error": "timed out waiting in queue"})
@@ -2266,6 +2434,8 @@ async def watchdog_loop():
             reconnect_grace, "worker did not reconnect within the grace period")
         REGISTRY.cleanup()
         REGISTRY.prune_dead_workers()
+        for worker in REGISTRY.all_workers():
+            REGISTRY.prune_finished_jobs_for_worker(worker, keep=3)
 
 
 @app.on_event("startup")
