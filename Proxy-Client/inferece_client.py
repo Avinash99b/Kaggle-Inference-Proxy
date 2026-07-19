@@ -1357,8 +1357,18 @@ class ProxyClient:
     def _worker_model_payload(self) -> dict:
         return {"repo": self.target_repo, "file": self.file_name}
 
-    def _heartbeat_payload(self) -> dict:
-        gpu_stats = aggregate_gpu_stats()
+    async def _heartbeat_payload(self) -> dict:
+        # aggregate_gpu_stats() shells out to nvidia-smi via a *blocking*
+        # subprocess.run() call (with its own 10s timeout, and real-world
+        # latency spikes under GPU load). Calling it directly from a
+        # coroutine would stall the single-threaded event loop that also
+        # owns this worker's WebSocket connection -- while stalled, the
+        # `websockets` library can't process incoming pong frames / service
+        # its own ping/pong bookkeeping, so a slow nvidia-smi call during a
+        # busy generation can silently blow through ping_timeout and get
+        # the connection killed with "keepalive ping timeout", right when
+        # a job is in flight. Always run it in the executor instead.
+        gpu_stats = await self.loop.run_in_executor(None, aggregate_gpu_stats)
         return {
             "type": "heartbeat",
             "worker_id": self.worker_id,
@@ -1516,7 +1526,8 @@ class ProxyClient:
         while True:
             await asyncio.sleep(interval)
             try:
-                await ws.send(json.dumps(self._heartbeat_payload()))
+                payload = await self._heartbeat_payload()
+                await ws.send(json.dumps(payload))
             except Exception:
                 return
 
@@ -1577,10 +1588,11 @@ class ProxyClient:
 
     async def _poll_heartbeat(self):
         try:
+            payload = await self._heartbeat_payload()
             resp = await self.loop.run_in_executor(
                 None,
                 lambda: requests.post(f"{self.proxy_url}/worker/heartbeat",
-                                       json=self._heartbeat_payload(), timeout=15),
+                                       json=payload, timeout=15),
             )
             try:
                 data = resp.json()
