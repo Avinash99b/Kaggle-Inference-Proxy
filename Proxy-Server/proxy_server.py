@@ -341,6 +341,13 @@ class WorkerState:
         # request_cancel() below -- and don't use this field.
         self.pending_cancel_job_id: Optional[str] = None
 
+        # Set by /kill-all (see request_kill_all() below) for long-poll
+        # workers, which have no push channel: relayed on the worker's next
+        # heartbeat/poll response, same pattern as pending_cancel_job_id.
+        # WS workers instead get an immediate out-of-band "kill_all"
+        # message and don't use this field.
+        self.pending_kill_all: bool = False
+
         # Set the instant we positively learn the worker's connection is
         # gone (WS close, explicit deregister, or heartbeat staleness during
         # a sweep). Used by the reconnect-grace watchdog below to decide
@@ -402,6 +409,28 @@ class WorkerState:
             self.pending_cancel_job_id = job_id
             logger.info("Queued cancel for job %s for worker '%s' (%s); will be delivered "
                         "on next long-poll heartbeat.", job_id, self.worker_id, reason)
+
+    async def request_kill_all(self, reason: str) -> None:
+        """Tell this worker to unconditionally hard-kill and reset its
+        local runner subprocess, regardless of which job_id (if any) it
+        currently thinks it's running. Unlike request_cancel(), this isn't
+        keyed to a specific job -- it's an emergency reset for when the
+        normal per-job cancel path has stopped working (e.g. a wedged
+        subprocess that never released its job lock, so the worker keeps
+        reporting busy and further cancels for it get silently ignored
+        because the job_id no longer matches whatever the worker thinks is
+        current)."""
+        if self.transport == "ws" and self.ws is not None:
+            try:
+                async with self.lock:
+                    await self.ws.send_text(json.dumps({"type": "kill_all"}))
+                logger.info("Sent kill_all to worker '%s' (%s) over WS.", self.worker_id, reason)
+            except Exception as e:
+                logger.warning("Failed to send kill_all to worker '%s': %s", self.worker_id, e)
+        else:
+            self.pending_kill_all = True
+            logger.info("Queued kill_all for worker '%s' (%s); will be delivered on next "
+                        "long-poll heartbeat.", self.worker_id, reason)
 
     def qsize(self) -> int:
         return self.queue.qsize()
@@ -685,6 +714,30 @@ class WorkerRegistry:
             except asyncio.QueueEmpty:
                 break
         return cancelled
+
+    async def kill_all(self, reason: str = "kill-all requested") -> dict:
+        """Emergency stop: empties every worker's queue, fails every
+        in-flight job across the whole fleet, and tells every worker
+        (regardless of transport) to unconditionally hard-kill and reset
+        its local runner subprocess -- not just whatever job_id it thinks
+        is current, which is what makes this a useful escape hatch when
+        the normal per-job cancel path has gotten stuck (see
+        request_kill_all's docstring). Intentionally does not distinguish
+        online/offline workers: an offline worker still gets its jobs
+        cancelled locally here, and will pick up the kill_all the moment
+        it reconnects and calls /worker/heartbeat or /worker/poll (both
+        check pending_kill_all)."""
+        total_cancelled = 0
+        workers_signalled: List[str] = []
+        for worker in self.all_workers():
+            total_cancelled += await self.cancel_all_jobs_for_worker(worker, reason)
+            await worker.request_kill_all(reason)
+            workers_signalled.append(worker.worker_id)
+        return {
+            "status": "ok",
+            "jobs_cancelled": total_cancelled,
+            "workers_signalled": workers_signalled,
+        }
 
     async def reap_unreconnected_workers(self, grace_seconds: float, reason: str) -> List[str]:
         """Watchdog helper: for every worker that has been continuously
@@ -1131,6 +1184,32 @@ async def health():
     }
 
 
+@app.get("/kill-all")
+async def kill_all():
+    """Emergency stop button: empties every worker's queue, fails every
+    in-flight job across the whole fleet, and tells every worker
+    (WS: immediately; long-poll: on its next heartbeat/poll) to
+    unconditionally hard-kill and reset its local runner subprocess --
+    regardless of which job_id it currently thinks it owns. Meant as a
+    manual escape hatch for exactly the failure mode where a wedged
+    subprocess never released its local job lock, so per-job cancels for
+    later jobs keep getting silently ignored (job_id no longer matches
+    whatever the worker thinks is "current") and the worker just sits
+    reporting busy forever.
+
+    Deliberately unauthenticated (no client API key, no worker HMAC
+    signature) -- it's an operator-only reset switch on the same trust
+    boundary as the machine hosting this proxy, not a client-facing API
+    surface, and requiring auth here would defeat the point of a
+    break-glass endpoint if that auth is ever what's stuck/misconfigured.
+    If this proxy is ever exposed somewhere untrusted, consider putting
+    it behind a network-level restriction (e.g. firewall/reverse-proxy
+    rule) rather than relying on this route to check credentials."""
+    result = await REGISTRY.kill_all()
+    logger.warning("kill-all invoked: %s", result)
+    return result
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     if not CONFIG["dashboard"].get("enabled", True):
@@ -1444,6 +1523,9 @@ async def worker_poll(worker_id: str, timestamp: str, signature: str):
     if worker.transport != "ws":
         worker.transport = "poll"
     worker.status = "idle"
+    if worker.pending_kill_all:
+        worker.pending_kill_all = False
+        return {"job": None, "kill_all": True}
     job = await REGISTRY.wait_next_for_delivery(
         worker, timeout=CONFIG["long_poll_timeout_seconds"])
     if job is None:
@@ -1509,6 +1591,9 @@ async def worker_heartbeat(request: Request):
     if worker.pending_cancel_job_id:
         response["cancel_job_id"] = worker.pending_cancel_job_id
         worker.pending_cancel_job_id = None
+    if worker.pending_kill_all:
+        response["kill_all"] = True
+        worker.pending_kill_all = False
     return response
 
 

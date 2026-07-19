@@ -177,6 +177,11 @@ DEFAULT_CONFIG = {
         # How long to wait for a subprocess to exit gracefully (SIGTERM)
         # before escalating to SIGKILL when a job is cancelled.
         "graceful_term_timeout_seconds": 2.0,
+        # See PersistentRunner.job_lock_wait_timeout_seconds for why this
+        # exists: a bound on how long a new job will wait to acquire the
+        # runner's job_lock before treating whoever's holding it as wedged
+        # and forcing an unconditional reset.
+        "job_lock_wait_timeout_seconds": 30,
     },
     "logging": {"level": "INFO", "file": "/tmp/inference_server.log"},
 }
@@ -1016,8 +1021,31 @@ class PersistentRunner:
         self.proc: Optional[subprocess.Popen] = None
         self._current_job_id: Optional[str] = None
         self._kill_flag = False
-        self._state_lock = threading.Lock()   # guards proc/_current_job_id/_kill_flag
+        self._state_lock = threading.Lock()   # guards proc/_current_job_id/_kill_flag/_cancelled_job_ids
         self.job_lock = threading.Lock()       # serializes job execution (one at a time)
+        # job_ids that have been cancelled but were not (yet, or ever)
+        # the currently-running job when the cancel arrived -- e.g. a job
+        # still waiting for job_lock because a previous job hasn't
+        # finished tearing down yet. Without this, a cancel that arrives
+        # slightly early would be silently dropped ("not currently running
+        # here") and the job would go on to run to completion anyway once
+        # the lock freed up. Checked at the top of run_job(), both before
+        # and after acquiring job_lock.
+        self._cancelled_job_ids: set = set()
+        # How long run_job() will wait to acquire job_lock before treating
+        # the holder as wedged. In normal operation this lock is essentially
+        # uncontended (the proxy only ever has one job in flight per worker
+        # at a time), so the only time a second run_job() call has to wait
+        # here at all is the brief handoff window after a job is cancelled
+        # (graceful SIGTERM, then SIGKILL -- single-digit seconds). A wait
+        # this long is only ever hit if that teardown itself is stuck (e.g.
+        # a genuinely hung subprocess that doesn't die even to SIGKILL),
+        # which is exactly the case force_reset() below exists to break out
+        # of -- otherwise every job after that point queues up behind the
+        # lock forever and the worker reports "busy" indefinitely with no
+        # way for a job_id-keyed cancel to ever reach it.
+        self.job_lock_wait_timeout_seconds = CONFIG.get("cancellation", {}).get(
+            "job_lock_wait_timeout_seconds", 30)
 
     def start(self) -> None:
         """(Re)spawns the subprocess and blocks until it reports the model
@@ -1061,7 +1089,10 @@ class PersistentRunner:
 
     def _teardown(self, reason: str) -> None:
         """Hard-kill the current subprocess (SIGTERM then SIGKILL). Safe to
-        call even if it's already dead."""
+        call even if it's already dead. Does NOT touch job_lock -- callers
+        that need to coordinate with an in-progress run_job() call do that
+        separately (see force_reset(), which is safe to call even while
+        another thread holds job_lock, and cancel_current_job())."""
         with self._state_lock:
             proc = self.proc
             self.proc = None
@@ -1089,16 +1120,49 @@ class PersistentRunner:
     def cancel_current_job(self, job_id: str) -> bool:
         """Called from a different thread than the one running run_job().
         Kills the subprocess right away if it's currently working on
-        job_id. The thread blocked in run_job() will observe the pipe
-        closing and return a cancellation error; a fresh subprocess is
-        spawned lazily before the NEXT job starts, so this call itself
-        does not block on a reload."""
+        job_id. If job_id isn't the current job -- e.g. it's still queued
+        behind job_lock waiting for an earlier job to finish tearing down
+        -- it's recorded in _cancelled_job_ids instead, so run_job() bails
+        out for it the moment it's about to start rather than letting a
+        job we were explicitly told to abandon run to completion anyway.
+        Returns True if either action was taken (subprocess killed now, or
+        the job was marked so it never runs)."""
         with self._state_lock:
-            if self._current_job_id != job_id or self.proc is None:
-                return False
-            self._kill_flag = True
-        self._teardown(reason=f"cancelled job {job_id}")
+            self._cancelled_job_ids.add(job_id)
+            if len(self._cancelled_job_ids) > 10000:
+                self._cancelled_job_ids = set(list(self._cancelled_job_ids)[-2000:])
+            is_current = self._current_job_id == job_id and self.proc is not None
+            if is_current:
+                self._kill_flag = True
+        if is_current:
+            self._teardown(reason=f"cancelled job {job_id}")
         return True
+
+    def force_reset(self, reason: str) -> None:
+        """Unconditionally kills whatever subprocess exists and clears all
+        per-job bookkeeping, regardless of which job_id (if any) currently
+        "owns" it. This is the escape hatch for the two situations where
+        the normal job_id-matching cancel path can't be trusted to reach
+        whatever is actually stuck:
+
+          1. /kill-all -- an explicit operator-issued reset.
+          2. run_job()'s own job_lock-wait timeout below, when a previous
+             job's teardown appears to be wedged (subprocess not dying
+             even to SIGKILL/wait()) and every job after it has been
+             silently queuing up behind job_lock with no way for a
+             job_id-keyed cancel to ever reach it.
+
+        Deliberately does not acquire job_lock -- it must be safe to call
+        while another thread is blocked holding it (that's the whole
+        point). Killing self.proc from here still reaches the same OS
+        process that thread's run_job() call is reading from, so its
+        `for raw_line in proc.stdout:` loop observes EOF and that thread
+        exits its own with-job_lock block on its own shortly after."""
+        with self._state_lock:
+            self._kill_flag = True
+            self._current_job_id = None
+            self._cancelled_job_ids.clear()
+        self._teardown(reason=reason)
 
     def run_job(self, job_id: str, job_dict: dict, on_token=None) -> dict:
         """Runs exactly one job on the persistent subprocess, blocking until
@@ -1111,8 +1175,32 @@ class PersistentRunner:
         Returns {"result": {...}} or {"error": "..."}. Streaming jobs also
         invoke on_token(delta, finish_reason) as tokens arrive.
         """
-        with self.job_lock:
+        # Fast path: don't even wait for job_lock if this job was already
+        # cancelled before its turn came up.
+        with self._state_lock:
+            if job_id in self._cancelled_job_ids:
+                self._cancelled_job_ids.discard(job_id)
+                return {"error": "cancelled: job was cancelled before it started running here"}
+
+        acquired = self.job_lock.acquire(timeout=self.job_lock_wait_timeout_seconds)
+        if not acquired:
+            # Whoever's holding job_lock has held it far longer than any
+            # legitimate handoff between jobs should ever take (see the
+            # comment on job_lock_wait_timeout_seconds in __init__). Force
+            # an unconditional reset to try to break whatever's wedged,
+            # then fail this job outright rather than joining the queue
+            # behind a lock that may never free.
+            logger.error(
+                "Timed out after %ss waiting for job_lock to run job %s; "
+                "forcing a reset.", self.job_lock_wait_timeout_seconds, job_id)
+            self.force_reset(reason=f"job_lock acquisition timed out (blocked job {job_id})")
+            return {"error": "inference_error: runner was stuck and has been force-reset; please retry"}
+
+        try:
             with self._state_lock:
+                if job_id in self._cancelled_job_ids:
+                    self._cancelled_job_ids.discard(job_id)
+                    return {"error": "cancelled: job was cancelled before it started running here"}
                 need_start = self.proc is None
             if need_start:
                 try:
@@ -1181,6 +1269,8 @@ class PersistentRunner:
             logger.error("Runner subprocess for job %s exited unexpectedly with no result.", job_id)
             self._teardown(reason="crashed")
             return {"error": "inference_error: runner process crashed unexpectedly"}
+        finally:
+            self.job_lock.release()
 
 
 RUNNER = PersistentRunner()
@@ -1190,15 +1280,16 @@ def cancel_job(job_id: str) -> bool:
     """Entrypoint used by the WS/long-poll message handler when the proxy
     signals that a job's result is no longer wanted (client disconnected,
     or the proxy's request_timeout_seconds elapsed). Hard-kills the
-    persistent runner subprocess if it is currently working on job_id, so
-    the GPU is freed immediately instead of finishing an orphaned
-    generation that would otherwise block every job queued behind it. The
-    subprocess is respawned (paying one model-load) lazily on the next job."""
+    persistent runner subprocess immediately if it is currently working on
+    job_id; otherwise (e.g. job_id is still queued behind job_lock waiting
+    for an earlier job to finish tearing down) it's recorded so run_job()
+    refuses to start it at all once its turn comes up. The subprocess is
+    respawned (paying one model-load) lazily on the next job that actually
+    runs."""
     found = RUNNER.cancel_current_job(job_id)
     if found:
-        logger.info("Cancelled job %s on request from proxy (subprocess killed).", job_id)
-    else:
-        logger.info("Cancel request for job %s ignored (not currently running here).", job_id)
+        logger.info("Cancelled job %s on request from proxy (subprocess killed "
+                     "if it was the one currently running).", job_id)
     return found
 
 
@@ -1646,6 +1737,18 @@ class ProxyClient:
                                     task = self.active_job_tasks.get(job_id)
                                     if task is not None and not task.done():
                                         task.cancel()
+                            elif mtype == "kill_all":
+                                # Emergency reset from the proxy's /kill-all
+                                # endpoint: unconditionally hard-kill and
+                                # reset the local runner, regardless of
+                                # which job_id it currently thinks it owns.
+                                # This exists specifically for the case
+                                # where the normal job_id-keyed cancel above
+                                # has stopped working -- e.g. a wedged
+                                # subprocess that never released job_lock,
+                                # so later jobs just queue up behind it
+                                # forever with no job_id match possible.
+                                await self._handle_kill_all()
                             elif mtype == "heartbeat_ack":
                                 pass
                             else:
@@ -1717,6 +1820,8 @@ class ProxyClient:
                     await asyncio.sleep(t_cfg["poll_interval_seconds"])
                     continue
                 data = resp.json()
+                if data.get("kill_all"):
+                    await self._handle_kill_all()
                 job = data.get("job")
                 if job is None:
                     continue
@@ -1729,6 +1834,19 @@ class ProxyClient:
             except Exception as e:
                 logger.warning("Long-poll cycle error: %s", e)
                 await asyncio.sleep(t_cfg["poll_interval_seconds"])
+
+    async def _handle_kill_all(self) -> None:
+        """Shared kill_all handler for both transports: cancels every
+        locally tracked job task and unconditionally force-resets the
+        runner subprocess. See the "kill_all" WS message handler in
+        run_websocket_forever for the full rationale."""
+        logger.warning("Received kill_all from proxy: cancelling all local job tasks "
+                        "and force-resetting the runner subprocess.")
+        for jid, task in list(self.active_job_tasks.items()):
+            if not task.done():
+                task.cancel()
+        await self.loop.run_in_executor(None, RUNNER.force_reset, "kill_all received from proxy")
+        self.seen_job_ids.clear()
 
     async def _poll_heartbeat(self):
         try:
@@ -1745,6 +1863,8 @@ class ProxyClient:
             cancel_job_id = data.get("cancel_job_id")
             if cancel_job_id:
                 cancel_job(cancel_job_id)
+            if data.get("kill_all"):
+                await self._handle_kill_all()
         except Exception:
             pass
 
