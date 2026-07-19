@@ -36,6 +36,31 @@ Unlike the single-worker reference, MANY workers may be connected and
 routed to exactly one worker's queue based on the scoring function below and
 never migrates between workers mid-flight (especially not mid-stream).
 
+CANCELLATION
+------------
+A job's computed result is only useful if someone is still waiting for it.
+The proxy now actively cancels jobs on the worker side (not just locally)
+whenever that stops being true:
+
+  * The client disconnects while a request is in flight (checked for both
+    streaming and non-streaming requests).
+  * A job's request_timeout_seconds elapses without a result (existing
+    watchdog behavior), which previously only resolved the job locally with
+    an error while the worker kept computing in the background.
+  * A worker connection drops mid-job (existing requeue_or_fail behavior)
+    and the job is ultimately failed rather than retried.
+
+In each case the proxy now sends `{"type": "cancel", "job_id": ...}` to the
+owning worker over its WebSocket (if connected), so the worker can hard-kill
+whatever is computing that job instead of letting it run to completion and
+block every job queued up behind it. For long-poll workers (no push
+channel), a pending cancellation is instead piggybacked onto the next
+heartbeat response as `{"cancel_job_id": "..."}`, which the worker polls at
+its regular heartbeat interval -- this bounds cancellation latency on that
+transport to one heartbeat interval, which is the best a pure
+request/response fallback transport can offer; WS remains the transport to
+prefer for prompt cancellation.
+
 Config loading:
     Config is normally read from (and, if missing, written to) the JSON file
     at PROXY_CONFIG_PATH (default "proxy_server_config.json"). If the
@@ -98,6 +123,7 @@ DEFAULT_CONFIG = {
     "worker_offline_after_seconds": 90,
     "worker_reconnect_grace_seconds": 30,
     "auth_timestamp_skew_seconds": 300,
+    "client_disconnect_check_interval_seconds": 1.0,
     "websocket": {
         "heartbeat_interval_seconds": 20,
         "heartbeat_timeout_seconds": 60,
@@ -275,6 +301,7 @@ class Job:
     retries: int = 0
     stream: bool = False
     stream_queue: Optional["asyncio.Queue"] = None   # only set for true (WS) streaming jobs
+    cancel_requested: bool = False             # True once we've asked the worker to abort this job
 
 
 # --------------------------------------------------------------------------- #
@@ -296,6 +323,7 @@ class WorkerState:
         self.current_model: Optional[str] = None
         self.in_flight_jobs: int = 0
         self.gpu_stats: dict = {}                     # {"total_mb", "used_mb", "free_mb", "utilization_percent"}
+        self.n_ctx: Optional[int] = None               # loaded context size, reported via heartbeat
         self.lock = asyncio.Lock()
 
         # Per-worker job queue + job map (jobs routed to this worker only).
@@ -305,6 +333,13 @@ class WorkerState:
 
         # Bookkeeping for the WS dispatcher task tied to this connection.
         self.dispatcher_task: Optional["asyncio.Task"] = None
+
+        # Job id the worker should be told to cancel on its next heartbeat
+        # response, for workers on the long-poll transport (which has no
+        # push channel to deliver a cancel immediately). WS workers instead
+        # get an immediate out-of-band "cancel" message -- see
+        # request_cancel() below -- and don't use this field.
+        self.pending_cancel_job_id: Optional[str] = None
 
         # Set the instant we positively learn the worker's connection is
         # gone (WS close, explicit deregister, or heartbeat staleness during
@@ -336,6 +371,32 @@ class WorkerState:
         if self.disconnected_at is None:
             self.disconnected_at = time.time()
 
+    async def request_cancel(self, job_id: str, reason: str) -> None:
+        """Ask this worker to hard-kill whatever is running for job_id, right
+        now if possible. On WS this is an immediate out-of-band push; on
+        long-poll it's queued to ride along with the next heartbeat
+        response (see /worker/heartbeat), which bounds latency to one
+        heartbeat interval on that transport."""
+        job = self.jobs.get(job_id)
+        if job is not None:
+            job.cancel_requested = True
+        if self.transport == "ws" and self.ws is not None:
+            try:
+                await self.ws.send_text(json.dumps({"type": "cancel", "job_id": job_id}))
+                logger.info("Sent cancel for job %s to worker '%s' (%s) over WS.",
+                            job_id, self.worker_id, reason)
+            except Exception as e:
+                logger.warning("Failed to send cancel for job %s to worker '%s': %s",
+                                job_id, self.worker_id, e)
+        else:
+            # Long-poll: no push channel. Stash it; /worker/heartbeat will
+            # hand it back on the worker's next heartbeat call. Only keep
+            # the most recent request -- a worker running one job at a time
+            # only ever needs to cancel the one it's currently working on.
+            self.pending_cancel_job_id = job_id
+            logger.info("Queued cancel for job %s for worker '%s' (%s); will be delivered "
+                        "on next long-poll heartbeat.", job_id, self.worker_id, reason)
+
     def qsize(self) -> int:
         return self.queue.qsize()
 
@@ -346,6 +407,7 @@ class WorkerState:
             "transport": self.transport,
             "status": self.status,
             "current_model": self.current_model,
+            "n_ctx": self.n_ctx,
             "in_flight_jobs": self.in_flight_jobs,
             "gpu_stats": self.gpu_stats,
             "known_models": list(self.models.keys()),
@@ -519,7 +581,20 @@ class WorkerRegistry:
         else:
             job.future.set_result(result)
         worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+        if worker.pending_cancel_job_id == job_id:
+            worker.pending_cancel_job_id = None
         return True
+
+    async def cancel_job_on_worker(self, worker: WorkerState, job: Job, reason: str) -> None:
+        """Tell the owning worker to hard-kill whatever compute is currently
+        happening for `job`, because nobody will ever consume its result
+        (client disconnected, or it's already been failed/timed-out
+        locally). Safe to call even if the job was never delivered yet (the
+        worker will simply report "not running" and ignore it) or has
+        already completed (worker-side cancel is a no-op post-completion)."""
+        if job.cancel_requested:
+            return  # already asked; avoid spamming duplicate cancel messages
+        await worker.request_cancel(job.id, reason)
 
     async def requeue_or_fail(self, worker: WorkerState, job: Job, reason: str) -> None:
         """Called by the watchdog (or by an immediate disconnect handler)
@@ -529,7 +604,13 @@ class WorkerRegistry:
         worker" requirement -- for non-streaming jobs this still means a
         retry only makes sense if that worker is expected to come back
         (e.g. a transient send failure), otherwise it will simply fail once
-        retries are exhausted or the worker is confirmed offline."""
+        retries are exhausted or the worker is confirmed offline.
+
+        Whenever a job is being permanently failed here (not requeued),
+        the owning worker is also told to cancel/hard-kill it, since the
+        result -- if the worker is even still computing it -- will never be
+        read by anyone. Requeued jobs are NOT cancelled: they haven't been
+        given up on, they're being retried on the same worker."""
         if job.future.done():
             return
         # A streaming job that has already sent tokens to the client cannot
@@ -542,6 +623,7 @@ class WorkerRegistry:
             await job.stream_queue.put(None)
             job.future.set_exception(RuntimeError(reason))
             worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+            await self.cancel_job_on_worker(worker, job, reason)
             return
         if job.retries < CONFIG["retry"]["max_job_retries"] and worker.is_online():
             job.retries += 1
@@ -556,6 +638,7 @@ class WorkerRegistry:
                          job.id, worker.worker_id, reason)
             job.future.set_exception(RuntimeError(reason))
             worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+            await self.cancel_job_on_worker(worker, job, reason)
 
     async def fail_in_flight_jobs_for_worker(self, worker: WorkerState, reason: str) -> None:
         """Immediately fail/requeue every job that was already delivered to
@@ -762,14 +845,46 @@ def to_stream_text_chunk(job_id: str, model: str, result: dict) -> dict:
     }
 
 
-async def real_stream_generator(job: Job, model: str, kind: str):
+async def _cancel_job_for_disconnect(job: Job, worker: Optional[WorkerState], where: str) -> None:
+    """Shared helper: the client that wanted `job` is gone, so ask the
+    owning worker to hard-kill whatever compute is happening for it. Safe
+    to call regardless of whether the job has already completed (no-op in
+    that case) -- callers don't need to check job.future.done() first."""
+    if job.future.done():
+        return
+    if worker is None:
+        return
+    logger.info("Client disconnected (%s) for job %s; requesting cancellation on worker '%s'.",
+                where, job.id, worker.worker_id)
+    await REGISTRY.cancel_job_on_worker(worker, job, f"client disconnected ({where})")
+
+
+async def real_stream_generator(job: Job, model: str, kind: str, request: Request,
+                                 worker: WorkerState):
     """True token-by-token SSE stream for jobs delivered over a worker's
     WebSocket. Reads from job.stream_queue as that worker's WS handler
     feeds it (see 'stream_chunk' / 'stream_done' / 'error' below), and
     yields OpenAI-compatible chunk frames as soon as each token arrives.
     The job (and therefore the stream) never migrates to a different
-    worker mid-flight."""
+    worker mid-flight.
+
+    Also watches for the client disconnecting mid-stream (StreamingResponse
+    keeps running server-side even after the client goes away unless we
+    check explicitly): if that happens, the worker is told to cancel the
+    job immediately rather than continuing to generate tokens nobody will
+    receive.
+    """
     role_sent = False
+    disconnect_check_interval = CONFIG.get("client_disconnect_check_interval_seconds", 1.0)
+
+    async def watch_for_disconnect():
+        while True:
+            await asyncio.sleep(disconnect_check_interval)
+            if await request.is_disconnected():
+                await _cancel_job_for_disconnect(job, worker, "stream")
+                return
+
+    watcher = asyncio.create_task(watch_for_disconnect())
     try:
         while True:
             try:
@@ -779,6 +894,7 @@ async def real_stream_generator(job: Job, model: str, kind: str):
                     "Timed out waiting for streamed tokens from the worker.",
                     "server_error")
                 yield f"data: {json.dumps(err)}\n\n"
+                await REGISTRY.cancel_job_on_worker(worker, job, "stream token timeout")
                 break
 
             if item is None:
@@ -816,6 +932,7 @@ async def real_stream_generator(job: Job, model: str, kind: str):
                 }
             yield f"data: {json.dumps(chunk)}\n\n"
     finally:
+        watcher.cancel()
         yield "data: [DONE]\n\n"
 
 
@@ -854,19 +971,36 @@ def route_or_503(model: str) -> WorkerState:
     return worker
 
 
-async def run_job_and_wait(worker: WorkerState, kind: str, payload: dict) -> Tuple[Job, dict]:
+async def run_job_and_wait(worker: WorkerState, kind: str, payload: dict,
+                            request: Request) -> Tuple[Job, dict]:
     """Non-streaming (or poll-fallback) path: submit a job to a specific
-    worker's queue and block until that worker returns the full result."""
+    worker's queue and block until that worker returns the full result --
+    OR the client disconnects, in which case the worker is told to cancel
+    the job and we stop waiting rather than sitting on a connection nobody
+    is reading the response from."""
     job = await REGISTRY.submit_job(worker, kind, payload, stream=False)
+    disconnect_check_interval = CONFIG.get("client_disconnect_check_interval_seconds", 1.0)
+
+    async def watch_for_disconnect():
+        while True:
+            await asyncio.sleep(disconnect_check_interval)
+            if await request.is_disconnected():
+                await _cancel_job_for_disconnect(job, worker, "request")
+                return
+
+    watcher = asyncio.create_task(watch_for_disconnect())
     try:
         result = await asyncio.wait_for(job.future, timeout=job.timeout)
     except asyncio.TimeoutError:
+        await REGISTRY.cancel_job_on_worker(worker, job, "request_timeout_seconds elapsed")
         raise HTTPException(status_code=504, detail=openai_error(
             "Timed out waiting for the inference worker to respond.",
             "server_error"))
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=openai_error(
             f"Worker failed to process the request: {e}", "server_error"))
+    finally:
+        watcher.cancel()
     return job, result
 
 
@@ -896,7 +1030,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         }
         job = await REGISTRY.submit_job(worker, "chat", payload, stream=True)
         return StreamingResponse(
-            real_stream_generator(job, model, "chat"),
+            real_stream_generator(job, model, "chat", request, worker),
             media_type="text/event-stream",
         )
 
@@ -906,7 +1040,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         "kind": "chat", "model": model, "messages": messages, "stream": False,
         "params": normalize_generation_params(body),
     }
-    job, result = await run_job_and_wait(worker, "chat", payload)
+    job, result = await run_job_and_wait(worker, "chat", payload, request)
     if stream:
         return StreamingResponse(
             fake_sse_stream(lambda: to_stream_chat_chunk(job.id, model, result)),
@@ -935,7 +1069,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         }
         job = await REGISTRY.submit_job(worker, "completions", payload, stream=True)
         return StreamingResponse(
-            real_stream_generator(job, model, "completion"),
+            real_stream_generator(job, model, "completion", request, worker),
             media_type="text/event-stream",
         )
 
@@ -943,7 +1077,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         "kind": "completion", "model": model, "prompt": prompt, "stream": False,
         "params": normalize_generation_params(body),
     }
-    job, result = await run_job_and_wait(worker, "completions", payload)
+    job, result = await run_job_and_wait(worker, "completions", payload, request)
     if stream:
         return StreamingResponse(
             fake_sse_stream(lambda: to_stream_text_chunk(job.id, model, result)),
@@ -1006,6 +1140,7 @@ async def dashboard():
         gpu = snap["gpu_stats"] or {}
         gpu_str = (f"{gpu.get('used_mb', '?')}/{gpu.get('total_mb', '?')} MB "
                    f"({gpu.get('utilization_percent', '?')}%)") if gpu else "—"
+        n_ctx_str = f"{snap['n_ctx']:,}" if snap.get("n_ctx") else "—"
         rows.append(f"""
       <tr>
         <td>{snap['worker_id']}</td>
@@ -1013,6 +1148,7 @@ async def dashboard():
         <td>{snap['transport']}</td>
         <td>{snap['status']}</td>
         <td>{snap['current_model'] or '—'}</td>
+        <td>{n_ctx_str}</td>
         <td>{', '.join(snap['known_models']) or '(none reported yet)'}</td>
         <td>{snap['in_flight_jobs']}</td>
         <td>{snap['queue_depth']}</td>
@@ -1043,10 +1179,10 @@ async def dashboard():
     <table>
       <tr>
         <th>Worker ID</th><th>Online</th><th>Transport</th><th>Status</th>
-        <th>Current Model</th><th>Known Models</th><th>In-Flight</th>
+        <th>Current Model</th><th>Loaded n_ctx</th><th>Known Models</th><th>In-Flight</th>
         <th>Queue</th><th>GPU</th><th>Last HB (s)</th>
       </tr>
-      {''.join(rows) if rows else '<tr><td colspan="10">No workers have registered yet.</td></tr>'}
+      {''.join(rows) if rows else '<tr><td colspan="11">No workers have registered yet.</td></tr>'}
     </table>
     </body></html>
     """
@@ -1171,6 +1307,8 @@ async def worker_ws(websocket: WebSocket):
                     worker.touch()
                     worker.status = msg.get("status", worker.status)
                     worker.current_model = msg.get("current_model", worker.current_model)
+                    if "n_ctx" in msg:
+                        worker.n_ctx = msg.get("n_ctx")
                     gpu_stats = msg.get("gpu_stats")
                     if isinstance(gpu_stats, dict):
                         worker.gpu_stats = gpu_stats
@@ -1312,8 +1450,16 @@ async def worker_result(request: Request):
 async def worker_heartbeat(request: Request):
     """Used by long-poll workers between jobs so they're marked online even
     while /worker/poll is (deliberately) blocked waiting for work. Also
-    carries GPU stats, since long-poll workers have no other channel to
-    push them outside of a job cycle."""
+    carries GPU stats and loaded n_ctx, since long-poll workers have no
+    other channel to push them outside of a job cycle.
+
+    The response may include `cancel_job_id`: if the proxy has a pending
+    cancellation queued for this worker (see WorkerState.request_cancel),
+    it's handed back here so the worker can hard-kill that job on its next
+    check -- this is the long-poll equivalent of the immediate WS "cancel"
+    push, just bounded to one heartbeat interval of latency instead of
+    being instant.
+    """
     body = await request.json()
     worker_id = body.get("worker_id")
     if not worker_id:
@@ -1327,12 +1473,19 @@ async def worker_heartbeat(request: Request):
     worker.touch()
     worker.status = body.get("status", worker.status)
     worker.current_model = body.get("current_model", worker.current_model)
+    if "n_ctx" in body:
+        worker.n_ctx = body.get("n_ctx")
     gpu_stats = body.get("gpu_stats")
     if isinstance(gpu_stats, dict):
         worker.gpu_stats = gpu_stats
     if "models" in body:
         worker.models = body["models"]
-    return {"status": "ok"}
+
+    response: Dict[str, Any] = {"status": "ok"}
+    if worker.pending_cancel_job_id:
+        response["cancel_job_id"] = worker.pending_cancel_job_id
+        worker.pending_cancel_job_id = None
+    return response
 
 
 @app.post("/worker/deregister")
@@ -1390,6 +1543,7 @@ async def watchdog_loop():
                         await job.stream_queue.put(None)
                     job.future.set_exception(RuntimeError("timed out waiting in queue"))
                     worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+                    await REGISTRY.cancel_job_on_worker(worker, job, "timed out waiting in queue")
             # A worker whose heartbeat has gone stale (e.g. a long-poll
             # worker that stopped calling /worker/heartbeat or /worker/poll
             # without ever hitting /worker/deregister) should be swept to

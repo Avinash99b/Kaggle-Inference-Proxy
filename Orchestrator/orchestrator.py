@@ -326,6 +326,9 @@ class OrchestratorConfig:
     # known-working reference config).
     machine_shape: str = "NvidiaTeslaT4"
     enable_tpu: bool = False
+    # Optional URL to inference subprocess file that gets downloaded
+    # alongside the main inference script.
+    inference_subprocess_file: Optional[str] = None
 
 
 ###############################################################################
@@ -1017,8 +1020,9 @@ class NotebookGenerator:
               matches what was already verified locally.
     """
 
-    def __init__(self, worker_script_url: str):
+    def __init__(self, worker_script_url: str, inference_subprocess_file_url: Optional[str] = None):
         self.worker_script_url = worker_script_url
+        self.inference_subprocess_file_url = inference_subprocess_file_url
 
     def generate(
         self,
@@ -1051,10 +1055,17 @@ class NotebookGenerator:
         # Popen backgrounds the process and returns immediately -- the
         # kernel would then be considered "complete" by Kaggle with the
         # worker never having actually run.
-        run_cell_text = (
+        run_cell_commands = [
             f"!wget -q \"{self.worker_script_url}\" -O inference_server_kaggle.py"
-            " && python inference_server_kaggle.py"
-        )
+        ]
+        
+        if self.inference_subprocess_file_url:
+            run_cell_commands.append(
+                f" && wget -q \"{self.inference_subprocess_file_url}\" -O inference_runner_proc.py"
+            )
+        
+        run_cell_commands.append(" && python inference_server_kaggle.py")
+        run_cell_text = "".join(run_cell_commands)
 
         notebook = {
             "cells": [
@@ -1762,7 +1773,10 @@ class Orchestrator:
             # since there is no more automatic-login fallback.
             self.sessions.load_from_env()
 
-            self.generator = NotebookGenerator(self.config.notebook_template_url)
+            self.generator = NotebookGenerator(
+                self.config.notebook_template_url,
+                self.config.inference_subprocess_file
+            )
             self.hf = HuggingFaceService(self.config.hf_token)
 
             logger.info("Loading saved state...")
@@ -2078,6 +2092,7 @@ class Orchestrator:
                 orchestrator_api_shared_secret=config_dict.get("orchestrator_api_shared_secret", ""),
                 machine_shape=machine_shape,
                 enable_tpu=config_dict.get("enable_tpu", False),
+                inference_subprocess_file=config_dict.get("inference_subprocess_file"),
             )
         except HTTPException:
             raise

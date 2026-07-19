@@ -14,6 +14,21 @@ There is no model-switching in this build: once the target model is loaded it
 stays loaded for the lifetime of the process. If you need a different
 model, restart the notebook cell with a different TARGET_MODEL_REPO/FILE_NAME pair.
 
+CANCELLATION / HARD-KILL
+-------------------------------------------------------------------------------
+Each inference call (chat/completion, streaming or not) runs in a dedicated
+child process (see inference_runner_proc.py), not in-process. This is what
+makes cancellation actually work: llama.cpp's generation call is a blocking
+native call with no cooperative-cancel hook, so the only reliable way to
+stop a job that the client no longer wants (disconnected, or the proxy's
+request_timeout_seconds elapsed) is to SIGKILL the process running it. The
+proxy signals this by sending a `{"type": "cancel", "job_id": ...}` message
+over the worker's WebSocket connection the moment the client disconnects or
+the job times out server-side; this worker kills the matching subprocess
+immediately, frees the GPU context, reports a cancellation error for that
+job, and is ready for the next job right away -- instead of sitting there
+for however long the orphaned generation would otherwise have taken.
+
 Run this in a Kaggle notebook (ideally with the "GPU T4 x2" accelerator
 enabled):
 
@@ -135,6 +150,11 @@ DEFAULT_CONFIG = {
         "n_batch": 512,
         "n_threads": 0,
         "n_gpu_layers": -1,
+    },
+    "cancellation": {
+        # How long to wait for a subprocess to exit gracefully (SIGTERM)
+        # before escalating to SIGKILL when a job is cancelled.
+        "graceful_term_timeout_seconds": 2.0,
     },
     "logging": {"level": "INFO", "file": "/tmp/inference_server.log"},
 }
@@ -650,11 +670,13 @@ def is_cuda_oom_error(e: Exception) -> bool:
 # Step 6: single-model manager (download/load ONE model at startup)
 #
 # No `ensure_loaded(alias)` / model-switching here. `load_startup_model()`
-# resolves + downloads + loads the target model exactly once; after that the
-# model just stays resident until process shutdown, at which point
-# `unload()` is called once for a clean exit.
+# resolves + downloads + probe-loads the target model exactly once, to
+# determine the final n_ctx/n_gpu_layers/tensor_split settings. Actual
+# inference then runs on a single persistent CHILD PROCESS (see
+# PersistentRunner below) that loads the model once and serves jobs one
+# at a time, so a stuck/orphaned job can be hard-killed (and the process
+# respawned) without reloading the model on every normal request.
 # --------------------------------------------------------------------------- #
-
 
 
 class ModelManager:
@@ -665,11 +687,20 @@ class ModelManager:
         self.target_model_id = f"{target_repo}/{file_name}"
         self.cache_dir = config["model_cache_dir"]
         self.current_local_path: Optional[str] = None
-        self.llm: Optional[Llama] = None
         self.status: str = "loading_model"  # "loading_model" | "idle" | "busy"
         self.disk_cache = DiskCacheManager(self.cache_dir, config)
         self.vram = VramManager(config)
         self._load_lock = threading.Lock()
+
+        # Resolved load parameters, computed once in load_startup_model()
+        # and then reused whenever PersistentRunner (re)spawns its
+        # subprocess. n_ctx is also what gets reported on the dashboard
+        # via heartbeat.
+        self.n_ctx: Optional[int] = None
+        self.n_gpu_layers: Optional[int] = None
+        self.n_batch: Optional[int] = None
+        self.n_threads: Optional[int] = None
+        self.tensor_split: Optional[List[float]] = None
 
     def _remote_file_size(self, repo: str, filename: str, token: Optional[str]) -> Optional[int]:
         try:
@@ -727,12 +758,16 @@ class ModelManager:
                 time.sleep(backoff * attempt)
         raise RuntimeError(f"Failed to download model '{self.target_model_id}' after {max_retries} attempts: {last_err}")
 
-    def _build_load_kwargs(self, n_ctx: int) -> dict:
-        gpu_cfg = self.config.get("gpu", {})
-        n_gpu_layers = gpu_cfg.get("n_gpu_layers", -1) if GPU_COUNT > 0 else 0
-        n_batch = gpu_cfg.get("n_batch", 512)
-        n_threads = gpu_cfg.get("n_threads", 0) or os.cpu_count() or 4
-        return dict(
+    def _try_load_probe(self, n_ctx: int, n_gpu_layers: int, n_batch: int,
+                         n_threads: int, attempt_dual: bool) -> None:
+        """Loads the model in-process JUST to validate that these settings
+        actually work (VRAM fits, no OOM), then immediately releases it.
+        The real inference calls happen in a persistent child process via
+        PersistentRunner,
+        which re-load the model fresh every job -- this probe only exists
+        to run the existing OOM-shrink retry loop once at startup instead
+        of duplicating that logic in every child process."""
+        kwargs = dict(
             model_path=self.current_local_path,
             n_ctx=n_ctx,
             n_batch=n_batch,
@@ -740,37 +775,59 @@ class ModelManager:
             n_gpu_layers=n_gpu_layers,
             verbose=False,
         )
+        llm = None
+        try:
+            if attempt_dual:
+                try:
+                    split = [1.0 / GPU_COUNT] * GPU_COUNT
+                    llm = Llama(tensor_split=split, **kwargs)
+                    self.tensor_split = split
+                except Exception as e:
+                    if is_cuda_oom_error(e):
+                        raise
+                    logger.warning("Dual-GPU split failed/did not help (%s); falling back.", e)
+                    llm = Llama(**kwargs)
+                    self.tensor_split = None
+            else:
+                llm = Llama(**kwargs)
+                self.tensor_split = None
+        finally:
+            if llm is not None:
+                del llm
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
-    def _try_load(self, kwargs: dict, attempt_dual: bool) -> Llama:
-        if attempt_dual:
-            try:
-                split = [1.0 / GPU_COUNT] * GPU_COUNT
-                return Llama(tensor_split=split, **kwargs)
-            except Exception as e:
-                if is_cuda_oom_error(e):
-                    raise
-                logger.warning("Dual-GPU split failed/did not help (%s); falling back.", e)
-        return Llama(**kwargs)
-
-    def load_startup_model(self) -> Llama:
+    def load_startup_model(self) -> None:
         """
-        Downloads (if needed) and loads the target model exactly once.
-        Handles VRAM constraints, OOM errors, and gracefully degrades context size.
+        Downloads (if needed) the target model and PROBES that it loads
+        successfully with some (n_ctx, n_gpu_layers, ...) configuration,
+        handling VRAM constraints, OOM errors, and gracefully degrading
+        context size along the way. The resolved settings are stored on
+        self (n_ctx, n_gpu_layers, n_batch, n_threads, tensor_split) and
+        reused whenever PersistentRunner (re)spawns its subprocess -- there
+        is no persistent in-process Llama object anymore; instead a single
+        long-lived, killable child process handles all inference calls.
         """
         with self._load_lock:
             self.status = "loading_model"
             model_path = self._resolve_local_path()
             self.current_local_path = model_path
-    
+
             gpu_cfg = self.config.get("gpu", {})
             configured_n_ctx = gpu_cfg.get("n_ctx", "max")
             n_gpu_layers = gpu_cfg.get("n_gpu_layers", -1) if GPU_COUNT > 0 else 0
             n_batch = gpu_cfg.get("n_batch", 512)
-    
+            n_threads = gpu_cfg.get("n_threads", 0) or os.cpu_count() or 4
+
             # Probe GGUF metadata
             hyper = probe_gguf_hyperparams(model_path)
             desired_n_ctx = resolve_desired_n_ctx(configured_n_ctx, hyper)
-            
+
             logger.info(
                 "Context resolution for '%s': configured n_ctx=%r, GGUF n_ctx_train=%s, "
                 "resolved desired_n_ctx=%d (before VRAM/safety shrinking).",
@@ -779,20 +836,20 @@ class ModelManager:
             if hyper:
                 logger.info("GGUF header: n_ctx_train=%s, n_layer=%s, n_embd=%s",
                             hyper.get("n_ctx_train"), hyper.get("n_layer"), hyper.get("n_embd"))
-    
+
             # Compute initial context size with VRAM constraints
             n_ctx = desired_n_ctx
             if GPU_COUNT > 0:
                 n_ctx = compute_dynamic_n_ctx(model_path, desired_n_ctx, n_gpu_layers,
                                             n_batch, self.vram, self.config, hyper=hyper)
-    
+
             # GPU split configuration
             attempt_dual = GPU_COUNT >= 2 and gpu_cfg.get("attempt_dual_gpu_split", True)
-            
+
             # VRAM management: be conservative on small GPUs
             vram_cfg = self.config.get("vram_management", {})
             total_vram_mb = self.vram.usable_free_bytes()/1024/1024
-            
+
             # Adjust shrink factor and min context based on available VRAM
             if total_vram_mb < 4096:  # Less than 4GB
                 shrink_factor = vram_cfg.get("oom_shrink_factor", 0.6)  # More aggressive
@@ -800,9 +857,9 @@ class ModelManager:
             else:
                 shrink_factor = vram_cfg.get("oom_shrink_factor", 0.75)
                 min_ctx = vram_cfg.get("min_n_ctx", 256)
-            
+
             max_retries = vram_cfg.get("max_oom_retries", 6)  # More retries for safety
-    
+
             # **Preemptive sizing**: If we detect we're pushing it, start lower
             if GPU_COUNT > 0 and n_ctx > 8192 and total_vram_mb < 6000:
                 preemptive_n_ctx = max(min_ctx, int(n_ctx * 0.5))
@@ -811,36 +868,39 @@ class ModelManager:
                     "due to low VRAM (%.1f GB available). Attempting dual_gpu=%s",
                     preemptive_n_ctx, n_ctx, total_vram_mb / 1024, attempt_dual)
                 n_ctx = preemptive_n_ctx
-    
+
             attempts = 0
             last_exception = None
-            
+
             while True:
-                kwargs = self._build_load_kwargs(n_ctx)
                 attempts += 1
-                
                 try:
-                    logger.info("Loading '%s' (attempt %d/%d, n_ctx=%d, n_gpu_layers=%s)...",
-                                self.target_model_id, attempts, max_retries + 1, 
-                                n_ctx, kwargs.get("n_gpu_layers", -1))
-                    
-                    self.llm = self._try_load(kwargs, attempt_dual)
-                    
-                    # Success!
+                    logger.info("Probe-loading '%s' (attempt %d/%d, n_ctx=%d, n_gpu_layers=%s)...",
+                                self.target_model_id, attempts, max_retries + 1,
+                                n_ctx, n_gpu_layers)
+
+                    self._try_load_probe(n_ctx, n_gpu_layers, n_batch, n_threads, attempt_dual)
+
+                    # Success! Store resolved settings for per-job runners.
+                    self.n_ctx = n_ctx
+                    self.n_gpu_layers = n_gpu_layers
+                    self.n_batch = n_batch
+                    self.n_threads = n_threads
                     self.status = "idle"
                     gpu_stats = aggregate_gpu_stats()
-                    logger.info("✓ Loaded '%s' with n_ctx=%d. GPU: %.1f/%.1f GB used.",
+                    logger.info("✓ Verified '%s' loads with n_ctx=%d. GPU: %.1f/%.1f GB used "
+                                "(probe released; per-job runner processes will reload as needed).",
                                 self.target_model_id, n_ctx,
                                 gpu_stats["used_mb"] / 1024, gpu_stats["total_mb"] / 1024)
-                    return self.llm
-                    
+                    return
+
                 except Exception as e:
                     last_exception = e
                     error_str = str(e).lower()
                     is_oom = is_cuda_oom_error(e) or "context" in error_str or "memory" in error_str
-                    
+
                     logger.error("Load attempt %d/%d failed: %s", attempts, max_retries + 1, type(e).__name__)
-                    
+
                     # **Condition 1: Max retries exceeded**
                     if attempts >= max_retries + 1:
                         logger.error("✗ Exceeded max retries (%d). Giving up.", max_retries + 1)
@@ -848,13 +908,13 @@ class ModelManager:
                         raise RuntimeError(
                             f"Failed to load model after {max_retries + 1} attempts. "
                             f"Last error: {e}") from e
-                    
+
                     # **Condition 2: Non-OOM error (can't recover)**
                     if not is_oom:
                         logger.error("✗ Non-recoverable error: %s", e)
                         self.status = "failed"
                         raise RuntimeError(f"Failed to load model (non-recoverable): {e}") from e
-                    
+
                     # **Condition 3: Already at minimum context**
                     if n_ctx <= min_ctx:
                         logger.error("✗ Reached minimum context (n_ctx=%d). Cannot shrink further.", min_ctx)
@@ -863,17 +923,17 @@ class ModelManager:
                             f"OOM even at minimum context (n_ctx={min_ctx}). "
                             f"GPU may be insufficient for this model. "
                             f"Try: reduce n_gpu_layers, lower min_n_ctx, or use a smaller model.") from e
-                    
+
                     # **Recoverable OOM: Shrink and retry**
                     new_ctx = max(min_ctx, int(n_ctx * shrink_factor))
                     logger.warning(
                         "OOM at n_ctx=%d. Shrinking to n_ctx=%d (%.0f%%) and retrying (%d/%d)...",
                         n_ctx, new_ctx, (new_ctx / n_ctx) * 100, attempts, max_retries + 1)
-                    
+
                     # Clear GPU cache aggressively
                     self._clear_gpu_memory()
                     time.sleep(0.5)
-                    
+
                     n_ctx = new_ctx
 
     @staticmethod
@@ -887,7 +947,7 @@ class ModelManager:
                 logger.debug("Cleared PyTorch GPU cache")
         except Exception as e:
             logger.debug("PyTorch cache clear failed: %s", e)
-        
+
         try:
             import cupy as cp
             cp.get_default_memory_pool().free_all_blocks()
@@ -895,23 +955,230 @@ class ModelManager:
         except Exception as e:
             logger.debug("CuPy cache clear failed: %s", e)
 
- 
     def unload(self):
-        """Called once, on shutdown. There is no reload afterwards."""
-        if self.llm is not None:
-            logger.info("Unloading model '%s'.", self.target_model_id)
-            del self.llm
-            self.llm = None
-            gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+        """Called once, on shutdown. No persistent in-process model to
+        release (the persistent runner subprocess cleans up its own GPU
+        memory on exit), but we still clear whatever cache we can from
+        this process."""
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 MODELS = ModelManager(CONFIG, TARGET_MODEL_REPO, FILE_NAME)
+
+# Path to the child-process entrypoint script, expected alongside this file.
+_RUNNER_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inference_runner_proc.py")
+
+
+class PersistentRunner:
+    """Owns ONE long-lived subprocess running inference_runner_proc.py, which
+    loads the model once and then serves jobs one at a time in a loop. This
+    is what avoids paying a multi-GB model reload on every single request:
+    the same warm process is reused across jobs, and is only killed +
+    respawned when a job actually needs to be force-cancelled (client
+    disconnected / proxy-side request_timeout_seconds elapsed) -- the NEXT
+    job after that pays one reload, but every other job doesn't.
+
+    Only one job may run at a time (job_lock), matching the underlying
+    single GGUF execution context -- this mirrors the previous in-process
+    behavior, just routed through a killable subprocess instead of a
+    killable-in-name-only blocking call.
+    """
+
+    def __init__(self):
+        self.proc: Optional[subprocess.Popen] = None
+        self._current_job_id: Optional[str] = None
+        self._kill_flag = False
+        self._state_lock = threading.Lock()   # guards proc/_current_job_id/_kill_flag
+        self.job_lock = threading.Lock()       # serializes job execution (one at a time)
+
+    def start(self) -> None:
+        """(Re)spawns the subprocess and blocks until it reports the model
+        loaded (or failed to load). Raises RuntimeError on load failure."""
+        with self._state_lock:
+            self.proc = subprocess.Popen(
+                [sys.executable, _RUNNER_SCRIPT_PATH],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            self._kill_flag = False
+            self._current_job_id = None
+            proc = self.proc
+
+        load_req = {
+            "type": "load",
+            "model_path": MODELS.current_local_path,
+            "n_ctx": MODELS.n_ctx,
+            "n_batch": MODELS.n_batch,
+            "n_threads": MODELS.n_threads,
+            "n_gpu_layers": MODELS.n_gpu_layers,
+            "tensor_split": MODELS.tensor_split,
+        }
+        assert proc.stdin is not None and proc.stdout is not None
+        proc.stdin.write(json.dumps(load_req) + "\n")
+        proc.stdin.flush()
+
+        line = proc.stdout.readline()
+        if not line:
+            stderr_tail = proc.stderr.read()[-2000:] if proc.stderr else ""
+            raise RuntimeError(f"Runner subprocess exited during model load. stderr: {stderr_tail}")
+        event = json.loads(line)
+        if event.get("type") == "load_error":
+            raise RuntimeError(f"Runner subprocess failed to load model: {event.get('error')}")
+        if event.get("type") != "loaded":
+            raise RuntimeError(f"Runner subprocess sent unexpected startup event: {event}")
+        logger.info("Persistent runner subprocess loaded and ready (pid=%s).", proc.pid)
+
+    def _teardown(self, reason: str) -> None:
+        """Hard-kill the current subprocess (SIGTERM then SIGKILL). Safe to
+        call even if it's already dead."""
+        with self._state_lock:
+            proc = self.proc
+            self.proc = None
+        if proc is None:
+            return
+        logger.warning("Killing runner subprocess (%s): pid=%s", reason, proc.pid)
+        graceful_timeout = CONFIG.get("cancellation", {}).get("graceful_term_timeout_seconds", 2.0)
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=graceful_timeout)
+            except subprocess.TimeoutExpired:
+                logger.warning("Runner subprocess did not exit after SIGTERM; sending SIGKILL.")
+                proc.kill()
+                proc.wait(timeout=5)
+        except Exception as e:
+            logger.warning("Error while killing runner subprocess: %s", e)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def cancel_current_job(self, job_id: str) -> bool:
+        """Called from a different thread than the one running run_job().
+        Kills the subprocess right away if it's currently working on
+        job_id. The thread blocked in run_job() will observe the pipe
+        closing and return a cancellation error; a fresh subprocess is
+        spawned lazily before the NEXT job starts, so this call itself
+        does not block on a reload."""
+        with self._state_lock:
+            if self._current_job_id != job_id or self.proc is None:
+                return False
+            self._kill_flag = True
+        self._teardown(reason=f"cancelled job {job_id}")
+        return True
+
+    def run_job(self, job_id: str, job_dict: dict, on_token=None) -> dict:
+        """Runs exactly one job on the persistent subprocess, blocking until
+        it completes, errors, or is cancelled. If the subprocess isn't
+        currently alive (first call, or a previous cancel killed it), it is
+        (re)spawned first -- this is the only point where job latency can
+        include a model-load cost, and only for the job immediately
+        following a cancellation.
+
+        Returns {"result": {...}} or {"error": "..."}. Streaming jobs also
+        invoke on_token(delta, finish_reason) as tokens arrive.
+        """
+        with self.job_lock:
+            with self._state_lock:
+                need_start = self.proc is None
+            if need_start:
+                try:
+                    self.start()
+                except Exception as e:
+                    return {"error": f"model_load_failed: {e}"}
+
+            with self._state_lock:
+                self._current_job_id = job_id
+                self._kill_flag = False
+                proc = self.proc
+
+            if proc is None:
+                return {"error": "model_load_failed: runner process unavailable"}
+
+            try:
+                assert proc.stdin is not None and proc.stdout is not None
+                proc.stdin.write(json.dumps({"type": "job", "job_id": job_id, "job": job_dict}) + "\n")
+                proc.stdin.flush()
+            except Exception as e:
+                with self._state_lock:
+                    was_killed = self._kill_flag
+                if was_killed:
+                    return {"error": "cancelled: job was cancelled (client disconnected or request timed out)"}
+                return {"error": f"inference_error: failed to send job to runner: {e}"}
+
+            result: Optional[dict] = None
+            error: Optional[str] = None
+            try:
+                for raw_line in proc.stdout:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    event = json.loads(raw_line)
+                    etype = event.get("type")
+                    if etype == "token" and on_token is not None:
+                        on_token(event.get("delta", "") or "", event.get("finish_reason"))
+                    elif etype == "done":
+                        result = event.get("result", {})
+                        break
+                    elif etype == "error":
+                        error = event.get("error")
+                        break
+                else:
+                    # EOF without a done/error event -- either we killed it
+                    # (cancellation) or it crashed unexpectedly.
+                    pass
+            except Exception as e:
+                error = f"lost connection to runner subprocess: {e}"
+            finally:
+                with self._state_lock:
+                    self._current_job_id = None
+                    was_killed = self._kill_flag
+
+            if was_killed:
+                return {"error": "cancelled: job was cancelled (client disconnected or request timed out)"}
+
+            if result is not None:
+                return {"result": result}
+            if error is not None:
+                return {"error": f"inference_error: {error}"}
+
+            # Subprocess died without reporting anything and we didn't kill
+            # it ourselves -- treat as a crash, tear down so the next job
+            # gets a fresh (working) process instead of reusing a dead pipe.
+            logger.error("Runner subprocess for job %s exited unexpectedly with no result.", job_id)
+            self._teardown(reason="crashed")
+            return {"error": "inference_error: runner process crashed unexpectedly"}
+
+
+RUNNER = PersistentRunner()
+
+
+def cancel_job(job_id: str) -> bool:
+    """Entrypoint used by the WS/long-poll message handler when the proxy
+    signals that a job's result is no longer wanted (client disconnected,
+    or the proxy's request_timeout_seconds elapsed). Hard-kills the
+    persistent runner subprocess if it is currently working on job_id, so
+    the GPU is freed immediately instead of finishing an orphaned
+    generation that would otherwise block every job queued behind it. The
+    subprocess is respawned (paying one model-load) lazily on the next job."""
+    found = RUNNER.cancel_current_job(job_id)
+    if found:
+        logger.info("Cancelled job %s on request from proxy (subprocess killed).", job_id)
+    else:
+        logger.info("Cancel request for job %s ignored (not currently running here).", job_id)
+    return found
+
 
 
 async def disk_monitor_loop():
@@ -937,6 +1204,14 @@ async def disk_monitor_loop():
 
 # --------------------------------------------------------------------------- #
 # Step 7: inference execution
+#
+# Both run_inference() and run_inference_streaming() delegate to the single
+# persistent RUNNER (a long-lived subprocess) instead of calling a Llama
+# object in-process. This is what enables hard cancellation: cancel_job()
+# (defined above, next to PersistentRunner) can kill that subprocess at any
+# point during execution, immediately freeing the GPU instead of letting an
+# orphaned generation run to completion and block every job queued behind
+# it.
 # --------------------------------------------------------------------------- #
 
 
@@ -960,105 +1235,95 @@ def build_gen_kwargs(payload: dict) -> dict:
     return gen_kwargs
 
 
-def recover_from_oom(model_alias: str, e: Exception) -> None:
-    """Single-model mode has nowhere to fall back to: we don't unload+reload
-    mid-run. We just free what CUDA cache we can and surface the error --
-    the caller returns a cuda_out_of_memory error for this request only."""
-    logger.error("CUDA OOM while running '%s': %s", model_alias, e)
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
+def _build_runner_job_dict(payload: dict, gen_kwargs: dict) -> dict:
+    """Flattens payload + gen_kwargs into the shape inference_runner_proc.py
+    expects for its "job" field (see that script's docstring)."""
+    job = {
+        "kind": payload["kind"],
+        "stream": bool(payload.get("stream", False)),
+        **gen_kwargs,
+    }
+    if payload["kind"] == "chat":
+        job["messages"] = build_chat_prompt_messages(payload["messages"])
+    else:
+        job["prompt"] = payload["prompt"]
+    return job
 
 
-def run_inference(payload: dict) -> dict:
-    """Non-streaming path: blocking, called via run_in_executor."""
+def run_inference(payload: dict, job_id: str) -> dict:
+    """Non-streaming path: blocking, called via run_in_executor. Runs on the
+    persistent runner subprocess, which can be hard-killed by cancel_job()
+    if a cancel arrives (client disconnected / job timed out on the proxy)
+    before it finishes."""
     requested_model = str(payload.get("model", MODELS.target_model_id))
     allowed_models = {MODELS.target_model_id, MODELS.target_repo, MODELS.file_name}
     if requested_model not in allowed_models:
         return {"error": f"model_not_available: this worker only serves '{MODELS.target_model_id}' "
                           f"(requested '{requested_model}')"}
-    gen_kwargs = build_gen_kwargs(payload)
 
-    if MODELS.llm is None:
+    if MODELS.current_local_path is None or MODELS.n_ctx is None:
         return {"error": "model_load_failed: model is not loaded"}
+
+    gen_kwargs = build_gen_kwargs(payload)
+    job_dict = _build_runner_job_dict(payload, gen_kwargs)
 
     MODELS.status = "busy"
     start = time.time()
     try:
-        if payload["kind"] == "chat":
-            messages = build_chat_prompt_messages(payload["messages"])
-            out = MODELS.llm.create_chat_completion(messages=messages, **gen_kwargs)
-            choice = out["choices"][0]
-            text = choice["message"]["content"]
-            finish_reason = choice.get("finish_reason", "stop")
-        else:
-            prompt = payload["prompt"]
-            out = MODELS.llm(prompt=prompt, **gen_kwargs)
-            choice = out["choices"][0]
-            text = choice["text"]
-            finish_reason = choice.get("finish_reason", "stop")
+        outcome = RUNNER.run_job(job_id, job_dict)
+        if "error" in outcome:
+            if not outcome["error"].startswith("cancelled:"):
+                logger.error("Job %s failed: %s", job_id, outcome["error"])
+            return outcome
 
-        usage = out.get("usage", {})
+        result = outcome["result"]
         elapsed = time.time() - start
-        logger.info("Job for '%s' completed in %.2fs (completion_tokens=%s).",
-                    requested_model, elapsed, usage.get("completion_tokens"))
-        return {"result": {"text": text, "finish_reason": finish_reason, "usage": usage}}
-    except RuntimeError as e:
-        if is_cuda_oom_error(e):
-            recover_from_oom(requested_model, e)
-            return {"error": "cuda_out_of_memory: the model ran out of GPU memory for this request"}
-        logger.error("Runtime error during inference: %s\n%s", e, traceback.format_exc())
-        return {"error": f"inference_error: {e}"}
+        usage = result.get("usage", {})
+        logger.info("Job %s for '%s' completed in %.2fs (completion_tokens=%s).",
+                    job_id, requested_model, elapsed, usage.get("completion_tokens"))
+        return {"result": result}
     except Exception as e:
-        logger.error("Unexpected error during inference: %s\n%s", e, traceback.format_exc())
+        logger.error("Unexpected error running job %s: %s\n%s", job_id, e, traceback.format_exc())
         return {"error": f"inference_error: {e}"}
     finally:
         MODELS.status = "idle"
 
 
-def run_inference_streaming(payload: dict, on_token):
+def run_inference_streaming(payload: dict, job_id: str, on_token):
     """Token-by-token streaming path (blocking; run in a background thread).
-    Calls on_token(delta_text, finish_reason) as tokens are produced."""
+    Calls on_token(delta_text, finish_reason) as tokens are produced by the
+    persistent runner subprocess. If the job is cancelled mid-stream, that
+    subprocess is killed and this function raises so the caller can surface
+    an error to the (still-connected, if any) SSE consumer; if nobody is
+    listening anymore that's fine too -- the point of killing is to free
+    the GPU immediately regardless of who's still watching."""
     requested_model = str(payload.get("model", MODELS.target_model_id))
     allowed_models = {MODELS.target_model_id, MODELS.target_repo, MODELS.file_name}
     if requested_model not in allowed_models:
         raise RuntimeError(f"model_not_available: this worker only serves '{MODELS.target_model_id}'")
-    if MODELS.llm is None:
+    if MODELS.current_local_path is None or MODELS.n_ctx is None:
         raise RuntimeError("model_load_failed: model is not loaded")
 
     gen_kwargs = build_gen_kwargs(payload)
+    job_dict = _build_runner_job_dict(payload, gen_kwargs)
+
     MODELS.status = "busy"
     start = time.time()
     token_count = 0
+
+    def _on_token(delta: str, finish_reason: Optional[str]) -> None:
+        nonlocal token_count
+        if delta:
+            token_count += 1
+        on_token(delta, finish_reason)
+
     try:
-        if payload["kind"] == "chat":
-            messages = build_chat_prompt_messages(payload["messages"])
-            stream = MODELS.llm.create_chat_completion(messages=messages, stream=True, **gen_kwargs)
-            for chunk in stream:
-                choice = chunk["choices"][0]
-                delta = choice.get("delta", {}) or {}
-                text = delta.get("content", "") or ""
-                finish_reason = choice.get("finish_reason")
-                if text:
-                    token_count += 1
-                if text or finish_reason:
-                    on_token(text, finish_reason)
-        else:
-            prompt = payload["prompt"]
-            stream = MODELS.llm(prompt=prompt, stream=True, **gen_kwargs)
-            for chunk in stream:
-                choice = chunk["choices"][0]
-                text = choice.get("text", "") or ""
-                finish_reason = choice.get("finish_reason")
-                if text:
-                    token_count += 1
-                if text or finish_reason:
-                    on_token(text, finish_reason)
-        logger.info("Streaming job for '%s' completed in %.2fs (~%d tokens).",
-                    requested_model, time.time() - start, token_count)
+        outcome = RUNNER.run_job(job_id, job_dict, on_token=_on_token)
+        if "error" in outcome:
+            raise RuntimeError(outcome["error"])
+
+        logger.info("Streaming job %s for '%s' completed in %.2fs (~%d tokens).",
+                    job_id, requested_model, time.time() - start, token_count)
     finally:
         MODELS.status = "idle"
 
@@ -1101,6 +1366,9 @@ class ProxyClient:
             "gpu_stats": gpu_stats,
             "current_model": self.target_model_id,
             "status": MODELS.status,
+            # Loaded context size, shown on the proxy dashboard. None until
+            # load_startup_model() has resolved it.
+            "n_ctx": MODELS.n_ctx,
         }
 
     def _check_and_mark_duplicate(self, job_id: str) -> bool:
@@ -1115,7 +1383,7 @@ class ProxyClient:
     async def process_job(self, job_id: str, payload: dict) -> dict:
         if self._check_and_mark_duplicate(job_id):
             return {"job_id": job_id, "duplicate": True}
-        result = await self.loop.run_in_executor(None, run_inference, payload)
+        result = await self.loop.run_in_executor(None, run_inference, payload, job_id)
         return {"job_id": job_id, **result}
 
     async def process_stream_job(self, ws, job_id: str, payload: dict) -> None:
@@ -1134,12 +1402,14 @@ class ProxyClient:
 
         def worker_thread() -> None:
             try:
-                run_inference_streaming(payload, on_token)
+                run_inference_streaming(payload, job_id, on_token)
                 loop.call_soon_threadsafe(queue.put_nowait, {"__done__": True})
             except RuntimeError as e:
                 if is_cuda_oom_error(e):
                     recover_from_oom(self.target_model_id, e)
                     err = "cuda_out_of_memory: the model ran out of GPU memory for this request"
+                elif str(e).startswith("cancelled:"):
+                    err = str(e)
                 else:
                     logger.error("Runtime error during streaming inference: %s\n%s",
                                   e, traceback.format_exc())
@@ -1204,7 +1474,8 @@ class ProxyClient:
                     try:
                         async for raw in ws:
                             msg = json.loads(raw)
-                            if msg.get("type") == "job":
+                            mtype = msg.get("type")
+                            if mtype == "job":
                                 payload = msg["payload"]
                                 await ws.send(json.dumps({"type": "ack", "job_id": msg["job_id"]}))
                                 if payload.get("stream"):
@@ -1212,7 +1483,16 @@ class ProxyClient:
                                 else:
                                     result = await self.process_job(msg["job_id"], payload)
                                     await ws.send(json.dumps({"type": "result", **result}))
-                            elif msg.get("type") == "heartbeat_ack":
+                            elif mtype == "cancel":
+                                # Client disconnected or the job timed out on
+                                # the proxy side -- the eventual result is
+                                # useless, so hard-kill the subprocess doing
+                                # the work right now instead of letting it
+                                # run to completion and block the next job.
+                                job_id = msg.get("job_id")
+                                if job_id:
+                                    await self.loop.run_in_executor(None, cancel_job, job_id)
+                            elif mtype == "heartbeat_ack":
                                 pass
                             else:
                                 logger.debug("Unhandled WS message: %s", msg)
@@ -1242,7 +1522,17 @@ class ProxyClient:
 
     async def run_long_poll_forever(self, stop_after_seconds: float):
         """Runs long-poll for a while (including its own periodic heartbeat
-        posts), then returns so the caller can retry upgrading back to WS."""
+        posts), then returns so the caller can retry upgrading back to WS.
+
+        Long-poll has no push channel for the proxy to deliver an
+        out-of-band cancel while a job is running, so on this transport a
+        cancel is instead piggybacked onto the heartbeat response (see
+        _poll_heartbeat below) and checked between poll cycles. This means
+        cancellation latency on long-poll is bounded by the heartbeat
+        interval rather than being instant, which is an inherent limitation
+        of a pure request/response fallback transport -- WS remains the
+        transport to prefer whenever available for exactly this reason.
+        """
         t_cfg = self.config["transport"]
         try:
             requests.post(f"{self.proxy_url}/worker/register", json={
@@ -1287,11 +1577,18 @@ class ProxyClient:
 
     async def _poll_heartbeat(self):
         try:
-            await self.loop.run_in_executor(
+            resp = await self.loop.run_in_executor(
                 None,
                 lambda: requests.post(f"{self.proxy_url}/worker/heartbeat",
                                        json=self._heartbeat_payload(), timeout=15),
             )
+            try:
+                data = resp.json()
+            except Exception:
+                return
+            cancel_job_id = data.get("cancel_job_id")
+            if cancel_job_id:
+                cancel_job(cancel_job_id)
         except Exception:
             pass
 
@@ -1320,15 +1617,30 @@ class ProxyClient:
             logger.info("Attempting to upgrade back to WebSocket transport...")
 
 
+def recover_from_oom(model_alias: str, e: Exception) -> None:
+    """Free what CUDA cache we can in THIS (parent) process after a job's
+    child process reported an OOM. The child process itself already exited
+    (taking its own CUDA context with it), so there's no reload to do here
+    -- just surface the error for that one request."""
+    logger.error("CUDA OOM while running '%s': %s", model_alias, e)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------- #
 # Entrypoint
 # --------------------------------------------------------------------------- #
 
 
 async def main():
-    # Step 1/2: download + load the single target model BEFORE connecting to
-    # the proxy, so the worker never advertises itself as ready until it
-    # actually has something to serve.
+    # Step 1/2: download + verify-load the single target model BEFORE
+    # connecting to the proxy, so the worker never advertises itself as
+    # ready until it actually knows a working (n_ctx, n_gpu_layers, ...)
+    # configuration for per-job runner processes to use.
     loop = asyncio.get_event_loop()
     try:
         await loop.run_in_executor(None, MODELS.load_startup_model)
