@@ -586,21 +586,47 @@ class WorkerRegistry:
 
     async def watch_job_liveness(self, worker: WorkerState, job: Job,
                                   request: Request) -> None:
-        """Polls request.is_disconnected() once a second for as long as
-        `job` is neither finished nor already abandoned. This is the ONE
-        rule the proxy enforces for every job it holds, queued or
-        delivered: no live return path -> halt immediately. The moment
-        disconnection is observed, the job is marked abandoned (so the
-        dispatcher will never deliver it if it hasn't been already) and,
-        if it has already been delivered to a worker, that worker is told
-        to hard-kill it right away."""
+        """Polls for a live return path once a second for as long as `job`
+        is neither finished nor already abandoned. This is the ONE rule
+        the proxy enforces for every job it holds, queued or delivered: no
+        live return path -> halt immediately.
+
+        IMPORTANT CAVEAT this function exists to work around: Starlette's
+        Request.is_disconnected() only returns True once the ASGI server
+        has actually observed an 'http.disconnect' message on the receive
+        channel. For a request whose body was already fully read (true of
+        every request here) and whose response is a StreamingResponse
+        (pure send-side traffic), uvicorn has no ongoing reason to probe
+        the receive channel on its own -- so is_disconnected() can go on
+        returning False indefinitely after the client is actually gone,
+        especially behind an intermediary (reverse proxy / CDN) that
+        doesn't propagate the close immediately. Calling it once is not
+        enough; we have to keep *forcing* a receive-channel check every
+        tick by calling it repeatedly, AND we cannot assume a single False
+        means "still connected" -- only a True is trustworthy, so we poll
+        aggressively and treat this as a best-effort signal, not a
+        guarantee. The dashboard/API kill switches (kill_worker/kill_all)
+        exist specifically as the deterministic backstop for whenever this
+        signal fails to fire (e.g. a reverse proxy masking the disconnect
+        entirely) -- see /worker/{worker_id}/kill.
+        """
         interval = CONFIG.get("client_disconnect_check_interval_seconds", 1.0)
         try:
             while not job.future.done() and not job.abandoned:
                 await asyncio.sleep(interval)
                 if job.future.done():
                     return
-                if await request.is_disconnected():
+                disconnected = False
+                try:
+                    disconnected = await request.is_disconnected()
+                except Exception:
+                    # Treat an inability to even ask the ASGI server about
+                    # connection state as a strong signal something's
+                    # wrong with the transport -- fail safe by treating it
+                    # as disconnected rather than looping forever assuming
+                    # the connection is fine.
+                    disconnected = True
+                if disconnected:
                     job.abandoned = True
                     logger.info(
                         "No live return path for job %s (client disconnected); "
@@ -779,10 +805,13 @@ class WorkerRegistry:
         for job in list(worker.jobs.values()):
             if job.future.done():
                 continue
+            job.abandoned = True
             if job.stream_queue is not None:
                 await job.stream_queue.put({"error": reason})
                 await job.stream_queue.put(None)
             job.future.set_exception(RuntimeError(reason))
+            if job.liveness_task is not None and not job.liveness_task.done():
+                job.liveness_task.cancel()
             cancelled += 1
         worker.in_flight_jobs = 0
         # Drain the queue itself so nothing lingers referencing job ids that
@@ -816,6 +845,23 @@ class WorkerRegistry:
             "status": "ok",
             "jobs_cancelled": total_cancelled,
             "workers_signalled": workers_signalled,
+        }
+
+    async def kill_worker(self, worker: WorkerState, reason: str = "manual worker kill") -> dict:
+        """Scoped version of kill_all: nukes exactly ONE worker's queue and
+        in-flight jobs (proxy-side) and unconditionally hard-kills and
+        resets that worker's runner subprocess, without touching any other
+        worker in the fleet. This is what the dashboard's per-worker Kill
+        button and POST /worker/{worker_id}/kill call. Also cancels
+        job.liveness_task for everything that gets cancelled here, since
+        those jobs are being resolved directly rather than through their
+        own disconnect-detection path."""
+        cancelled = await self.cancel_all_jobs_for_worker(worker, reason)
+        await worker.request_kill_all(reason)
+        return {
+            "status": "ok",
+            "worker_id": worker.worker_id,
+            "jobs_cancelled": cancelled,
         }
 
     async def reap_unreconnected_workers(self, grace_seconds: float, reason: str) -> List[str]:
@@ -992,15 +1038,27 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
     The job (and therefore the stream) never migrates to a different
     worker mid-flight.
 
-    Disconnect handling is NOT done here anymore -- job.liveness_task
-    (started in submit_job) already polls request.is_disconnected() once a
-    second for this job's entire lifetime and will mark job.abandoned +
-    cancel it on the worker the moment the client is gone, which unblocks
-    the stream_queue.get() below via the future/queue sentinel this
-    generator is already watching. This loop only needs to notice that
-    happened and stop yielding.
+    Two independent disconnect signals feed into the same
+    abandon-this-job path:
+
+    1. job.liveness_task (started in submit_job) polls
+       request.is_disconnected() once a second for this job's entire
+       lifetime, in a separate task, and marks job.abandoned + cancels on
+       the worker the moment it observes a disconnect.
+    2. GeneratorExit, caught here: when uvicorn/Starlette actually tears
+       down this async generator early (which happens once the ASGI
+       server itself gives up on the connection -- e.g. the underlying
+       socket write fails), Python raises GeneratorExit into wherever
+       we're suspended (the `await job.stream_queue.get()` below). This
+       is a strictly stronger signal than is_disconnected() polling: it
+       fires exactly when the server has concluded the connection is
+       actually dead, rather than relying on a receive-channel probe that
+       may never get scheduled again for a send-only stream. We use it as
+       an immediate trigger for the same worker-side cancel rather than
+       waiting for the next 1s poll tick to catch up.
     """
     role_sent = False
+    exiting_via_generator_exit = False
     try:
         while True:
             try:
@@ -1048,10 +1106,35 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
                                  "finish_reason": finish_reason}],
                 }
             yield f"data: {json.dumps(chunk)}\n\n"
+    except GeneratorExit:
+        # The ASGI server just tore this generator down early -- the
+        # connection is confirmed gone. Fire the same abandon path
+        # immediately rather than waiting for the polling liveness task to
+        # notice on its next tick. We must NOT yield again after this (the
+        # generator is being closed, not paused -- attempting to yield
+        # would raise "generator ignored GeneratorExit"), so the `finally`
+        # below skips its usual DONE sentinel in this specific case.
+        exiting_via_generator_exit = True
+        if not job.future.done():
+            job.abandoned = True
+            logger.info(
+                "GeneratorExit for job %s (connection torn down); "
+                "marking abandoned and halting on worker '%s'.",
+                job.id, worker.worker_id)
+            asyncio.create_task(
+                REGISTRY.cancel_job_on_worker(worker, job, "no return path: generator closed"))
+            worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+            try:
+                job.future.set_exception(
+                    RuntimeError("client disconnected: generator closed"))
+            except asyncio.InvalidStateError:
+                pass
+        raise
     finally:
         if job.liveness_task is not None and not job.liveness_task.done():
             job.liveness_task.cancel()
-        yield "data: [DONE]\n\n"
+        if not exiting_via_generator_exit:
+            yield "data: [DONE]\n\n"
 
 
 # --------------------------------------------------------------------------- #
@@ -1268,6 +1351,28 @@ async def kill_all():
     return result
 
 
+@app.post("/worker/{worker_id}/kill")
+async def kill_worker(worker_id: str):
+    """Per-worker emergency stop: empties THIS worker's queue, fails every
+    job it currently owns (queued or in-flight), and tells it to
+    unconditionally hard-kill and reset its runner subprocess --
+    regardless of which job_id it thinks is current. Scoped equivalent of
+    /kill-all for when only one worker in the fleet is wedged/misbehaving
+    and the rest should keep serving traffic undisturbed. This is what the
+    dashboard's per-worker "Kill" button calls.
+
+    Same trust boundary as /kill-all: deliberately unauthenticated
+    (operator-only reset switch on the machine hosting this proxy, not a
+    client-facing API surface). Put it behind a network-level restriction
+    if this proxy is ever exposed somewhere untrusted."""
+    worker = REGISTRY.get(worker_id)
+    if worker is None:
+        raise HTTPException(status_code=404, detail=f"unknown worker_id '{worker_id}'")
+    result = await REGISTRY.kill_worker(worker, reason=f"manual kill via dashboard/API for '{worker_id}'")
+    logger.warning("Per-worker kill invoked for '%s': %s", worker_id, result)
+    return result
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     if not CONFIG["dashboard"].get("enabled", True):
@@ -1284,9 +1389,10 @@ async def dashboard():
         gpu_str = (f"{gpu.get('used_mb', '?')}/{gpu.get('total_mb', '?')} MB "
                    f"({gpu.get('utilization_percent', '?')}%)") if gpu else "—"
         n_ctx_str = f"{snap['n_ctx']:,}" if snap.get("n_ctx") else "—"
+        wid = snap['worker_id']
         rows.append(f"""
       <tr>
-        <td>{snap['worker_id']}</td>
+        <td>{wid}</td>
         <td class="{status_class}">{snap['online']}</td>
         <td>{snap['transport']}</td>
         <td>{snap['status']}</td>
@@ -1297,6 +1403,7 @@ async def dashboard():
         <td>{snap['queue_depth']}</td>
         <td>{gpu_str}</td>
         <td>{snap['last_heartbeat_age_seconds']}</td>
+        <td><button class="kill-btn" onclick="killWorker('{wid}')">Kill</button></td>
       </tr>""")
 
     total_queue = REGISTRY.total_queue_depth()
@@ -1304,7 +1411,7 @@ async def dashboard():
     online_count = sum(1 for w in workers if w.is_online())
 
     html = f"""
-    <html><head><meta http-equiv="refresh" content="{refresh}">
+    <html><head>
     <title>Multi-Worker Proxy Dashboard</title>
     <style>
         body {{ font-family: monospace; background:#0d1117; color:#c9d1d9; padding:2rem; }}
@@ -1315,6 +1422,19 @@ async def dashboard():
         .summary td {{ padding: 4px 12px; }}
         h2 {{ margin-bottom: 0.2em; }}
         .sub {{ color: #8b949e; margin-top:0; }}
+        .kill-btn {{
+            background:#f85149; color:#fff; border:none; border-radius:4px;
+            padding:4px 10px; cursor:pointer; font-family: monospace; font-size:0.85em;
+        }}
+        .kill-btn:hover {{ background:#da3633; }}
+        .kill-btn:disabled {{ background:#6e2c2a; cursor:default; }}
+        .kill-all-btn {{
+            background:#f85149; color:#fff; border:none; border-radius:4px;
+            padding:8px 16px; cursor:pointer; font-family: monospace; font-size:0.95em;
+            margin-top: 0.5em;
+        }}
+        .kill-all-btn:hover {{ background:#da3633; }}
+        #status-msg {{ color:#8b949e; margin-left: 1em; }}
     </style></head><body>
     <h2>GGUF Kaggle Multi-Worker Proxy Dashboard</h2>
     <p class="sub">{online_count}/{len(workers)} workers online &middot;
@@ -1323,10 +1443,62 @@ async def dashboard():
       <tr>
         <th>Worker ID</th><th>Online</th><th>Transport</th><th>Status</th>
         <th>Current Model</th><th>Loaded n_ctx</th><th>Known Models</th><th>In-Flight</th>
-        <th>Queue</th><th>GPU</th><th>Last HB (s)</th>
+        <th>Queue</th><th>GPU</th><th>Last HB (s)</th><th>Action</th>
       </tr>
-      {''.join(rows) if rows else '<tr><td colspan="11">No workers have registered yet.</td></tr>'}
+      {''.join(rows) if rows else '<tr><td colspan="12">No workers have registered yet.</td></tr>'}
     </table>
+    <button class="kill-all-btn" onclick="killAll()">Kill ALL Workers</button>
+    <span id="status-msg"></span>
+    <script>
+        const refreshSeconds = {refresh};
+
+        async function killWorker(workerId) {{
+            if (!confirm('Kill worker "' + workerId + '"? This empties its entire ' +
+                         'queue, fails every job it currently owns, and hard-resets ' +
+                         'its runner subprocess. This cannot be undone.')) {{
+                return;
+            }}
+            const msg = document.getElementById('status-msg');
+            msg.textContent = 'Killing ' + workerId + '...';
+            try {{
+                const resp = await fetch('/worker/' + encodeURIComponent(workerId) + '/kill', {{
+                    method: 'POST'
+                }});
+                const data = await resp.json();
+                if (!resp.ok) {{
+                    msg.textContent = 'Error: ' + (data.detail || resp.statusText);
+                    return;
+                }}
+                msg.textContent = 'Killed ' + workerId + ' (' + data.jobs_cancelled + ' jobs cancelled).';
+                setTimeout(() => location.reload(), 800);
+            }} catch (e) {{
+                msg.textContent = 'Request failed: ' + e;
+            }}
+        }}
+
+        async function killAll() {{
+            if (!confirm('Kill ALL workers? This empties every queue, fails every ' +
+                         'in-flight job across the whole fleet, and hard-resets every ' +
+                         'runner subprocess. This cannot be undone.')) {{
+                return;
+            }}
+            const msg = document.getElementById('status-msg');
+            msg.textContent = 'Killing all workers...';
+            try {{
+                const resp = await fetch('/kill-all');
+                const data = await resp.json();
+                msg.textContent = 'Killed all workers (' + data.jobs_cancelled + ' jobs cancelled).';
+                setTimeout(() => location.reload(), 800);
+            }} catch (e) {{
+                msg.textContent = 'Request failed: ' + e;
+            }}
+        }}
+
+        // JS-driven refresh instead of <meta refresh> so an in-flight kill
+        // action's confirm()/status message doesn't get yanked away by an
+        // unconditional page reload firing mid-click.
+        setTimeout(() => location.reload(), refreshSeconds * 1000);
+    </script>
     </body></html>
     """
     return HTMLResponse(html)

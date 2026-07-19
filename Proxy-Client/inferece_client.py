@@ -1209,6 +1209,21 @@ class PersistentRunner:
                     return {"error": f"model_load_failed: {e}"}
 
             with self._state_lock:
+                # Re-check immediately before we commit to running this
+                # job: a cancel for job_id may have arrived after the
+                # first check above (line ~1201, before self.start()) but
+                # before this point -- e.g. while self.start() was
+                # spawning/loading the subprocess, or simply in the
+                # scheduling gap between acquiring job_lock and getting
+                # here. Until _current_job_id is actually set to job_id,
+                # cancel_current_job() has no live subprocess to kill for
+                # this job and can only record it in _cancelled_job_ids;
+                # without this second check that recorded cancellation
+                # would never be consulted again and the job would be
+                # dispatched anyway. This closes that window.
+                if job_id in self._cancelled_job_ids:
+                    self._cancelled_job_ids.discard(job_id)
+                    return {"error": "cancelled: job was cancelled before it started running here"}
                 self._current_job_id = job_id
                 self._kill_flag = False
                 proc = self.proc
