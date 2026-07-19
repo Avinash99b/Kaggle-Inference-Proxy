@@ -382,7 +382,13 @@ class WorkerState:
             job.cancel_requested = True
         if self.transport == "ws" and self.ws is not None:
             try:
-                await self.ws.send_text(json.dumps({"type": "cancel", "job_id": job_id}))
+                # Shares self.lock with the main recv loop's heartbeat_ack
+                # sends and the dispatcher task's job sends (see worker_ws)
+                # -- all three run concurrently on the same websocket, and
+                # unserialized concurrent send_text() calls can interleave
+                # partial frames on the wire, corrupting the connection.
+                async with self.lock:
+                    await self.ws.send_text(json.dumps({"type": "cancel", "job_id": job_id}))
                 logger.info("Sent cancel for job %s to worker '%s' (%s) over WS.",
                             job_id, self.worker_id, reason)
             except Exception as e:
@@ -433,36 +439,6 @@ class WorkerRegistry:
         self.workers: Dict[str, WorkerState] = {}
         self._rr_counter = itertools.count()  # round-robin tiebreaker source
         self._registry_lock = asyncio.Lock()
-
-    def _resolve_future(self, job: "Job", result: Optional[dict] = None,
-                         error: Optional[str] = None) -> None:
-        """Resolve job.future exactly once, in whichever way is safe for
-        who (if anyone) is actually listening on it.
-
-        Non-streaming jobs are awaited directly by run_job_and_wait() via
-        `await asyncio.wait_for(job.future, ...)`, so they need a real
-        set_result()/set_exception() to unblock that caller.
-
-        Streaming (WS) jobs are NEVER awaited on job.future -- the actual
-        response is driven entirely by job.stream_queue, consumed by
-        real_stream_generator(). job.future exists for them purely so
-        total_in_flight() can treat job.future.done() as "no longer
-        occupying the worker". Calling set_exception() on a future nobody
-        awaits leaves the exception unretrieved, and asyncio logs a scary
-        (but functionally harmless) "Future exception was never retrieved"
-        warning once it's garbage-collected -- exactly what showed up in
-        the logs. cancel() marks it done for accounting without ever
-        storing an exception that could go unretrieved.
-        """
-        if job.future.done():
-            return
-        if job.stream_queue is not None:
-            job.future.cancel()
-            return
-        if error:
-            job.future.set_exception(RuntimeError(error))
-        else:
-            job.future.set_result(result)
 
     async def get_or_create(self, worker_id: str) -> WorkerState:
         async with self._registry_lock:
@@ -606,7 +582,10 @@ class WorkerRegistry:
         job = worker.jobs.get(job_id)
         if job is None or job.future.done():
             return False  # unknown or duplicate delivery -- ignore safely
-        self._resolve_future(job, result=result, error=error)
+        if error:
+            job.future.set_exception(RuntimeError(error))
+        else:
+            job.future.set_result(result)
         worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
         if worker.pending_cancel_job_id == job_id:
             worker.pending_cancel_job_id = None
@@ -648,7 +627,7 @@ class WorkerRegistry:
                          job.id, worker.worker_id, reason)
             await job.stream_queue.put({"error": reason})
             await job.stream_queue.put(None)
-            self._resolve_future(job, error=reason)
+            job.future.set_exception(RuntimeError(reason))
             worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
             await self.cancel_job_on_worker(worker, job, reason)
             return
@@ -663,7 +642,7 @@ class WorkerRegistry:
         else:
             logger.error("Failing job %s on worker '%s' permanently: %s",
                          job.id, worker.worker_id, reason)
-            self._resolve_future(job, error=reason)
+            job.future.set_exception(RuntimeError(reason))
             worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
             await self.cancel_job_on_worker(worker, job, reason)
 
@@ -695,7 +674,7 @@ class WorkerRegistry:
             if job.stream_queue is not None:
                 await job.stream_queue.put({"error": reason})
                 await job.stream_queue.put(None)
-            self._resolve_future(job, error=reason)
+            job.future.set_exception(RuntimeError(reason))
             cancelled += 1
         worker.in_flight_jobs = 0
         # Drain the queue itself so nothing lingers referencing job ids that
@@ -1284,6 +1263,24 @@ async def worker_ws(websocket: WebSocket):
 
         heartbeat_timeout = CONFIG["websocket"]["heartbeat_timeout_seconds"]
 
+        # worker.lock guards every websocket.send_text() for the rest of
+        # this connection's life. dispatcher() below runs as its own
+        # asyncio task and pushes "job" frames whenever work is queued,
+        # the main recv loop (further down) concurrently sends
+        # "heartbeat_ack" frames, and request_cancel() (WorkerState, above)
+        # can push an out-of-band "cancel" frame at any moment from a
+        # third task entirely -- all three write to the SAME websocket.
+        # Unserialized concurrent send_text() calls can interleave partial
+        # frames on the wire, corrupting the connection. That corruption
+        # (not real network jitter) is what was showing up as spurious
+        # "worker disconnected mid-request" / keepalive-timeout failures on
+        # the worker side during active streaming. Every send from here on
+        # must go through send() below instead of calling
+        # websocket.send_text() directly.
+        async def send(obj: dict) -> None:
+            async with worker.lock:
+                await websocket.send_text(json.dumps(obj))
+
         async def dispatcher(w: WorkerState):
             """Pulls jobs off THIS worker's queue and pushes them to it one
             at a time (a single GGUF backend processes one request at a
@@ -1299,11 +1296,11 @@ async def worker_ws(websocket: WebSocket):
                     continue
                 w.status = "busy"
                 try:
-                    await websocket.send_text(json.dumps({
+                    await send({
                         "type": "job",
                         "job_id": job.id,
                         "payload": job.payload,
-                    }))
+                    })
                 except Exception as e:
                     await REGISTRY.requeue_or_fail(w, job, f"send failed: {e}")
                     return
@@ -1339,7 +1336,7 @@ async def worker_ws(websocket: WebSocket):
                     gpu_stats = msg.get("gpu_stats")
                     if isinstance(gpu_stats, dict):
                         worker.gpu_stats = gpu_stats
-                    await websocket.send_text(json.dumps({"type": "heartbeat_ack"}))
+                    await send({"type": "heartbeat_ack"})
                 elif mtype == "ack":
                     worker.touch()  # job delivery acknowledged, nothing else to do
                 elif mtype == "result":
@@ -1568,7 +1565,7 @@ async def watchdog_loop():
                     if job.stream_queue is not None:
                         await job.stream_queue.put({"error": "timed out waiting in queue"})
                         await job.stream_queue.put(None)
-                    REGISTRY._resolve_future(job, error="timed out waiting in queue")
+                    job.future.set_exception(RuntimeError("timed out waiting in queue"))
                     worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
                     await REGISTRY.cancel_job_on_worker(worker, job, "timed out waiting in queue")
             # A worker whose heartbeat has gone stale (e.g. a long-poll

@@ -1372,6 +1372,15 @@ class ProxyClient:
         self.ws_failures = 0
         self.loop = asyncio.get_event_loop()
 
+    async def _ws_send(self, ws, payload: dict) -> None:
+        """The only way any code in this class should write to `ws`. Takes
+        self._send_lock so that concurrent writers (the heartbeat task and
+        whichever coroutine is handling the current job/stream) can never
+        interleave frames on the wire -- see the comment where the lock is
+        created in run_websocket_forever for why that matters."""
+        async with self._send_lock:
+            await ws.send(json.dumps(payload))
+
     def _sign(self) -> Dict[str, str]:
         ts = str(time.time())
         sig = hmac.new(self.secret.encode(), f"{self.worker_id}:{ts}".encode(),
@@ -1422,9 +1431,9 @@ class ProxyClient:
 
     async def process_stream_job(self, ws, job_id: str, payload: dict) -> None:
         if self._check_and_mark_duplicate(job_id):
-            await ws.send(json.dumps({
+            await self._ws_send(ws, {
                 "type": "stream_done", "job_id": job_id, "result": {"duplicate": True},
-            }))
+            })
             return
 
         queue: "asyncio.Queue" = asyncio.Queue()
@@ -1461,22 +1470,22 @@ class ProxyClient:
             while True:
                 item = await queue.get()
                 if item.get("__done__"):
-                    await ws.send(json.dumps({
+                    await self._ws_send(ws, {
                         "type": "stream_done", "job_id": job_id,
                         "result": {"usage": {"completion_tokens": completion_tokens}},
-                    }))
+                    })
                     return
                 if "__error__" in item:
-                    await ws.send(json.dumps({
+                    await self._ws_send(ws, {
                         "type": "error", "job_id": job_id, "error": item["__error__"],
-                    }))
+                    })
                     return
                 if item.get("delta"):
                     completion_tokens += 1
-                await ws.send(json.dumps({
+                await self._ws_send(ws, {
                     "type": "stream_chunk", "job_id": job_id,
                     "delta": item.get("delta", ""), "finish_reason": item.get("finish_reason"),
-                }))
+                })
         except Exception as e:
             logger.warning("Lost connection while streaming job %s: %s", job_id, e)
 
@@ -1492,12 +1501,27 @@ class ProxyClient:
                     ping_interval=t_cfg.get("ws_ping_interval_seconds", 30),
                     ping_timeout=t_cfg.get("ws_ping_timeout_seconds", 45),
                 ) as ws:
+                    # Guards every ws.send() for the lifetime of this
+                    # connection. The heartbeat loop (its own asyncio task)
+                    # and this recv loop (which itself calls process_stream_job,
+                    # sending one frame per generated token) both write to the
+                    # SAME connection concurrently. websockets does not
+                    # serialize concurrent send() calls for you -- two
+                    # coroutines writing at once can interleave partial
+                    # frames on the wire, corrupting the protocol stream.
+                    # That corruption is what was actually causing the
+                    # intermittent "keepalive ping timeout" disconnects during
+                    # streaming (the heartbeat firing mid-stream), not real
+                    # network jitter -- so every send must go through this
+                    # lock instead of calling ws.send() directly.
+                    self._send_lock = asyncio.Lock()
+
                     hello = {
                         "type": "hello",
                         "models": {self.target_model_id: self._worker_model_payload()},
                         **self._sign(),
                     }
-                    await ws.send(json.dumps(hello))
+                    await self._ws_send(ws, hello)
                     ack_raw = await asyncio.wait_for(ws.recv(), timeout=15)
                     ack = json.loads(ack_raw)
                     if ack.get("type") != "hello_ack":
@@ -1515,12 +1539,12 @@ class ProxyClient:
                             mtype = msg.get("type")
                             if mtype == "job":
                                 payload = msg["payload"]
-                                await ws.send(json.dumps({"type": "ack", "job_id": msg["job_id"]}))
+                                await self._ws_send(ws, {"type": "ack", "job_id": msg["job_id"]})
                                 if payload.get("stream"):
                                     await self.process_stream_job(ws, msg["job_id"], payload)
                                 else:
                                     result = await self.process_job(msg["job_id"], payload)
-                                    await ws.send(json.dumps({"type": "result", **result}))
+                                    await self._ws_send(ws, {"type": "result", **result})
                             elif mtype == "cancel":
                                 # Client disconnected or the job timed out on
                                 # the proxy side -- the eventual result is
@@ -1555,7 +1579,7 @@ class ProxyClient:
             await asyncio.sleep(interval)
             try:
                 payload = await self._heartbeat_payload()
-                await ws.send(json.dumps(payload))
+                await self._ws_send(ws, payload)
             except Exception:
                 return
 
