@@ -434,6 +434,36 @@ class WorkerRegistry:
         self._rr_counter = itertools.count()  # round-robin tiebreaker source
         self._registry_lock = asyncio.Lock()
 
+    def _resolve_future(self, job: "Job", result: Optional[dict] = None,
+                         error: Optional[str] = None) -> None:
+        """Resolve job.future exactly once, in whichever way is safe for
+        who (if anyone) is actually listening on it.
+
+        Non-streaming jobs are awaited directly by run_job_and_wait() via
+        `await asyncio.wait_for(job.future, ...)`, so they need a real
+        set_result()/set_exception() to unblock that caller.
+
+        Streaming (WS) jobs are NEVER awaited on job.future -- the actual
+        response is driven entirely by job.stream_queue, consumed by
+        real_stream_generator(). job.future exists for them purely so
+        total_in_flight() can treat job.future.done() as "no longer
+        occupying the worker". Calling set_exception() on a future nobody
+        awaits leaves the exception unretrieved, and asyncio logs a scary
+        (but functionally harmless) "Future exception was never retrieved"
+        warning once it's garbage-collected -- exactly what showed up in
+        the logs. cancel() marks it done for accounting without ever
+        storing an exception that could go unretrieved.
+        """
+        if job.future.done():
+            return
+        if job.stream_queue is not None:
+            job.future.cancel()
+            return
+        if error:
+            job.future.set_exception(RuntimeError(error))
+        else:
+            job.future.set_result(result)
+
     async def get_or_create(self, worker_id: str) -> WorkerState:
         async with self._registry_lock:
             w = self.workers.get(worker_id)
@@ -576,10 +606,7 @@ class WorkerRegistry:
         job = worker.jobs.get(job_id)
         if job is None or job.future.done():
             return False  # unknown or duplicate delivery -- ignore safely
-        if error:
-            job.future.set_exception(RuntimeError(error))
-        else:
-            job.future.set_result(result)
+        self._resolve_future(job, result=result, error=error)
         worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
         if worker.pending_cancel_job_id == job_id:
             worker.pending_cancel_job_id = None
@@ -621,7 +648,7 @@ class WorkerRegistry:
                          job.id, worker.worker_id, reason)
             await job.stream_queue.put({"error": reason})
             await job.stream_queue.put(None)
-            job.future.set_exception(RuntimeError(reason))
+            self._resolve_future(job, error=reason)
             worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
             await self.cancel_job_on_worker(worker, job, reason)
             return
@@ -636,7 +663,7 @@ class WorkerRegistry:
         else:
             logger.error("Failing job %s on worker '%s' permanently: %s",
                          job.id, worker.worker_id, reason)
-            job.future.set_exception(RuntimeError(reason))
+            self._resolve_future(job, error=reason)
             worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
             await self.cancel_job_on_worker(worker, job, reason)
 
@@ -668,7 +695,7 @@ class WorkerRegistry:
             if job.stream_queue is not None:
                 await job.stream_queue.put({"error": reason})
                 await job.stream_queue.put(None)
-            job.future.set_exception(RuntimeError(reason))
+            self._resolve_future(job, error=reason)
             cancelled += 1
         worker.in_flight_jobs = 0
         # Drain the queue itself so nothing lingers referencing job ids that
@@ -1541,7 +1568,7 @@ async def watchdog_loop():
                     if job.stream_queue is not None:
                         await job.stream_queue.put({"error": "timed out waiting in queue"})
                         await job.stream_queue.put(None)
-                    job.future.set_exception(RuntimeError("timed out waiting in queue"))
+                    REGISTRY._resolve_future(job, error="timed out waiting in queue")
                     worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
                     await REGISTRY.cancel_job_on_worker(worker, job, "timed out waiting in queue")
             # A worker whose heartbeat has gone stale (e.g. a long-poll
