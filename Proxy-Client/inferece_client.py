@@ -1,1703 +1,1608 @@
 """
-inference_client.py
+proxy_server_multi.py
 ================================================================================
-Single-model Kaggle notebook inference worker.
+Public-facing, OpenAI-compatible API proxy — MULTI-WORKER ROUTER.
 
-Adapted from `run_model_with_proxy.py` for SINGLE-MODEL mode: loads exactly
-one GGUF model at startup (selected via TARGET_MODEL_REPO and FILE_NAME env vars), connects
-outbound to a proxy (WebSocket first, HTTP long-poll fallback), serves
-chat/text completion jobs (including token streaming), reports GPU
-utilization every 5 seconds via heartbeat, and shuts down cleanly on
-KeyboardInterrupt (unloading the model and deregistering from the proxy).
+This is the multi-inference-server evolution of proxy_server.py. Instead of
+tracking a single active worker, this process can accept connections from
+many Kaggle-hosted inference workers simultaneously (one model loaded per
+worker), and routes each incoming client request to whichever connected
+worker is:
 
-There is no model-switching in this build: once the target model is loaded it
-stays loaded for the lifetime of the process. If you need a different
-model, restart the notebook cell with a different TARGET_MODEL_REPO/FILE_NAME pair.
+    1. Actually serving the requested model
+    2. Least busy right now (fewest in-flight jobs, lowest GPU utilization)
+    3. Most recently heard from (tie-break), then round-robin as a final
+       deterministic tie-break
 
-CANCELLATION / HARD-KILL
--------------------------------------------------------------------------------
-Each inference call (chat/completion, streaming or not) runs in a dedicated
-child process (see inference_runner_proc.py), not in-process. This is what
-makes cancellation actually work: llama.cpp's generation call is a blocking
-native call with no cooperative-cancel hook, so the only reliable way to
-stop a job that the client no longer wants (disconnected, or the proxy's
-request_timeout_seconds elapsed) is to SIGKILL the process running it. The
-proxy signals this by sending a `{"type": "cancel", "job_id": ...}` message
-over the worker's WebSocket connection the moment the client disconnects or
-the job times out server-side; this worker kills the matching subprocess
-immediately, frees the GPU context, reports a cancellation error for that
-job, and is ready for the next job right away -- instead of sitting there
-for however long the orphaned generation would otherwise have taken.
+Clients only ever see a normal, stateless OpenAI-compatible API:
 
-Run this in a Kaggle notebook (ideally with the "GPU T4 x2" accelerator
-enabled):
+    GET  /v1/models
+    POST /v1/chat/completions
+    POST /v1/completions
+    POST /v1/embeddings          (not supported -> clean OpenAI-style error)
+    GET  /health
+    GET  /dashboard
 
-    export TARGET_MODEL_REPO="Qwen/Qwen3-8B-GGUF"
-    export FILE_NAME="Qwen3-8B-Q8_0.gguf"
-    export PROXY_URL="https://kaggle-inference-proxy.onrender.com"
-    export WORKER_ID="kaggle-account-1"
-    export WORKER_SECRET="shared-secret-key"
-    python inference_client.py
+Workers connect OUTBOUND to this server (this server never dials into
+Kaggle) via one of two transports:
+
+    * WebSocket  (ws://.../worker/ws)   <- preferred, low latency, push-based
+    * Long-poll  (POST /worker/register, GET /worker/poll,
+                  POST /worker/result, POST /worker/heartbeat,
+                  POST /worker/deregister)  <- fallback transport
+
+Unlike the single-worker reference, MANY workers may be connected and
+"active" at the same time. Each worker has its own job queue; a job is
+routed to exactly one worker's queue based on the scoring function below and
+never migrates between workers mid-flight (especially not mid-stream).
+
+CANCELLATION
+------------
+A job's computed result is only useful if someone is still waiting for it.
+The proxy now actively cancels jobs on the worker side (not just locally)
+whenever that stops being true:
+
+  * The client disconnects while a request is in flight (checked for both
+    streaming and non-streaming requests).
+  * A job's request_timeout_seconds elapses without a result (existing
+    watchdog behavior), which previously only resolved the job locally with
+    an error while the worker kept computing in the background.
+  * A worker connection drops mid-job (existing requeue_or_fail behavior)
+    and the job is ultimately failed rather than retried.
+
+In each case the proxy now sends `{"type": "cancel", "job_id": ...}` to the
+owning worker over its WebSocket (if connected), so the worker can hard-kill
+whatever is computing that job instead of letting it run to completion and
+block every job queued up behind it. For long-poll workers (no push
+channel), a pending cancellation is instead piggybacked onto the next
+heartbeat response as `{"cancel_job_id": "..."}`, which the worker polls at
+its regular heartbeat interval -- this bounds cancellation latency on that
+transport to one heartbeat interval, which is the best a pure
+request/response fallback transport can offer; WS remains the transport to
+prefer for prompt cancellation.
+
+Config loading:
+    Config is normally read from (and, if missing, written to) the JSON file
+    at PROXY_CONFIG_PATH (default "proxy_server_config.json"). If the
+    PROXY_SERVER_CONFIG environment variable is set, it takes priority over
+    the file entirely: its value is expected to be a base64-encoded JSON
+    document containing the config (or a partial config to overlay onto the
+    defaults), and no file is read or written in that case.
+
+Worker reconnect handling:
+    If a worker's connection drops while it still has queued or in-flight
+    jobs, the proxy gives it a grace window (worker_reconnect_grace_seconds,
+    default 30s) to reconnect (same worker_id, either transport). If the
+    worker has not come back online by the time that window elapses, ALL of
+    its remaining jobs (queued and in-flight) are cancelled with an error,
+    and the worker is removed from the registry entirely.
+
+Run:
+    pip install fastapi "uvicorn[standard]" websockets
+    python proxy_server_multi.py
 """
 
 from __future__ import annotations
 
 import asyncio
-import gc
+import base64
+import binascii
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import os
-import shutil
-import subprocess
-import sys
-import threading
 import time
-import traceback
-from typing import Any, Dict, List, Optional, Set
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import uvicorn
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 # --------------------------------------------------------------------------- #
-# Step -1: consolidate Hugging Face's own cache into our tracked cache dir.
-#
-# Same fix as the multi-model reference: HF's default cache
-# (~/.cache/huggingface) lives on the same disk quota as everything else on
-# Kaggle. Point HF_HOME/HF_HUB_CACHE at our own cache dir *before*
-# huggingface_hub is imported (it reads these env vars once at import time),
-# and never pass local_dir=... to hf_hub_download, so there is only ever one
-# copy of each model blob on disk, and our eviction logic (LRU) can actually
-# find and free it.
-# --------------------------------------------------------------------------- #
-_DEFAULT_MODEL_CACHE_DIR = os.environ.get("MODEL_CACHE_DIR", "/tmp/gguf_models")
-os.environ.setdefault("HF_HOME", os.path.join(_DEFAULT_MODEL_CACHE_DIR, ".hf_cache"))
-os.environ.setdefault("HF_HUB_CACHE", os.path.join(_DEFAULT_MODEL_CACHE_DIR, ".hf_cache", "hub"))
-os.makedirs(os.environ["HF_HUB_CACHE"], exist_ok=True)
-
-
-def _pip_install(*packages: str, extra_index: Optional[str] = None, env: Optional[dict] = None) -> None:
-    cmd = [sys.executable, "-m", "pip", "install", "-q", "--upgrade", *packages]
-    if extra_index:
-        cmd += ["--extra-index-url", extra_index]
-    subprocess.run(cmd, check=True, env={**os.environ, **(env or {})})
-
-
-def ensure_base_dependencies() -> None:
-    needed = {
-        "websockets": "websockets",
-        "requests": "requests",
-        "huggingface_hub": "huggingface_hub",
-    }
-    for module_name, pip_name in needed.items():
-        try:
-            __import__(module_name)
-        except ImportError:
-            print(f"[worker] Installing missing dependency: {pip_name}")
-            _pip_install(pip_name)
-
-
-ensure_base_dependencies()
-
-import requests  # noqa: E402
-import websockets  # noqa: E402
-from huggingface_hub import hf_hub_download, hf_hub_url, get_hf_file_metadata  # noqa: E402
-
-# --------------------------------------------------------------------------- #
-# Step 1: configuration
-#
-# Single-model mode reads its target repo/file directly from environment
-# variables (set by the orchestrator/dashboard). Everything else
-# (VRAM/disk/transport tuning) still comes from a local JSON config file,
-# same as the reference script, so operators can tune it without touching
-# code.
+# Configuration
 # --------------------------------------------------------------------------- #
 
-CONFIG_PATH = os.environ.get("WORKER_CONFIG_PATH", "inference_server_config.json")
+CONFIG_PATH = os.environ.get("PROXY_CONFIG_PATH", "proxy_server_config.json")
+CONFIG_ENV_VAR = "PROXY_SERVER_CONFIG"
 
 DEFAULT_CONFIG = {
-    "model_cache_dir": _DEFAULT_MODEL_CACHE_DIR,
-    "default_generation": {"temperature": 0.8, "top_p": 0.95, "max_tokens": 512},
-    "transport": {
-        "prefer_websocket": True,
-        "ws_path": "/worker/ws",
-        "heartbeat_interval_seconds": 5,
-        "reconnect_initial_backoff_seconds": 2,
-        "reconnect_max_backoff_seconds": 60,
-        "ws_failure_threshold_before_poll_fallback": 3,
-        "poll_interval_seconds": 2,
-        "long_poll_wait_seconds": 40,
+    "host": "0.0.0.0",
+    "port": 8000,
+    "client_api_keys": ["sk-your-api-key-here"],
+    "worker_shared_secret": "change-me-worker-secret",
+    "max_queue_size_per_worker": 100,
+    "request_timeout_seconds": 300,
+    "long_poll_timeout_seconds": 40,
+    "job_delivery_ack_timeout_seconds": 15,
+    "worker_offline_after_seconds": 90,
+    "worker_reconnect_grace_seconds": 30,
+    "auth_timestamp_skew_seconds": 300,
+    "client_disconnect_check_interval_seconds": 1.0,
+    "websocket": {
+        "heartbeat_interval_seconds": 20,
+        "heartbeat_timeout_seconds": 60,
     },
-    "download": {"max_retries": 4, "retry_backoff_seconds": 5},
-    "disk_management": {
+    "retry": {
+        "max_job_retries": 1,
+    },
+    "routing": {
+        "prefer_least_busy_gpu": True,
+        "fallback_to_round_robin": True,
+    },
+    "logging": {
+        "level": "INFO",
+        "file": "proxy_server.log",
+    },
+    "dashboard": {
         "enabled": True,
-        "safety_margin_gb": 2,
-        "min_free_space_gb": 5,
-        "monitor_interval_seconds": 30,
+        "refresh_seconds": 5,
     },
-    "vram_management": {
-        "headroom_fraction": 0.05,
-        "min_n_ctx": 256,
-        "oom_shrink_factor": 0.75,
-        "max_oom_retries": 4,
-        "max_auto_n_ctx": 32768,
+    "cors": {
+        "enabled": True,
+        "allow_origins": ["*"],
     },
-    "backend_build": {
-        "prefer_prebuilt_wheel": True,
-        "cmake_cuda_args": "-DGGML_CUDA=on",
-    },
-    "gpu": {
-        "attempt_dual_gpu_split": True,
-        "n_ctx": "max",
-        "n_batch": 512,
-        "n_threads": 0,
-        "n_gpu_layers": -1,
-    },
-    "cancellation": {
-        # How long to wait for a subprocess to exit gracefully (SIGTERM)
-        # before escalating to SIGKILL when a job is cancelled.
-        "graceful_term_timeout_seconds": 2.0,
-    },
-    "logging": {"level": "INFO", "file": "/tmp/inference_server.log"},
 }
 
 
+def _merge_config(defaults: dict, overlay: dict) -> dict:
+    """Deep-merge `overlay` onto `defaults` (one level of nested dicts, which
+    is all this config shape uses), without mutating either input."""
+    merged = json.loads(json.dumps(defaults))
+    merged.update(overlay)
+    for k, v in defaults.items():
+        if isinstance(v, dict) and isinstance(overlay.get(k), dict):
+            merged[k] = {**v, **overlay[k]}
+    return merged
+
+
+def load_config_from_env(var_name: str, defaults: dict) -> Optional[dict]:
+    """If `var_name` is set, decode it as base64-encoded JSON and merge it
+    onto `defaults`. Returns None if the env var isn't set, so the caller
+    can fall back to file-based config. Raises a clear error if the env var
+    is set but malformed, rather than silently ignoring it."""
+    raw = os.environ.get(var_name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        decoded = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise RuntimeError(
+            f"Environment variable {var_name} is set but is not valid "
+            f"base64: {e}") from e
+    try:
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise RuntimeError(
+            f"Environment variable {var_name} decoded from base64 but is "
+            f"not valid JSON: {e}") from e
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"Environment variable {var_name} must decode to a JSON object, "
+            f"got {type(parsed).__name__}.")
+    print(f"[proxy_server_multi] Loaded config from ${var_name} "
+          f"(base64-encoded JSON env var); ignoring '{CONFIG_PATH}'.")
+    return _merge_config(defaults, parsed)
+
+
 def load_or_create_config(path: str, defaults: dict) -> dict:
-    abs_path = os.path.abspath(path)
+    """Load config with the following precedence:
+
+    1. PROXY_SERVER_CONFIG env var (base64-encoded JSON) if set -- no file
+       is read or written in this case.
+    2. JSON config file at `path`, backfilling any missing keys from
+       `defaults` without clobbering user edits.
+    3. If neither is present, write out a default config file to `path` and
+       use the defaults, same as before.
+    """
+    from_env = load_config_from_env(CONFIG_ENV_VAR, defaults)
+    if from_env is not None:
+        return from_env
+
     if not os.path.exists(path):
         with open(path, "w") as f:
             json.dump(defaults, f, indent=2)
-        print(f"[worker] No config found at '{abs_path}'. Created a default config there.")
+        print(f"[proxy_server_multi] No config found at '{path}' and "
+              f"${CONFIG_ENV_VAR} is not set. A default config has been "
+              f"created. Please review/edit it (API keys, secrets, ports) "
+              f"before exposing this server publicly.")
         return json.loads(json.dumps(defaults))
     with open(path, "r") as f:
         cfg = json.load(f)
-    merged = json.loads(json.dumps(defaults))
-    merged.update(cfg)
-    for k, v in defaults.items():
-        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-            merged[k] = {**v, **cfg[k]}
-    return merged
+    return _merge_config(defaults, cfg)
 
 
 CONFIG = load_or_create_config(CONFIG_PATH, DEFAULT_CONFIG)
 
-# --- Env-var overrides (these are what the orchestrator/dashboard sets) --- #
-TARGET_MODEL_REPO = os.environ.get("TARGET_MODEL_REPO")
-FILE_NAME = os.environ.get("FILE_NAME")
-PROXY_URL = os.environ.get("PROXY_URL", "http://0.0.0.0:8000")
-WORKER_ID = os.environ.get("WORKER_ID", "kaggle-worker-1")
-WORKER_SECRET = os.environ.get("WORKER_SECRET", "change-me-worker-secret")
-HUGGINGFACE_TOKEN = os.environ.get("HUGGINGFACE_TOKEN", "")
-WORKER_LOG_LEVEL = os.environ.get("WORKER_LOG_LEVEL", CONFIG["logging"].get("level", "INFO"))
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
 
-if not TARGET_MODEL_REPO or not FILE_NAME:
-    print("[worker] FATAL: TARGET_MODEL_REPO and FILE_NAME environment variables are required.")
-    sys.exit(1)
-
-TARGET_MODEL_ID = f"{TARGET_MODEL_REPO}/{FILE_NAME}"
-
-CONFIG["worker_id"] = WORKER_ID
-CONFIG["worker_shared_secret"] = WORKER_SECRET
-CONFIG["proxy_url"] = PROXY_URL
-CONFIG["huggingface_token"] = HUGGINGFACE_TOKEN
-CONFIG["logging"]["level"] = WORKER_LOG_LEVEL
-
-if CONFIG["model_cache_dir"] != _DEFAULT_MODEL_CACHE_DIR:
-    _hf_cache = os.path.join(CONFIG["model_cache_dir"], ".hf_cache", "hub")
-    os.makedirs(_hf_cache, exist_ok=True)
-    os.environ["HF_HUB_CACHE"] = _hf_cache
-    import huggingface_hub.constants as _hf_constants
-    _hf_constants.HF_HUB_CACHE = _hf_cache
-    _hf_constants.HUGGINGFACE_HUB_CACHE = _hf_cache
-
+log_level = getattr(logging, CONFIG["logging"].get("level", "INFO").upper(), logging.INFO)
 logging.basicConfig(
-    level=getattr(logging, CONFIG["logging"].get("level", "INFO").upper(), logging.INFO),
+    level=log_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler(CONFIG["logging"].get("file", "/tmp/inference_server.log"))],
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(CONFIG["logging"].get("file", "proxy_server.log")),
+    ],
 )
-logger = logging.getLogger("worker")
-
-os.makedirs(CONFIG["model_cache_dir"], exist_ok=True)
-
-logger.info("Starting inference server worker '%s' -> proxy %s (target model: %s)",
-            WORKER_ID, PROXY_URL, TARGET_MODEL_ID)
+logger = logging.getLogger("proxy_server_multi")
 
 # --------------------------------------------------------------------------- #
-# Step 2: GPU detection
+# Auth helpers
 # --------------------------------------------------------------------------- #
 
 
-def detect_gpus() -> int:
+def check_client_key(authorization: Optional[str]) -> None:
+    """Client -> Proxy auth: simple bearer token, like a real OpenAI API key."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail=openai_error(
+            "Missing or malformed Authorization header.", "invalid_request_error"))
+    token = authorization[len("Bearer "):].strip()
+    if token not in CONFIG["client_api_keys"]:
+        raise HTTPException(status_code=401, detail=openai_error(
+            "Invalid API key.", "invalid_request_error"))
+
+
+def make_worker_signature(worker_id: str, timestamp: str, secret: str) -> str:
+    msg = f"{worker_id}:{timestamp}".encode()
+    return hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def verify_worker_auth(worker_id: str, timestamp: str, signature: str) -> bool:
+    """Worker -> Proxy auth: HMAC over worker_id+timestamp with shared secret,
+    with a timestamp freshness check to reduce replay risk."""
     try:
-        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
-        if out.returncode == 0:
-            lines = [l for l in out.stdout.splitlines() if l.strip().startswith("GPU")]
-            if lines:
-                return len(lines)
-    except Exception:
-        pass
-    try:
-        import torch  # noqa
-        if torch.cuda.is_available():
-            return torch.cuda.device_count()
-    except Exception:
-        pass
-    return 0
-
-
-GPU_COUNT = detect_gpus()
-logger.info("Detected %d GPU(s).", GPU_COUNT)
-
-
-def query_gpu_memory() -> List[dict]:
-    """Per-GPU memory + utilization stats via nvidia-smi. [] if unavailable."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi",
-             "--query-gpu=index,memory.total,memory.used,memory.free,utilization.gpu",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10)
-        if out.returncode != 0:
-            return []
-        stats = []
-        for line in out.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) != 5:
-                continue
-            idx, total, used, free, util = parts
-            stats.append({
-                "index": int(idx),
-                "total_mb": int(total),
-                "used_mb": int(used),
-                "free_mb": int(free),
-                "utilization_percent": int(util),
-            })
-        return stats
-    except Exception as e:
-        logger.debug("nvidia-smi memory query failed: %s", e)
-        return []
-
-
-def aggregate_gpu_stats() -> dict:
-    """Summed/averaged GPU stats across all detected GPUs, for heartbeat
-    reporting. Returns zeros if no GPU is present or nvidia-smi is unavailable."""
-    stats = query_gpu_memory()
-    if not stats:
-        return {"total_mb": 0, "used_mb": 0, "free_mb": 0, "utilization_percent": 0}
-    total = sum(s["total_mb"] for s in stats)
-    used = sum(s["used_mb"] for s in stats)
-    free = sum(s["free_mb"] for s in stats)
-    avg_util = int(sum(s["utilization_percent"] for s in stats) / len(stats))
-    return {"total_mb": total, "used_mb": used, "free_mb": free, "utilization_percent": avg_util}
-
-
-class VramManager:
-    """Tracks free VRAM to size context windows and keep a safety headroom."""
-
-    def __init__(self, config: dict):
-        self.config = config
-
-    def relevant_gpu_indices(self) -> List[int]:
-        gpu_cfg = self.config.get("gpu", {})
-        if GPU_COUNT >= 2 and gpu_cfg.get("attempt_dual_gpu_split", True):
-            return list(range(GPU_COUNT))
-        elif GPU_COUNT >= 1:
-            return [0]
-        return []
-
-    def totals(self) -> Dict[str, int]:
-        indices = set(self.relevant_gpu_indices())
-        if not indices:
-            return {"total_bytes": 0, "free_bytes": 0, "used_bytes": 0}
-        stats = query_gpu_memory()
-        total = used = free = 0
-        for s in stats:
-            if s["index"] in indices:
-                total += s["total_mb"] * (1024 ** 2)
-                used += s["used_mb"] * (1024 ** 2)
-                free += s["free_mb"] * (1024 ** 2)
-        return {"total_bytes": total, "free_bytes": free, "used_bytes": used}
-
-    def headroom_bytes(self) -> int:
-        frac = self.config.get("vram_management", {}).get("headroom_fraction", 0.05)
-        return int(self.totals()["total_bytes"] * frac)
-
-    def usable_free_bytes(self) -> int:
-        totals = self.totals()
-        return max(totals["free_bytes"] - self.headroom_bytes(), 0)
-
-
-# --------------------------------------------------------------------------- #
-# Step 3: install/build the CUDA-enabled llama.cpp backend
-# --------------------------------------------------------------------------- #
-
-
-def _llama_cpp_has_gpu_support() -> bool:
-    """A successful `import llama_cpp` proves nothing about GPU support --
-    a CPU-only build imports fine too. Always verify via the actual
-    offload-support query before trusting an install."""
-    try:
-        import llama_cpp
-        return bool(llama_cpp.llama_supports_gpu_offload())
-    except Exception as e:
-        logger.debug("Could not query llama_cpp GPU offload support: %s", e)
+        ts = float(timestamp)
+    except (TypeError, ValueError):
         return False
+    skew = CONFIG.get("auth_timestamp_skew_seconds", 300)
+    if abs(time.time() - ts) > skew:
+        return False
+    expected = make_worker_signature(worker_id, timestamp, CONFIG["worker_shared_secret"])
+    return hmac.compare_digest(expected, signature or "")
 
 
-def ensure_llama_cpp_backend():
-    """Installs llama-cpp-python with CUDA support when a GPU is present.
-    Every install path is followed by an explicit GPU-offload check and
-    falls through to a more forceful strategy if that check fails --
-    `import` succeeding is never treated as "done" on its own, since pip can
-    silently fall back to a CPU-only source build if a CUDA wheel index
-    doesn't have a match for the resolved version."""
-    if GPU_COUNT == 0:
-        logger.info("No GPU detected; installing CPU-only llama-cpp-python.")
-        try:
-            import llama_cpp  # noqa
-            return
-        except ImportError:
-            pass
-        _pip_install("llama-cpp-python")
-        return
-
-    try:
-        import llama_cpp  # noqa
-        if _llama_cpp_has_gpu_support():
-            logger.info("llama-cpp-python already importable with CUDA support.")
-            return
-        logger.warning("llama-cpp-python is importable but was NOT built with CUDA "
-                        "support even though %d GPU(s) are present; reinstalling.", GPU_COUNT)
-    except ImportError:
-        pass
-
-    cfg = CONFIG["backend_build"]
-
-    if cfg.get("prefer_prebuilt_wheel", True):
-        try:
-            logger.info("Attempting prebuilt CUDA wheel for llama-cpp-python...")
-            _pip_install(
-                "llama-cpp-python", "--force-reinstall", "--no-cache-dir",
-                extra_index="https://abetlen.github.io/llama-cpp-python/whl/cu121",
-            )
-            if _llama_cpp_has_gpu_support():
-                logger.info("Installed prebuilt CUDA llama-cpp-python wheel (verified GPU offload).")
-                return
-            logger.warning("Prebuilt-wheel install completed but GPU offload is NOT available; "
-                            "trying an explicit CUDA source build instead.")
-        except Exception as e:
-            logger.warning("Prebuilt CUDA wheel install failed (%s); will try source build.", e)
-
-    try:
-        logger.info("Building llama-cpp-python from source with CUDA (%s)...",
-                    cfg.get("cmake_cuda_args"))
-        _pip_install(
-            "llama-cpp-python", "--force-reinstall", "--no-cache-dir",
-            env={"CMAKE_ARGS": cfg.get("cmake_cuda_args", "-DGGML_CUDA=on"),
-                 "FORCE_CMAKE": "1"},
-        )
-        if _llama_cpp_has_gpu_support():
-            logger.info("Built CUDA-enabled llama-cpp-python from source (verified GPU offload).")
-            return
-        logger.error("CUDA source build completed but GPU offload is still NOT available. "
-                     "Falling back to CPU-only inference.")
-    except Exception as e:
-        logger.error("CUDA source build failed (%s). Falling back to CPU-only llama-cpp-python.", e)
-
-    import llama_cpp  # noqa
-
-
-ensure_llama_cpp_backend()
-from llama_cpp import Llama  # noqa: E402
-
-# --------------------------------------------------------------------------- #
-# Step 4: disk cache manager (LRU eviction)
-#
-# Single-model mode still needs this: the target model has to be downloaded
-# (and old, no-longer-needed cached blobs from a previous target model run
-# in this same notebook instance may need to be evicted to make room), but
-# there is no "switch models while running" case anymore, so entries are
-# never protected mid-run except the one model currently loaded.
-# --------------------------------------------------------------------------- #
-
-
-class DiskCacheManager:
-    def __init__(self, cache_dir: str, config: dict):
-        self.cache_dir = cache_dir
-        self.config = config
-        self.metadata_path = os.path.join(cache_dir, "cache_metadata.json")
-        self._lock = threading.Lock()
-        self.entries: Dict[str, dict] = self._load_metadata()
-        self._reconcile_with_disk()
-
-    def _load_metadata(self) -> Dict[str, dict]:
-        if os.path.exists(self.metadata_path):
-            try:
-                with open(self.metadata_path, "r") as f:
-                    return json.load(f)
-            except Exception:
-                logger.warning("Could not read cache metadata at %s, starting fresh.",
-                                self.metadata_path)
-        return {}
-
-    def _save_metadata(self) -> None:
-        try:
-            tmp_path = self.metadata_path + ".tmp"
-            with open(tmp_path, "w") as f:
-                json.dump(self.entries, f, indent=2)
-            os.replace(tmp_path, self.metadata_path)
-        except Exception as e:
-            logger.warning("Could not persist cache metadata: %s", e)
-
-    def _reconcile_with_disk(self) -> None:
-        with self._lock:
-            missing = [k for k, v in self.entries.items()
-                       if not os.path.exists(v.get("path", ""))]
-            for k in missing:
-                del self.entries[k]
-            if missing:
-                self._save_metadata()
-
-    @staticmethod
-    def free_space_bytes(path: str) -> int:
-        return shutil.disk_usage(path).free
-
-    def touch(self, cache_key: str, local_path: str, size_bytes: int) -> None:
-        with self._lock:
-            self.entries[cache_key] = {
-                "path": local_path,
-                "size_bytes": size_bytes,
-                "last_used": time.time(),
-            }
-            self._save_metadata()
-
-    def remove(self, cache_key: str) -> None:
-        with self._lock:
-            entry = self.entries.pop(cache_key, None)
-            self._save_metadata()
-        if entry is None:
-            return
-        path = entry["path"]
-        real_path = os.path.realpath(path) if os.path.islink(path) else path
-        for p in {path, real_path}:
-            try:
-                if os.path.exists(p) or os.path.islink(p):
-                    os.remove(p)
-            except Exception as e:
-                logger.warning("Failed to remove cached file '%s' for '%s': %s", p, cache_key, e)
-        logger.info("Evicted cached model '%s' (%.2f GB) to free disk space.",
-                    cache_key, entry.get("size_bytes", 0) / (1024 ** 3))
-        parent = os.path.dirname(path)
-        try:
-            if os.path.isdir(parent) and not os.listdir(parent):
-                os.rmdir(parent)
-        except Exception:
-            pass
-
-    def ensure_space_for(self, required_bytes: int, protect_paths: Optional[Set[str]] = None) -> bool:
-        protect_paths = protect_paths or set()
-        disk_cfg = self.config.get("disk_management", {})
-        margin_bytes = int(disk_cfg.get("safety_margin_gb", 2) * (1024 ** 3))
-        target = required_bytes + margin_bytes
-
-        free = self.free_space_bytes(self.cache_dir)
-        if free >= target:
-            return True
-
-        logger.info("Low disk space: %.2f GB free, need %.2f GB. Evicting LRU cached models...",
-                    free / (1024 ** 3), target / (1024 ** 3))
-
-        with self._lock:
-            candidates = sorted(
-                (k for k, v in self.entries.items() if v.get("path") not in protect_paths),
-                key=lambda k: self.entries[k]["last_used"],
-            )
-
-        for cache_key in candidates:
-            if free >= target:
-                break
-            self.remove(cache_key)
-            free = self.free_space_bytes(self.cache_dir)
-
-        if free < target:
-            logger.warning(
-                "Only %.2f GB free after evicting everything evictable (%.2f GB requested "
-                "including margin). Proceeding only if the raw file itself still fits.",
-                free / (1024 ** 3), target / (1024 ** 3))
-            return free >= required_bytes
-        return True
-
-
-# --------------------------------------------------------------------------- #
-# Step 5: GGUF header introspection (for VRAM/KV-cache estimation)
-# --------------------------------------------------------------------------- #
-
-
-def probe_gguf_hyperparams(model_path: str) -> Optional[dict]:
-    try:
-        probe = Llama(model_path=model_path, vocab_only=True, n_ctx=8,
-                       n_gpu_layers=0, verbose=False)
-    except Exception as e:
-        logger.warning("Could not probe GGUF header for %s: %s", model_path, e)
-        return None
-    try:
-        meta = getattr(probe, "metadata", {}) or {}
-
-        def meta_int(*keys):
-            for k in keys:
-                v = meta.get(k)
-                if v is not None:
-                    try:
-                        return int(v)
-                    except (TypeError, ValueError):
-                        continue
-            return None
-
-        arch = meta.get("general.architecture", "")
-        n_layer = meta_int(f"{arch}.block_count")
-        n_embd = meta_int(f"{arch}.embedding_length")
-        n_head = meta_int(f"{arch}.attention.head_count")
-        n_head_kv = meta_int(f"{arch}.attention.head_count_kv") or n_head
-        n_ctx_train = meta_int(f"{arch}.context_length")
-
-        if not n_ctx_train:
-            try:
-                n_ctx_train = probe.n_ctx_train()
-            except Exception:
-                pass
-
-        if not n_layer or not n_embd or not n_head:
-            logger.info("GGUF header for %s didn't expose full hyperparameters "
-                        "(arch=%r); using a coarser VRAM estimate.", model_path, arch)
-            return None
-
-        return {
-            "architecture": arch,
-            "n_layer": n_layer,
-            "n_embd": n_embd,
-            "n_head": n_head,
-            "n_head_kv": n_head_kv,
-            "n_ctx_train": n_ctx_train,
+def openai_error(message: str, err_type: str = "server_error", code: Optional[str] = None,
+                  status: Optional[int] = None) -> dict:
+    return {
+        "error": {
+            "message": message,
+            "type": err_type,
+            "param": None,
+            "code": code,
         }
-    except Exception as e:
-        logger.warning("Failed to parse GGUF header metadata for %s: %s", model_path, e)
-        return None
-    finally:
-        del probe
-        gc.collect()
-
-
-def estimate_kv_bytes_per_token(hyper: dict, kv_dtype_bytes: int = 2) -> int:
-    n_layer = hyper["n_layer"]
-    n_embd = hyper["n_embd"]
-    n_head = hyper["n_head"]
-    n_head_kv = hyper.get("n_head_kv") or n_head
-    head_dim = n_embd / n_head
-    kv_embd = head_dim * n_head_kv
-    return int(n_layer * kv_embd * 2 * kv_dtype_bytes)
-
-
-def resolve_desired_n_ctx(configured: Any, hyper: Optional[dict],
-                           fallback_max: int = 32768) -> int:
-    if isinstance(configured, str) and configured.strip().lower() == "max":
-        if hyper and hyper.get("n_ctx_train"):
-            return int(hyper["n_ctx_train"])
-        logger.info("Could not read the model's trained max context from its GGUF header; "
-                    "falling back to n_ctx=%d before VRAM sizing.", fallback_max)
-        return fallback_max
-    return int(configured)
-
-
-def compute_dynamic_n_ctx(model_path: str, desired_n_ctx: int, n_gpu_layers: int,
-                           n_batch: int, vram: VramManager, config: dict,
-                           hyper: Optional[dict] = None) -> int:
-    if not vram.relevant_gpu_indices():
-        return desired_n_ctx
-
-    vram_cfg = config.get("vram_management", {})
-    min_ctx = vram_cfg.get("min_n_ctx", 256)
-
-    if hyper is None:
-        hyper = probe_gguf_hyperparams(model_path)
-    usable_free = vram.usable_free_bytes()
-    file_size = os.path.getsize(model_path)
-
-    if hyper:
-        n_layer = hyper["n_layer"]
-        gpu_layers_used = n_layer if n_gpu_layers < 0 else min(n_gpu_layers, n_layer)
-        weight_bytes = int(file_size * (gpu_layers_used / n_layer)) if n_layer else file_size
-        kv_per_token = estimate_kv_bytes_per_token(hyper)
-        n_ctx_cap = hyper.get("n_ctx_train") or desired_n_ctx
-    else:
-        weight_bytes = file_size
-        kv_per_token = 128 * 1024
-        n_ctx_cap = desired_n_ctx
-
-    flat_overhead = max(512 * 1024 ** 2, n_batch * 1024 * 1024)
-    per_token_compute_overhead = 2 * 1024  # ~2KB/token, conservative estimate
-    available_for_kv = usable_free - weight_bytes - flat_overhead
-
-    if available_for_kv <= 0:
-        max_ctx_by_vram = 0
-    else:
-        max_ctx_by_vram = int(available_for_kv // max(kv_per_token + per_token_compute_overhead, 1))
-
-    final_ctx = min(desired_n_ctx, n_ctx_cap or desired_n_ctx)
-
-    max_auto_n_ctx = vram_cfg.get("max_auto_n_ctx")
-    if max_auto_n_ctx:
-        final_ctx = min(final_ctx, int(max_auto_n_ctx))
-
-    if max_ctx_by_vram > 0:
-        final_ctx = min(final_ctx, max_ctx_by_vram)
-    else:
-        final_ctx = min(final_ctx, min_ctx)
-    final_ctx = max(final_ctx, min_ctx)
-
-    if final_ctx < desired_n_ctx:
-        logger.info(
-            "Sizing context for VRAM/safety headroom: requested n_ctx=%d, using n_ctx=%d "
-            "(usable free VRAM=%.2f GB, est. weight VRAM=%.2f GB, est. KV/token=%d bytes).",
-            desired_n_ctx, final_ctx, usable_free / (1024 ** 3),
-            weight_bytes / (1024 ** 3), kv_per_token)
-    return final_ctx
-
-
-def is_cuda_oom_error(e: Exception) -> bool:
-    msg = str(e).lower()
-    return "out of memory" in msg or ("cuda" in msg and "memory" in msg)
-
-
-# --------------------------------------------------------------------------- #
-# Step 6: single-model manager (download/load ONE model at startup)
-#
-# No `ensure_loaded(alias)` / model-switching here. `load_startup_model()`
-# resolves + downloads + probe-loads the target model exactly once, to
-# determine the final n_ctx/n_gpu_layers/tensor_split settings. Actual
-# inference then runs on a single persistent CHILD PROCESS (see
-# PersistentRunner below) that loads the model once and serves jobs one
-# at a time, so a stuck/orphaned job can be hard-killed (and the process
-# respawned) without reloading the model on every normal request.
-# --------------------------------------------------------------------------- #
-
-
-class ModelManager:
-    def __init__(self, config: dict, target_repo: str, file_name: str):
-        self.config = config
-        self.target_repo = target_repo
-        self.file_name = file_name
-        self.target_model_id = f"{target_repo}/{file_name}"
-        self.cache_dir = config["model_cache_dir"]
-        self.current_local_path: Optional[str] = None
-        self.status: str = "loading_model"  # "loading_model" | "idle" | "busy"
-        self.disk_cache = DiskCacheManager(self.cache_dir, config)
-        self.vram = VramManager(config)
-        self._load_lock = threading.Lock()
-
-        # Resolved load parameters, computed once in load_startup_model()
-        # and then reused whenever PersistentRunner (re)spawns its
-        # subprocess. n_ctx is also what gets reported on the dashboard
-        # via heartbeat.
-        self.n_ctx: Optional[int] = None
-        self.n_gpu_layers: Optional[int] = None
-        self.n_batch: Optional[int] = None
-        self.n_threads: Optional[int] = None
-        self.tensor_split: Optional[List[float]] = None
-
-    def _remote_file_size(self, repo: str, filename: str, token: Optional[str]) -> Optional[int]:
-        try:
-            url = hf_hub_url(repo_id=repo, filename=filename)
-            meta = get_hf_file_metadata(url, token=token)
-            return getattr(meta, "size", None)
-        except Exception as e:
-            logger.warning("Could not fetch remote size for %s/%s: %s", repo, filename, e)
-            return None
-
-    def _resolve_local_path(self) -> str:
-        repo = self.target_repo
-        filename = self.file_name
-        cache_key = f"{repo}/{filename}"
-        token = self.config.get("huggingface_token") or None
-
-        dl_cfg = self.config.get("download", {})
-        max_retries = dl_cfg.get("max_retries", 4)
-        backoff = dl_cfg.get("retry_backoff_seconds", 5)
-
-        already_cached = cache_key in self.disk_cache.entries and             os.path.exists(self.disk_cache.entries[cache_key]["path"])
-        if not already_cached:
-            disk_cfg = self.config.get("disk_management", {})
-            if disk_cfg.get("enabled", True):
-                remote_size = self._remote_file_size(repo, filename, token)
-                if remote_size:
-                    ok = self.disk_cache.ensure_space_for(remote_size)
-                    if not ok:
-                        free_gb = self.disk_cache.free_space_bytes(self.cache_dir) / (1024 ** 3)
-                        raise RuntimeError(
-                            f"Not enough disk space to download '{self.target_model_id}' "
-                            f"({remote_size / (1024 ** 3):.2f} GB needed, only "
-                            f"{free_gb:.2f} GB free even after evicting all evictable cached models).")
-                else:
-                    logger.info("Proceeding without a pre-download space check for '%s' "
-                                "(remote size unknown).", self.target_model_id)
-
-        last_err = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                logger.info("Resolving '%s' from %s (attempt %d/%d)...", filename, repo, attempt, max_retries)
-                path = hf_hub_download(repo_id=repo, filename=filename, cache_dir=self.cache_dir, token=token)
-                logger.info("Model resolved at %s", path)
-                size = os.path.getsize(path)
-                self.disk_cache.touch(cache_key, path, size)
-                return path
-            except Exception as e:
-                last_err = e
-                logger.warning("Download attempt %d failed: %s", attempt, e)
-                disk_cfg = self.config.get("disk_management", {})
-                if disk_cfg.get("enabled", True):
-                    remote_size = self._remote_file_size(repo, filename, token)
-                    if remote_size:
-                        self.disk_cache.ensure_space_for(remote_size)
-                time.sleep(backoff * attempt)
-        raise RuntimeError(f"Failed to download model '{self.target_model_id}' after {max_retries} attempts: {last_err}")
-
-    def _try_load_probe(self, n_ctx: int, n_gpu_layers: int, n_batch: int,
-                         n_threads: int, attempt_dual: bool) -> None:
-        """Loads the model in-process JUST to validate that these settings
-        actually work (VRAM fits, no OOM), then immediately releases it.
-        The real inference calls happen in a persistent child process via
-        PersistentRunner,
-        which re-load the model fresh every job -- this probe only exists
-        to run the existing OOM-shrink retry loop once at startup instead
-        of duplicating that logic in every child process."""
-        kwargs = dict(
-            model_path=self.current_local_path,
-            n_ctx=n_ctx,
-            n_batch=n_batch,
-            n_threads=n_threads,
-            n_gpu_layers=n_gpu_layers,
-            verbose=False,
-        )
-        llm = None
-        try:
-            if attempt_dual:
-                try:
-                    split = [1.0 / GPU_COUNT] * GPU_COUNT
-                    llm = Llama(tensor_split=split, **kwargs)
-                    self.tensor_split = split
-                except Exception as e:
-                    if is_cuda_oom_error(e):
-                        raise
-                    logger.warning("Dual-GPU split failed/did not help (%s); falling back.", e)
-                    llm = Llama(**kwargs)
-                    self.tensor_split = None
-            else:
-                llm = Llama(**kwargs)
-                self.tensor_split = None
-        finally:
-            if llm is not None:
-                del llm
-                gc.collect()
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
-
-    def load_startup_model(self) -> None:
-        """
-        Downloads (if needed) the target model and PROBES that it loads
-        successfully with some (n_ctx, n_gpu_layers, ...) configuration,
-        handling VRAM constraints, OOM errors, and gracefully degrading
-        context size along the way. The resolved settings are stored on
-        self (n_ctx, n_gpu_layers, n_batch, n_threads, tensor_split) and
-        reused whenever PersistentRunner (re)spawns its subprocess -- there
-        is no persistent in-process Llama object anymore; instead a single
-        long-lived, killable child process handles all inference calls.
-        """
-        with self._load_lock:
-            self.status = "loading_model"
-            model_path = self._resolve_local_path()
-            self.current_local_path = model_path
-
-            gpu_cfg = self.config.get("gpu", {})
-            configured_n_ctx = gpu_cfg.get("n_ctx", "max")
-            n_gpu_layers = gpu_cfg.get("n_gpu_layers", -1) if GPU_COUNT > 0 else 0
-            n_batch = gpu_cfg.get("n_batch", 512)
-            n_threads = gpu_cfg.get("n_threads", 0) or os.cpu_count() or 4
-
-            # Probe GGUF metadata
-            hyper = probe_gguf_hyperparams(model_path)
-            desired_n_ctx = resolve_desired_n_ctx(configured_n_ctx, hyper)
-
-            logger.info(
-                "Context resolution for '%s': configured n_ctx=%r, GGUF n_ctx_train=%s, "
-                "resolved desired_n_ctx=%d (before VRAM/safety shrinking).",
-                self.target_model_id, configured_n_ctx,
-                hyper.get("n_ctx_train") if hyper else "unknown", desired_n_ctx)
-            if hyper:
-                logger.info("GGUF header: n_ctx_train=%s, n_layer=%s, n_embd=%s",
-                            hyper.get("n_ctx_train"), hyper.get("n_layer"), hyper.get("n_embd"))
-
-            # Compute initial context size with VRAM constraints
-            n_ctx = desired_n_ctx
-            if GPU_COUNT > 0:
-                n_ctx = compute_dynamic_n_ctx(model_path, desired_n_ctx, n_gpu_layers,
-                                            n_batch, self.vram, self.config, hyper=hyper)
-
-            # GPU split configuration
-            attempt_dual = GPU_COUNT >= 2 and gpu_cfg.get("attempt_dual_gpu_split", True)
-
-            # VRAM management: be conservative on small GPUs
-            vram_cfg = self.config.get("vram_management", {})
-            total_vram_mb = self.vram.usable_free_bytes()/1024/1024
-
-            # Adjust shrink factor and min context based on available VRAM
-            if total_vram_mb < 4096:  # Less than 4GB
-                shrink_factor = vram_cfg.get("oom_shrink_factor", 0.6)  # More aggressive
-                min_ctx = vram_cfg.get("min_n_ctx", 128)  # Lower floor
-            else:
-                shrink_factor = vram_cfg.get("oom_shrink_factor", 0.75)
-                min_ctx = vram_cfg.get("min_n_ctx", 256)
-
-            max_retries = vram_cfg.get("max_oom_retries", 6)  # More retries for safety
-
-            # **Preemptive sizing**: If we detect we're pushing it, start lower
-            if GPU_COUNT > 0 and n_ctx > 8192 and total_vram_mb < 6000:
-                preemptive_n_ctx = max(min_ctx, int(n_ctx * 0.5))
-                logger.warning(
-                    "Preemptive context reduction: starting with n_ctx=%d (was %d) "
-                    "due to low VRAM (%.1f GB available). Attempting dual_gpu=%s",
-                    preemptive_n_ctx, n_ctx, total_vram_mb / 1024, attempt_dual)
-                n_ctx = preemptive_n_ctx
-
-            attempts = 0
-            last_exception = None
-
-            while True:
-                attempts += 1
-                try:
-                    logger.info("Probe-loading '%s' (attempt %d/%d, n_ctx=%d, n_gpu_layers=%s)...",
-                                self.target_model_id, attempts, max_retries + 1,
-                                n_ctx, n_gpu_layers)
-
-                    self._try_load_probe(n_ctx, n_gpu_layers, n_batch, n_threads, attempt_dual)
-
-                    # Success! Store resolved settings for per-job runners.
-                    self.n_ctx = n_ctx
-                    self.n_gpu_layers = n_gpu_layers
-                    self.n_batch = n_batch
-                    self.n_threads = n_threads
-                    self.status = "idle"
-                    gpu_stats = aggregate_gpu_stats()
-                    logger.info("✓ Verified '%s' loads with n_ctx=%d. GPU: %.1f/%.1f GB used "
-                                "(probe released; per-job runner processes will reload as needed).",
-                                self.target_model_id, n_ctx,
-                                gpu_stats["used_mb"] / 1024, gpu_stats["total_mb"] / 1024)
-                    return
-
-                except Exception as e:
-                    last_exception = e
-                    error_str = str(e).lower()
-                    is_oom = is_cuda_oom_error(e) or "context" in error_str or "memory" in error_str
-
-                    logger.error("Load attempt %d/%d failed: %s", attempts, max_retries + 1, type(e).__name__)
-
-                    # **Condition 1: Max retries exceeded**
-                    if attempts >= max_retries + 1:
-                        logger.error("✗ Exceeded max retries (%d). Giving up.", max_retries + 1)
-                        self.status = "failed"
-                        raise RuntimeError(
-                            f"Failed to load model after {max_retries + 1} attempts. "
-                            f"Last error: {e}") from e
-
-                    # **Condition 2: Non-OOM error (can't recover)**
-                    if not is_oom:
-                        logger.error("✗ Non-recoverable error: %s", e)
-                        self.status = "failed"
-                        raise RuntimeError(f"Failed to load model (non-recoverable): {e}") from e
-
-                    # **Condition 3: Already at minimum context**
-                    if n_ctx <= min_ctx:
-                        logger.error("✗ Reached minimum context (n_ctx=%d). Cannot shrink further.", min_ctx)
-                        self.status = "failed"
-                        raise RuntimeError(
-                            f"OOM even at minimum context (n_ctx={min_ctx}). "
-                            f"GPU may be insufficient for this model. "
-                            f"Try: reduce n_gpu_layers, lower min_n_ctx, or use a smaller model.") from e
-
-                    # **Recoverable OOM: Shrink and retry**
-                    new_ctx = max(min_ctx, int(n_ctx * shrink_factor))
-                    logger.warning(
-                        "OOM at n_ctx=%d. Shrinking to n_ctx=%d (%.0f%%) and retrying (%d/%d)...",
-                        n_ctx, new_ctx, (new_ctx / n_ctx) * 100, attempts, max_retries + 1)
-
-                    # Clear GPU cache aggressively
-                    self._clear_gpu_memory()
-                    time.sleep(0.5)
-
-                    n_ctx = new_ctx
-
-    @staticmethod
-    def _clear_gpu_memory():
-        """Clear GPU memory caches across different libraries."""
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                logger.debug("Cleared PyTorch GPU cache")
-        except Exception as e:
-            logger.debug("PyTorch cache clear failed: %s", e)
-
-        try:
-            import cupy as cp
-            cp.get_default_memory_pool().free_all_blocks()
-            logger.debug("Cleared CuPy GPU cache")
-        except Exception as e:
-            logger.debug("CuPy cache clear failed: %s", e)
-
-    def unload(self):
-        """Called once, on shutdown. No persistent in-process model to
-        release (the persistent runner subprocess cleans up its own GPU
-        memory on exit), but we still clear whatever cache we can from
-        this process."""
-        gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-
-MODELS = ModelManager(CONFIG, TARGET_MODEL_REPO, FILE_NAME)
-
-# Path to the child-process entrypoint script, expected alongside this file.
-_RUNNER_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inference_runner_proc.py")
-
-
-class PersistentRunner:
-    """Owns ONE long-lived subprocess running inference_runner_proc.py, which
-    loads the model once and then serves jobs one at a time in a loop. This
-    is what avoids paying a multi-GB model reload on every single request:
-    the same warm process is reused across jobs, and is only killed +
-    respawned when a job actually needs to be force-cancelled (client
-    disconnected / proxy-side request_timeout_seconds elapsed) -- the NEXT
-    job after that pays one reload, but every other job doesn't.
-
-    Only one job may run at a time (job_lock), matching the underlying
-    single GGUF execution context -- this mirrors the previous in-process
-    behavior, just routed through a killable subprocess instead of a
-    killable-in-name-only blocking call.
-    """
-
-    def __init__(self):
-        self.proc: Optional[subprocess.Popen] = None
-        self._current_job_id: Optional[str] = None
-        self._kill_flag = False
-        self._state_lock = threading.Lock()   # guards proc/_current_job_id/_kill_flag
-        self.job_lock = threading.Lock()       # serializes job execution (one at a time)
-
-    def start(self) -> None:
-        """(Re)spawns the subprocess and blocks until it reports the model
-        loaded (or failed to load). Raises RuntimeError on load failure."""
-        with self._state_lock:
-            self.proc = subprocess.Popen(
-                [sys.executable, _RUNNER_SCRIPT_PATH],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-            self._kill_flag = False
-            self._current_job_id = None
-            proc = self.proc
-
-        load_req = {
-            "type": "load",
-            "model_path": MODELS.current_local_path,
-            "n_ctx": MODELS.n_ctx,
-            "n_batch": MODELS.n_batch,
-            "n_threads": MODELS.n_threads,
-            "n_gpu_layers": MODELS.n_gpu_layers,
-            "tensor_split": MODELS.tensor_split,
-        }
-        assert proc.stdin is not None and proc.stdout is not None
-        proc.stdin.write(json.dumps(load_req) + "\n")
-        proc.stdin.flush()
-
-        line = proc.stdout.readline()
-        if not line:
-            stderr_tail = proc.stderr.read()[-2000:] if proc.stderr else ""
-            raise RuntimeError(f"Runner subprocess exited during model load. stderr: {stderr_tail}")
-        event = json.loads(line)
-        if event.get("type") == "load_error":
-            raise RuntimeError(f"Runner subprocess failed to load model: {event.get('error')}")
-        if event.get("type") != "loaded":
-            raise RuntimeError(f"Runner subprocess sent unexpected startup event: {event}")
-        logger.info("Persistent runner subprocess loaded and ready (pid=%s).", proc.pid)
-
-    def _teardown(self, reason: str) -> None:
-        """Hard-kill the current subprocess (SIGTERM then SIGKILL). Safe to
-        call even if it's already dead."""
-        with self._state_lock:
-            proc = self.proc
-            self.proc = None
-        if proc is None:
-            return
-        logger.warning("Killing runner subprocess (%s): pid=%s", reason, proc.pid)
-        graceful_timeout = CONFIG.get("cancellation", {}).get("graceful_term_timeout_seconds", 2.0)
-        try:
-            proc.terminate()
-            try:
-                proc.wait(timeout=graceful_timeout)
-            except subprocess.TimeoutExpired:
-                logger.warning("Runner subprocess did not exit after SIGTERM; sending SIGKILL.")
-                proc.kill()
-                proc.wait(timeout=5)
-        except Exception as e:
-            logger.warning("Error while killing runner subprocess: %s", e)
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-    def cancel_current_job(self, job_id: str) -> bool:
-        """Called from a different thread than the one running run_job().
-        Kills the subprocess right away if it's currently working on
-        job_id. The thread blocked in run_job() will observe the pipe
-        closing and return a cancellation error; a fresh subprocess is
-        spawned lazily before the NEXT job starts, so this call itself
-        does not block on a reload."""
-        with self._state_lock:
-            if self._current_job_id != job_id or self.proc is None:
-                return False
-            self._kill_flag = True
-        self._teardown(reason=f"cancelled job {job_id}")
-        return True
-
-    def run_job(self, job_id: str, job_dict: dict, on_token=None) -> dict:
-        """Runs exactly one job on the persistent subprocess, blocking until
-        it completes, errors, or is cancelled. If the subprocess isn't
-        currently alive (first call, or a previous cancel killed it), it is
-        (re)spawned first -- this is the only point where job latency can
-        include a model-load cost, and only for the job immediately
-        following a cancellation.
-
-        Returns {"result": {...}} or {"error": "..."}. Streaming jobs also
-        invoke on_token(delta, finish_reason) as tokens arrive.
-        """
-        with self.job_lock:
-            with self._state_lock:
-                need_start = self.proc is None
-            if need_start:
-                try:
-                    self.start()
-                except Exception as e:
-                    return {"error": f"model_load_failed: {e}"}
-
-            with self._state_lock:
-                self._current_job_id = job_id
-                self._kill_flag = False
-                proc = self.proc
-
-            if proc is None:
-                return {"error": "model_load_failed: runner process unavailable"}
-
-            try:
-                assert proc.stdin is not None and proc.stdout is not None
-                proc.stdin.write(json.dumps({"type": "job", "job_id": job_id, "job": job_dict}) + "\n")
-                proc.stdin.flush()
-            except Exception as e:
-                with self._state_lock:
-                    was_killed = self._kill_flag
-                if was_killed:
-                    return {"error": "cancelled: job was cancelled (client disconnected or request timed out)"}
-                return {"error": f"inference_error: failed to send job to runner: {e}"}
-
-            result: Optional[dict] = None
-            error: Optional[str] = None
-            try:
-                for raw_line in proc.stdout:
-                    raw_line = raw_line.strip()
-                    if not raw_line:
-                        continue
-                    event = json.loads(raw_line)
-                    etype = event.get("type")
-                    if etype == "token" and on_token is not None:
-                        on_token(event.get("delta", "") or "", event.get("finish_reason"))
-                    elif etype == "done":
-                        result = event.get("result", {})
-                        break
-                    elif etype == "error":
-                        error = event.get("error")
-                        break
-                else:
-                    # EOF without a done/error event -- either we killed it
-                    # (cancellation) or it crashed unexpectedly.
-                    pass
-            except Exception as e:
-                error = f"lost connection to runner subprocess: {e}"
-            finally:
-                with self._state_lock:
-                    self._current_job_id = None
-                    was_killed = self._kill_flag
-
-            if was_killed:
-                return {"error": "cancelled: job was cancelled (client disconnected or request timed out)"}
-
-            if result is not None:
-                return {"result": result}
-            if error is not None:
-                return {"error": f"inference_error: {error}"}
-
-            # Subprocess died without reporting anything and we didn't kill
-            # it ourselves -- treat as a crash, tear down so the next job
-            # gets a fresh (working) process instead of reusing a dead pipe.
-            logger.error("Runner subprocess for job %s exited unexpectedly with no result.", job_id)
-            self._teardown(reason="crashed")
-            return {"error": "inference_error: runner process crashed unexpectedly"}
-
-
-RUNNER = PersistentRunner()
-
-
-def cancel_job(job_id: str) -> bool:
-    """Entrypoint used by the WS/long-poll message handler when the proxy
-    signals that a job's result is no longer wanted (client disconnected,
-    or the proxy's request_timeout_seconds elapsed). Hard-kills the
-    persistent runner subprocess if it is currently working on job_id, so
-    the GPU is freed immediately instead of finishing an orphaned
-    generation that would otherwise block every job queued behind it. The
-    subprocess is respawned (paying one model-load) lazily on the next job."""
-    found = RUNNER.cancel_current_job(job_id)
-    if found:
-        logger.info("Cancelled job %s on request from proxy (subprocess killed).", job_id)
-    else:
-        logger.info("Cancel request for job %s ignored (not currently running here).", job_id)
-    return found
-
-
-
-async def disk_monitor_loop():
-    """Periodically evicts LRU cached models (other than the currently
-    loaded one's backing file) if free space drops below the configured
-    minimum."""
-    disk_cfg = CONFIG.get("disk_management", {})
-    if not disk_cfg.get("enabled", True):
-        return
-    interval = disk_cfg.get("monitor_interval_seconds", 30)
-    min_free_bytes = int(disk_cfg.get("min_free_space_gb", 5) * (1024 ** 3))
-    loop = asyncio.get_event_loop()
-
-    def _check_and_evict() -> None:
-        free = MODELS.disk_cache.free_space_bytes(MODELS.cache_dir)
-        if free < min_free_bytes:
-            protect = {MODELS.current_local_path} if MODELS.current_local_path else set()
-            logger.info("Disk monitor: %.2f GB free < %.2f GB minimum; evicting LRU cached models.",
-                        free / (1024 ** 3), min_free_bytes / (1024 ** 3))
-            MODELS.disk_cache.ensure_space_for(min_free_bytes, protect_paths=protect)
-
-    while True:
-        await asyncio.sleep(interval)
-        try:
-            # free_space_bytes() alone is normally a cheap syscall, but
-            # ensure_space_for() can synchronously os.remove() multi-GB
-            # cached model files and rewrite cache metadata under a lock.
-            # Both are pushed to the executor so a slow/networked disk
-            # can never stall the event loop that also owns the worker's
-            # WebSocket connection (a stall here reads as a missed
-            # ping/pong and kills the connection with "keepalive ping
-            # timeout", exactly like the earlier nvidia-smi issue).
-            await loop.run_in_executor(None, _check_and_evict)
-        except Exception as e:
-            logger.warning("Disk monitor loop error: %s", e)
-
-# --------------------------------------------------------------------------- #
-# Step 7: inference execution
-#
-# Both run_inference() and run_inference_streaming() delegate to the single
-# persistent RUNNER (a long-lived subprocess) instead of calling a Llama
-# object in-process. This is what enables hard cancellation: cancel_job()
-# (defined above, next to PersistentRunner) can kill that subprocess at any
-# point during execution, immediately freeing the GPU instead of letting an
-# orphaned generation run to completion and block every job queued behind
-# it.
-# --------------------------------------------------------------------------- #
-
-
-def build_chat_prompt_messages(messages: list) -> list:
-    return [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages]
-
-
-def build_gen_kwargs(payload: dict) -> dict:
-    params = payload.get("params", {})
-    defaults = CONFIG.get("default_generation", {})
-    gen_kwargs = dict(
-        temperature=params.get("temperature", defaults.get("temperature", 0.8)),
-        top_p=params.get("top_p", defaults.get("top_p", 0.95)),
-        max_tokens=params.get("max_tokens", defaults.get("max_tokens", 512)),
-        stop=params.get("stop"),
-        presence_penalty=params.get("presence_penalty", 0.0),
-        frequency_penalty=params.get("frequency_penalty", 0.0),
-    )
-    if params.get("seed") is not None:
-        gen_kwargs["seed"] = params["seed"]
-    return gen_kwargs
-
-
-def _build_runner_job_dict(payload: dict, gen_kwargs: dict) -> dict:
-    """Flattens payload + gen_kwargs into the shape inference_runner_proc.py
-    expects for its "job" field (see that script's docstring)."""
-    job = {
-        "kind": payload["kind"],
-        "stream": bool(payload.get("stream", False)),
-        **gen_kwargs,
     }
-    if payload["kind"] == "chat":
-        job["messages"] = build_chat_prompt_messages(payload["messages"])
-    else:
-        job["prompt"] = payload["prompt"]
-    return job
-
-
-def run_inference(payload: dict, job_id: str) -> dict:
-    """Non-streaming path: blocking, called via run_in_executor. Runs on the
-    persistent runner subprocess, which can be hard-killed by cancel_job()
-    if a cancel arrives (client disconnected / job timed out on the proxy)
-    before it finishes."""
-    requested_model = str(payload.get("model", MODELS.target_model_id))
-    allowed_models = {MODELS.target_model_id, MODELS.target_repo, MODELS.file_name}
-    if requested_model not in allowed_models:
-        return {"error": f"model_not_available: this worker only serves '{MODELS.target_model_id}' "
-                          f"(requested '{requested_model}')"}
-
-    if MODELS.current_local_path is None or MODELS.n_ctx is None:
-        return {"error": "model_load_failed: model is not loaded"}
-
-    gen_kwargs = build_gen_kwargs(payload)
-    job_dict = _build_runner_job_dict(payload, gen_kwargs)
-
-    MODELS.status = "busy"
-    start = time.time()
-    try:
-        outcome = RUNNER.run_job(job_id, job_dict)
-        if "error" in outcome:
-            if not outcome["error"].startswith("cancelled:"):
-                logger.error("Job %s failed: %s", job_id, outcome["error"])
-            return outcome
-
-        result = outcome["result"]
-        elapsed = time.time() - start
-        usage = result.get("usage", {})
-        logger.info("Job %s for '%s' completed in %.2fs (completion_tokens=%s).",
-                    job_id, requested_model, elapsed, usage.get("completion_tokens"))
-        return {"result": result}
-    except Exception as e:
-        logger.error("Unexpected error running job %s: %s\n%s", job_id, e, traceback.format_exc())
-        return {"error": f"inference_error: {e}"}
-    finally:
-        MODELS.status = "idle"
-
-
-def run_inference_streaming(payload: dict, job_id: str, on_token):
-    """Token-by-token streaming path (blocking; run in a background thread).
-    Calls on_token(delta_text, finish_reason) as tokens are produced by the
-    persistent runner subprocess. If the job is cancelled mid-stream, that
-    subprocess is killed and this function raises so the caller can surface
-    an error to the (still-connected, if any) SSE consumer; if nobody is
-    listening anymore that's fine too -- the point of killing is to free
-    the GPU immediately regardless of who's still watching."""
-    requested_model = str(payload.get("model", MODELS.target_model_id))
-    allowed_models = {MODELS.target_model_id, MODELS.target_repo, MODELS.file_name}
-    if requested_model not in allowed_models:
-        raise RuntimeError(f"model_not_available: this worker only serves '{MODELS.target_model_id}'")
-    if MODELS.current_local_path is None or MODELS.n_ctx is None:
-        raise RuntimeError("model_load_failed: model is not loaded")
-
-    gen_kwargs = build_gen_kwargs(payload)
-    job_dict = _build_runner_job_dict(payload, gen_kwargs)
-
-    MODELS.status = "busy"
-    start = time.time()
-    token_count = 0
-
-    def _on_token(delta: str, finish_reason: Optional[str]) -> None:
-        nonlocal token_count
-        if delta:
-            token_count += 1
-        on_token(delta, finish_reason)
-
-    try:
-        outcome = RUNNER.run_job(job_id, job_dict, on_token=_on_token)
-        if "error" in outcome:
-            raise RuntimeError(outcome["error"])
-
-        logger.info("Streaming job %s for '%s' completed in %.2fs (~%d tokens).",
-                    job_id, requested_model, time.time() - start, token_count)
-    finally:
-        MODELS.status = "idle"
 
 
 # --------------------------------------------------------------------------- #
-# Step 8: transport layer -- WebSocket primary, long-poll fallback
+# Job dataclass (unchanged shape from the single-worker reference)
 # --------------------------------------------------------------------------- #
 
 
+@dataclass
+class Job:
+    id: str
+    kind: str                      # "chat", "completions"
+    payload: dict                  # normalized job payload sent to worker
+    worker_id: Optional[str] = None            # which worker this job was routed to
+    created_at: float = field(default_factory=time.time)
+    timeout: float = 300.0
+    future: "asyncio.Future" = field(default_factory=lambda: asyncio.get_event_loop().create_future())
+    delivered: bool = False
+    delivered_at: Optional[float] = None
+    last_activity_at: Optional[float] = None   # refreshed on every streamed token
+    retries: int = 0
+    stream: bool = False
+    stream_queue: Optional["asyncio.Queue"] = None   # only set for true (WS) streaming jobs
+    cancel_requested: bool = False             # True once we've asked the worker to abort this job
 
-class ProxyClient:
-    def __init__(self, config: dict, target_model_id: str, target_repo: str, file_name: str):
-        self.config = config
-        self.target_model_id = target_model_id
-        self.target_repo = target_repo
-        self.file_name = file_name
-        self.proxy_url = config["proxy_url"].rstrip("/")
-        self.ws_url = self.proxy_url.replace("http://", "ws://").replace("https://", "wss://")             + config["transport"]["ws_path"]
-        self.worker_id = config["worker_id"]
-        self.secret = config["worker_shared_secret"]
-        self.seen_job_ids: set = set()
-        self.ws_failures = 0
-        self.loop = asyncio.get_event_loop()
 
-    def _sign(self) -> Dict[str, str]:
-        ts = str(time.time())
-        sig = hmac.new(self.secret.encode(), f"{self.worker_id}:{ts}".encode(),
-                        hashlib.sha256).hexdigest()
-        return {"worker_id": self.worker_id, "timestamp": ts, "signature": sig}
+# --------------------------------------------------------------------------- #
+# Per-worker state
+# --------------------------------------------------------------------------- #
 
-    def _worker_model_payload(self) -> dict:
-        return {"repo": self.target_repo, "file": self.file_name}
 
-    async def _heartbeat_payload(self) -> dict:
-        # aggregate_gpu_stats() shells out to nvidia-smi via a *blocking*
-        # subprocess.run() call (with its own 10s timeout, and real-world
-        # latency spikes under GPU load). Calling it directly from a
-        # coroutine would stall the single-threaded event loop that also
-        # owns this worker's WebSocket connection -- while stalled, the
-        # `websockets` library can't process incoming pong frames / service
-        # its own ping/pong bookkeeping, so a slow nvidia-smi call during a
-        # busy generation can silently blow through ping_timeout and get
-        # the connection killed with "keepalive ping timeout", right when
-        # a job is in flight. Always run it in the executor instead.
-        gpu_stats = await self.loop.run_in_executor(None, aggregate_gpu_stats)
+class WorkerState:
+    """Tracks one connected inference worker (whichever transport it is
+    using) along with its own private job queue."""
+
+    def __init__(self, worker_id: str) -> None:
+        self.worker_id: str = worker_id
+        self.transport: Optional[str] = None        # "ws" or "poll"
+        self.ws: Optional[WebSocket] = None
+        self.last_heartbeat: float = 0.0
+        self.models: Dict[str, Any] = {}
+        self.status: str = "unknown"                 # idle / busy / loading_model / unknown
+        self.current_model: Optional[str] = None
+        self.in_flight_jobs: int = 0
+        self.gpu_stats: dict = {}                     # {"total_mb", "used_mb", "free_mb", "utilization_percent"}
+        self.n_ctx: Optional[int] = None               # loaded context size, reported via heartbeat
+        self.lock = asyncio.Lock()
+
+        # Per-worker job queue + job map (jobs routed to this worker only).
+        self.queue: "asyncio.Queue[str]" = asyncio.Queue(
+            maxsize=CONFIG.get("max_queue_size_per_worker", 100))
+        self.jobs: Dict[str, Job] = {}
+
+        # Bookkeeping for the WS dispatcher task tied to this connection.
+        self.dispatcher_task: Optional["asyncio.Task"] = None
+
+        # Job id the worker should be told to cancel on its next heartbeat
+        # response, for workers on the long-poll transport (which has no
+        # push channel to deliver a cancel immediately). WS workers instead
+        # get an immediate out-of-band "cancel" message -- see
+        # request_cancel() below -- and don't use this field.
+        self.pending_cancel_job_id: Optional[str] = None
+
+        # Set the instant we positively learn the worker's connection is
+        # gone (WS close, explicit deregister, or heartbeat staleness during
+        # a sweep). Used by the reconnect-grace watchdog below to decide
+        # when a disconnected worker has been gone too long and should be
+        # torn down entirely, rather than left around indefinitely with a
+        # dead queue. Cleared (set back to None) the moment the worker
+        # successfully re-registers, on either transport.
+        self.disconnected_at: Optional[float] = None
+
+    def is_online(self) -> bool:
+        if self.last_heartbeat == 0:
+            return False
+        return (time.time() - self.last_heartbeat) < CONFIG["worker_offline_after_seconds"]
+
+    def touch(self) -> None:
+        self.last_heartbeat = time.time()
+        self.disconnected_at = None
+
+    def mark_offline(self) -> None:
+        """Immediately mark the worker offline instead of waiting for the
+        worker_offline_after_seconds grace window to elapse. Used whenever we
+        positively know the connection is gone (WS close, explicit
+        deregister, or heartbeat staleness during a sweep). Also stamps
+        disconnected_at (if not already stamped), which starts the
+        reconnect-grace clock consulted by reap_unreconnected_workers()."""
+        self.last_heartbeat = 0.0
+        self.status = "unknown"
+        if self.disconnected_at is None:
+            self.disconnected_at = time.time()
+
+    async def request_cancel(self, job_id: str, reason: str) -> None:
+        """Ask this worker to hard-kill whatever is running for job_id, right
+        now if possible. On WS this is an immediate out-of-band push; on
+        long-poll it's queued to ride along with the next heartbeat
+        response (see /worker/heartbeat), which bounds latency to one
+        heartbeat interval on that transport."""
+        job = self.jobs.get(job_id)
+        if job is not None:
+            job.cancel_requested = True
+        if self.transport == "ws" and self.ws is not None:
+            try:
+                await self.ws.send_text(json.dumps({"type": "cancel", "job_id": job_id}))
+                logger.info("Sent cancel for job %s to worker '%s' (%s) over WS.",
+                            job_id, self.worker_id, reason)
+            except Exception as e:
+                logger.warning("Failed to send cancel for job %s to worker '%s': %s",
+                                job_id, self.worker_id, e)
+        else:
+            # Long-poll: no push channel. Stash it; /worker/heartbeat will
+            # hand it back on the worker's next heartbeat call. Only keep
+            # the most recent request -- a worker running one job at a time
+            # only ever needs to cancel the one it's currently working on.
+            self.pending_cancel_job_id = job_id
+            logger.info("Queued cancel for job %s for worker '%s' (%s); will be delivered "
+                        "on next long-poll heartbeat.", job_id, self.worker_id, reason)
+
+    def qsize(self) -> int:
+        return self.queue.qsize()
+
+    def snapshot(self) -> dict:
         return {
-            "type": "heartbeat",
             "worker_id": self.worker_id,
-            "timestamp": str(time.time()),
-            "gpu_stats": gpu_stats,
-            "current_model": self.target_model_id,
-            "status": MODELS.status,
-            # Loaded context size, shown on the proxy dashboard. None until
-            # load_startup_model() has resolved it.
-            "n_ctx": MODELS.n_ctx,
+            "online": self.is_online(),
+            "transport": self.transport,
+            "status": self.status,
+            "current_model": self.current_model,
+            "n_ctx": self.n_ctx,
+            "in_flight_jobs": self.in_flight_jobs,
+            "gpu_stats": self.gpu_stats,
+            "known_models": list(self.models.keys()),
+            "queue_depth": self.qsize(),
+            "last_heartbeat_age_seconds": round(time.time() - self.last_heartbeat, 1)
+            if self.last_heartbeat else None,
+            "disconnected_for_seconds": round(time.time() - self.disconnected_at, 1)
+            if self.disconnected_at else None,
         }
 
-    def _check_and_mark_duplicate(self, job_id: str) -> bool:
-        if job_id in self.seen_job_ids:
-            logger.info("Duplicate delivery of job %s ignored.", job_id)
-            return True
-        self.seen_job_ids.add(job_id)
-        if len(self.seen_job_ids) > 10000:
-            self.seen_job_ids = set(list(self.seen_job_ids)[-2000:])
-        return False
 
-    async def process_job(self, job_id: str, payload: dict) -> dict:
-        if self._check_and_mark_duplicate(job_id):
-            return {"job_id": job_id, "duplicate": True}
-        result = await self.loop.run_in_executor(None, run_inference, payload, job_id)
-        return {"job_id": job_id, **result}
+# --------------------------------------------------------------------------- #
+# Worker registry + routing
+# --------------------------------------------------------------------------- #
 
-    async def process_stream_job(self, ws, job_id: str, payload: dict) -> None:
-        if self._check_and_mark_duplicate(job_id):
-            await ws.send(json.dumps({
-                "type": "stream_done", "job_id": job_id, "result": {"duplicate": True},
+
+class WorkerRegistry:
+    """Owns the Dict[worker_id -> WorkerState] and all job bookkeeping across
+    every worker. Routing decisions (which worker gets a given request) live
+    here too, since they need a global view of all workers."""
+
+    def __init__(self) -> None:
+        self.workers: Dict[str, WorkerState] = {}
+        self._rr_counter = itertools.count()  # round-robin tiebreaker source
+        self._registry_lock = asyncio.Lock()
+
+    def _resolve_future(self, job: "Job", result: Optional[dict] = None,
+                         error: Optional[str] = None) -> None:
+        """Resolve job.future exactly once, in whichever way is safe for
+        who (if anyone) is actually listening on it.
+
+        Non-streaming jobs are awaited directly by run_job_and_wait() via
+        `await asyncio.wait_for(job.future, ...)`, so they need a real
+        set_result()/set_exception() to unblock that caller.
+
+        Streaming (WS) jobs are NEVER awaited on job.future -- the actual
+        response is driven entirely by job.stream_queue, consumed by
+        real_stream_generator(). job.future exists for them purely so
+        total_in_flight() can treat job.future.done() as "no longer
+        occupying the worker". Calling set_exception() on a future nobody
+        awaits leaves the exception unretrieved, and asyncio logs a scary
+        (but functionally harmless) "Future exception was never retrieved"
+        warning once it's garbage-collected -- exactly what showed up in
+        the logs. cancel() marks it done for accounting without ever
+        storing an exception that could go unretrieved.
+        """
+        if job.future.done():
+            return
+        if job.stream_queue is not None:
+            job.future.cancel()
+            return
+        if error:
+            job.future.set_exception(RuntimeError(error))
+        else:
+            job.future.set_result(result)
+
+    async def get_or_create(self, worker_id: str) -> WorkerState:
+        async with self._registry_lock:
+            w = self.workers.get(worker_id)
+            if w is None:
+                w = WorkerState(worker_id)
+                self.workers[worker_id] = w
+            return w
+
+    def get(self, worker_id: str) -> Optional[WorkerState]:
+        return self.workers.get(worker_id)
+
+    def all_workers(self) -> List[WorkerState]:
+        return list(self.workers.values())
+
+    def online_workers(self) -> List[WorkerState]:
+        return [w for w in self.workers.values() if w.is_online()]
+
+    def all_known_models(self) -> Dict[str, dict]:
+        """Union of models across all currently-online workers, for
+        GET /v1/models. If multiple workers serve the same model id, the
+        last one wins for metadata purposes (metadata itself is usually
+        trivial/empty)."""
+        merged: Dict[str, dict] = {}
+        for w in self.online_workers():
+            for model_id, meta in w.models.items():
+                merged[model_id] = meta
+        return merged
+
+    def total_queue_depth(self) -> int:
+        return sum(w.qsize() for w in self.workers.values())
+
+    def total_in_flight(self) -> int:
+        return sum(
+            1
+            for w in self.workers.values()
+            for j in w.jobs.values()
+            if not j.future.done()
+        )
+
+    def score_worker(self, worker: WorkerState) -> Tuple[float, float, float, int]:
+        """Lower score = better. Used for routing decisions.
+
+        priority = (in_flight_jobs, gpu_utilization_percent, heartbeat_age,
+                    round_robin_counter)
+
+        The round-robin counter is only consulted as the final tiebreaker
+        when everything else is equal (e.g. two freshly-registered, idle
+        workers serving the same model)."""
+        utilization = worker.gpu_stats.get("utilization_percent", 0) or 0
+        in_flight = worker.in_flight_jobs
+        recency = time.time() - worker.last_heartbeat if worker.last_heartbeat else float("inf")
+        rr = next(self._rr_counter) if CONFIG["routing"].get("fallback_to_round_robin", True) else 0
+        return (in_flight, utilization, recency, rr)
+
+    def route_request(self, model: str) -> Optional[WorkerState]:
+        """Pick the best online worker currently serving `model`."""
+        candidates = [
+            w for w in self.workers.values()
+            if w.is_online() and model in w.models
+        ]
+        if not candidates:
+            return None
+        scored = [(self.score_worker(w), w) for w in candidates]
+        scored.sort(key=lambda pair: pair[0])
+        return scored[0][1]
+
+    async def submit_job(self, worker: WorkerState, kind: str, payload: dict,
+                          stream: bool) -> Job:
+        if worker.queue.full():
+            raise HTTPException(status_code=429, detail=openai_error(
+                "Selected inference server's queue is full. Please retry shortly.",
+                "rate_limit_error"))
+        job = Job(
+            id=str(uuid.uuid4()),
+            kind=kind,
+            payload=payload,
+            worker_id=worker.worker_id,
+            timeout=CONFIG["request_timeout_seconds"],
+            stream=stream,
+        )
+        if stream:
+            job.stream_queue = asyncio.Queue()
+        worker.jobs[job.id] = job
+        worker.in_flight_jobs += 1
+        await worker.queue.put(job.id)
+        logger.info("Routed job %s (kind=%s, model=%s) -> worker '%s' "
+                    "(in_flight=%d, gpu_util=%s%%)",
+                    job.id, kind, payload.get("model"), worker.worker_id,
+                    worker.in_flight_jobs, worker.gpu_stats.get("utilization_percent"))
+        return job
+
+    def find_job(self, job_id: str) -> Tuple[Optional[WorkerState], Optional[Job]]:
+        """Locate a job (and its owning worker) by id, searching across all
+        workers. Used by long-poll result/heartbeat endpoints which only
+        carry worker_id + job_id, not a direct WorkerState reference."""
+        for w in self.workers.values():
+            j = w.jobs.get(job_id)
+            if j is not None:
+                return w, j
+        return None, None
+
+    def pop_next_for_delivery(self, worker: WorkerState) -> Optional[Job]:
+        """Non-blocking pop from this worker's queue."""
+        try:
+            job_id = worker.queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+        job = worker.jobs.get(job_id)
+        if job is None or job.future.done():
+            return None
+        job.delivered = True
+        job.delivered_at = time.time()
+        job.last_activity_at = job.delivered_at
+        return job
+
+    async def wait_next_for_delivery(self, worker: WorkerState, timeout: float) -> Optional[Job]:
+        """Blocking (up to timeout) pop from this worker's queue, used by
+        both the WS dispatcher loop and the long-poll endpoint."""
+        try:
+            job_id = await asyncio.wait_for(worker.queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        job = worker.jobs.get(job_id)
+        if job is None or job.future.done():
+            return None
+        job.delivered = True
+        job.delivered_at = time.time()
+        job.last_activity_at = job.delivered_at
+        return job
+
+    def mark_activity(self, worker: WorkerState, job_id: str) -> None:
+        """Called whenever a streamed token arrives, so long-running streams
+        aren't mistaken for a stalled/dead worker by the watchdog."""
+        job = worker.jobs.get(job_id)
+        if job is not None:
+            job.last_activity_at = time.time()
+
+    def complete(self, worker: WorkerState, job_id: str, result: Optional[dict],
+                 error: Optional[str]) -> bool:
+        job = worker.jobs.get(job_id)
+        if job is None or job.future.done():
+            return False  # unknown or duplicate delivery -- ignore safely
+        self._resolve_future(job, result=result, error=error)
+        worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+        if worker.pending_cancel_job_id == job_id:
+            worker.pending_cancel_job_id = None
+        return True
+
+    async def cancel_job_on_worker(self, worker: WorkerState, job: Job, reason: str) -> None:
+        """Tell the owning worker to hard-kill whatever compute is currently
+        happening for `job`, because nobody will ever consume its result
+        (client disconnected, or it's already been failed/timed-out
+        locally). Safe to call even if the job was never delivered yet (the
+        worker will simply report "not running" and ignore it) or has
+        already completed (worker-side cancel is a no-op post-completion)."""
+        if job.cancel_requested:
+            return  # already asked; avoid spamming duplicate cancel messages
+        await worker.request_cancel(job.id, reason)
+
+    async def requeue_or_fail(self, worker: WorkerState, job: Job, reason: str) -> None:
+        """Called by the watchdog (or by an immediate disconnect handler)
+        when a delivered job never got a result. Jobs are only ever
+        requeued onto the SAME worker's queue (never migrated to a
+        different worker), matching the "streaming job MUST stay with same
+        worker" requirement -- for non-streaming jobs this still means a
+        retry only makes sense if that worker is expected to come back
+        (e.g. a transient send failure), otherwise it will simply fail once
+        retries are exhausted or the worker is confirmed offline.
+
+        Whenever a job is being permanently failed here (not requeued),
+        the owning worker is also told to cancel/hard-kill it, since the
+        result -- if the worker is even still computing it -- will never be
+        read by anyone. Requeued jobs are NOT cancelled: they haven't been
+        given up on, they're being retried on the same worker."""
+        if job.future.done():
+            return
+        # A streaming job that has already sent tokens to the client cannot
+        # be safely retried (the client already received a partial
+        # response) -- fail it outright and unblock the SSE consumer.
+        if job.stream_queue is not None:
+            logger.error("Failing streaming job %s on worker '%s': %s",
+                         job.id, worker.worker_id, reason)
+            await job.stream_queue.put({"error": reason})
+            await job.stream_queue.put(None)
+            self._resolve_future(job, error=reason)
+            worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+            await self.cancel_job_on_worker(worker, job, reason)
+            return
+        if job.retries < CONFIG["retry"]["max_job_retries"] and worker.is_online():
+            job.retries += 1
+            job.delivered = False
+            job.delivered_at = None
+            job.last_activity_at = None
+            logger.warning("Requeuing job %s on worker '%s' after failure: %s",
+                           job.id, worker.worker_id, reason)
+            await worker.queue.put(job.id)
+        else:
+            logger.error("Failing job %s on worker '%s' permanently: %s",
+                         job.id, worker.worker_id, reason)
+            self._resolve_future(job, error=reason)
+            worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+            await self.cancel_job_on_worker(worker, job, reason)
+
+    async def fail_in_flight_jobs_for_worker(self, worker: WorkerState, reason: str) -> None:
+        """Immediately fail/requeue every job that was already delivered to
+        this (now-gone) worker connection, instead of waiting for the
+        watchdog to notice via its timeout. Jobs still only queued (never
+        delivered) are left in this worker's queue -- if the worker comes
+        back online within the reconnect grace window they'll be picked up
+        then; if it doesn't come back within that window,
+        cancel_all_jobs_for_worker() below will cancel those too and the
+        worker will be removed entirely."""
+        in_flight = [j for j in worker.jobs.values() if not j.future.done() and j.delivered]
+        for job in in_flight:
+            await self.requeue_or_fail(worker, job, reason)
+
+    async def cancel_all_jobs_for_worker(self, worker: WorkerState, reason: str) -> int:
+        """Forcefully cancels every still-pending job owned by this worker
+        (both delivered/in-flight and merely queued-but-undelivered), used
+        when a disconnected worker has exceeded its reconnect grace window
+        and is about to be removed from the registry entirely. Unlike
+        requeue_or_fail, this never retries -- the worker is being deleted,
+        so there is nowhere left to requeue to. Returns the number of jobs
+        cancelled."""
+        cancelled = 0
+        for job in list(worker.jobs.values()):
+            if job.future.done():
+                continue
+            if job.stream_queue is not None:
+                await job.stream_queue.put({"error": reason})
+                await job.stream_queue.put(None)
+            self._resolve_future(job, error=reason)
+            cancelled += 1
+        worker.in_flight_jobs = 0
+        # Drain the queue itself so nothing lingers referencing job ids that
+        # are about to be discarded along with the worker.
+        while not worker.queue.empty():
+            try:
+                worker.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        return cancelled
+
+    async def reap_unreconnected_workers(self, grace_seconds: float, reason: str) -> List[str]:
+        """Watchdog helper: for every worker that has been continuously
+        disconnected for longer than `grace_seconds`, cancel all of its
+        pending/in-flight jobs and remove it from the registry entirely
+        (rather than leaving a dead entry around whose queue nothing will
+        ever service again). Returns the list of worker_ids that were
+        removed."""
+        now = time.time()
+        to_remove = [
+            w for w in self.workers.values()
+            if w.disconnected_at is not None
+            and (now - w.disconnected_at) >= grace_seconds
+        ]
+        removed_ids: List[str] = []
+        for worker in to_remove:
+            # Re-check online status defensively -- a worker could have
+            # reconnected (which clears disconnected_at via touch()) between
+            # building the list above and getting here.
+            if worker.is_online() or worker.disconnected_at is None:
+                continue
+            n = await self.cancel_all_jobs_for_worker(worker, reason)
+            if n:
+                logger.warning(
+                    "Worker '%s' did not reconnect within %.0fs of "
+                    "disconnecting; cancelled %d pending job(s) and "
+                    "removed the worker from the registry.",
+                    worker.worker_id, grace_seconds, n)
+            else:
+                logger.info(
+                    "Worker '%s' did not reconnect within %.0fs of "
+                    "disconnecting; removed the worker from the registry.",
+                    worker.worker_id, grace_seconds)
+            self.workers.pop(worker.worker_id, None)
+            removed_ids.append(worker.worker_id)
+        return removed_ids
+
+    def cleanup(self, max_age: float = 3600) -> None:
+        now = time.time()
+        for w in self.workers.values():
+            stale = [jid for jid, j in w.jobs.items()
+                     if j.future.done() and (now - j.created_at) > max_age]
+            for jid in stale:
+                del w.jobs[jid]
+
+    def prune_dead_workers(self, max_age: float = 24 * 3600) -> None:
+        """Drop bookkeeping for workers that have been offline for a very
+        long time, so the registry doesn't grow unbounded across many
+        Kaggle session churns. Only prunes workers with no in-flight/queued
+        jobs left. In normal operation, reap_unreconnected_workers() (30s
+        grace window, or as configured) will have already removed and
+        cancelled any disconnected worker with pending jobs long before
+        this much slower long-horizon prune ever runs; this remains as a
+        backstop for workers that disconnect cleanly with no pending work."""
+        now = time.time()
+        dead = []
+        for wid, w in self.workers.items():
+            if w.is_online():
+                continue
+            if w.in_flight_jobs > 0 or w.qsize() > 0:
+                continue
+            if w.last_heartbeat and (now - w.last_heartbeat) > max_age:
+                dead.append(wid)
+        for wid in dead:
+            del self.workers[wid]
+            logger.info("Pruned long-dead worker '%s' from registry.", wid)
+
+
+REGISTRY = WorkerRegistry()
+
+
+# --------------------------------------------------------------------------- #
+# FastAPI app
+# --------------------------------------------------------------------------- #
+
+app = FastAPI(title="GGUF-Kaggle OpenAI-Compatible Multi-Worker Proxy")
+
+if CONFIG["cors"].get("enabled"):
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CONFIG["cors"].get("allow_origins", ["*"]),
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# OpenAI response formatting helpers (unchanged from reference)
+# --------------------------------------------------------------------------- #
+
+
+def format_chat_completion(job_id: str, model: str, result: dict) -> dict:
+    return {
+        "id": f"chatcmpl-{job_id}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": result.get("text", "")},
+            "finish_reason": result.get("finish_reason", "stop"),
+        }],
+        "usage": result.get("usage", {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0
+        }),
+    }
+
+
+def format_text_completion(job_id: str, model: str, result: dict) -> dict:
+    return {
+        "id": f"cmpl-{job_id}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "text": result.get("text", ""),
+            "logprobs": None,
+            "finish_reason": result.get("finish_reason", "stop"),
+        }],
+        "usage": result.get("usage", {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0
+        }),
+    }
+
+
+async def fake_sse_stream(final_chunk_builder):
+    """Used only when the winning worker is on the long-poll fallback
+    transport, which cannot push individual tokens as they're generated. We
+    compute the full result and then emit it as a single SSE 'delta' chunk
+    followed by [DONE]. This keeps stream=True clients working (just
+    without real incremental output) whenever that worker isn't on WS."""
+    payload = final_chunk_builder()
+    yield f"data: {json.dumps(payload)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+def to_stream_chat_chunk(job_id: str, model: str, result: dict) -> dict:
+    return {
+        "id": f"chatcmpl-{job_id}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": result.get("text", "")},
+            "finish_reason": result.get("finish_reason", "stop"),
+        }],
+    }
+
+
+def to_stream_text_chunk(job_id: str, model: str, result: dict) -> dict:
+    return {
+        "id": f"cmpl-{job_id}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "text": result.get("text", ""),
+            "logprobs": None,
+            "finish_reason": result.get("finish_reason", "stop"),
+        }],
+    }
+
+
+async def _cancel_job_for_disconnect(job: Job, worker: Optional[WorkerState], where: str) -> None:
+    """Shared helper: the client that wanted `job` is gone, so ask the
+    owning worker to hard-kill whatever compute is happening for it. Safe
+    to call regardless of whether the job has already completed (no-op in
+    that case) -- callers don't need to check job.future.done() first."""
+    if job.future.done():
+        return
+    if worker is None:
+        return
+    logger.info("Client disconnected (%s) for job %s; requesting cancellation on worker '%s'.",
+                where, job.id, worker.worker_id)
+    await REGISTRY.cancel_job_on_worker(worker, job, f"client disconnected ({where})")
+
+
+async def real_stream_generator(job: Job, model: str, kind: str, request: Request,
+                                 worker: WorkerState):
+    """True token-by-token SSE stream for jobs delivered over a worker's
+    WebSocket. Reads from job.stream_queue as that worker's WS handler
+    feeds it (see 'stream_chunk' / 'stream_done' / 'error' below), and
+    yields OpenAI-compatible chunk frames as soon as each token arrives.
+    The job (and therefore the stream) never migrates to a different
+    worker mid-flight.
+
+    Also watches for the client disconnecting mid-stream (StreamingResponse
+    keeps running server-side even after the client goes away unless we
+    check explicitly): if that happens, the worker is told to cancel the
+    job immediately rather than continuing to generate tokens nobody will
+    receive.
+    """
+    role_sent = False
+    disconnect_check_interval = CONFIG.get("client_disconnect_check_interval_seconds", 1.0)
+
+    async def watch_for_disconnect():
+        while True:
+            await asyncio.sleep(disconnect_check_interval)
+            if await request.is_disconnected():
+                await _cancel_job_for_disconnect(job, worker, "stream")
+                return
+
+    watcher = asyncio.create_task(watch_for_disconnect())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(job.stream_queue.get(), timeout=job.timeout)
+            except asyncio.TimeoutError:
+                err = openai_error(
+                    "Timed out waiting for streamed tokens from the worker.",
+                    "server_error")
+                yield f"data: {json.dumps(err)}\n\n"
+                await REGISTRY.cancel_job_on_worker(worker, job, "stream token timeout")
+                break
+
+            if item is None:
+                break  # normal end-of-stream sentinel
+
+            if "error" in item:
+                err = openai_error(f"Worker streaming error: {item['error']}", "server_error")
+                yield f"data: {json.dumps(err)}\n\n"
+                break
+
+            delta_text = item.get("delta", "") or ""
+            finish_reason = item.get("finish_reason")
+
+            if kind == "chat":
+                if not role_sent:
+                    first = {
+                        "id": f"chatcmpl-{job.id}", "object": "chat.completion.chunk",
+                        "created": int(time.time()), "model": model,
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(first)}\n\n"
+                    role_sent = True
+                delta_obj = {"content": delta_text} if delta_text else {}
+                chunk = {
+                    "id": f"chatcmpl-{job.id}", "object": "chat.completion.chunk",
+                    "created": int(time.time()), "model": model,
+                    "choices": [{"index": 0, "delta": delta_obj, "finish_reason": finish_reason}],
+                }
+            else:
+                chunk = {
+                    "id": f"cmpl-{job.id}", "object": "text_completion",
+                    "created": int(time.time()), "model": model,
+                    "choices": [{"index": 0, "text": delta_text, "logprobs": None,
+                                 "finish_reason": finish_reason}],
+                }
+            yield f"data: {json.dumps(chunk)}\n\n"
+    finally:
+        watcher.cancel()
+        yield "data: [DONE]\n\n"
+
+
+# --------------------------------------------------------------------------- #
+# Shared request handling / routing
+# --------------------------------------------------------------------------- #
+
+
+def normalize_generation_params(body: dict) -> dict:
+    """Pull out OpenAI-style generation params with sane defaults."""
+    return {
+        "temperature": body.get("temperature", 0.8),
+        "top_p": body.get("top_p", 0.95),
+        "max_tokens": body.get("max_tokens", 512),
+        "stop": body.get("stop"),
+        "presence_penalty": body.get("presence_penalty", 0.0),
+        "frequency_penalty": body.get("frequency_penalty", 0.0),
+        "seed": body.get("seed"),
+    }
+
+
+def route_or_503(model: str) -> WorkerState:
+    """Find the best worker for `model`, or raise a clean 503."""
+    worker = REGISTRY.route_request(model)
+    if worker is None:
+        # Distinguish "model unknown anywhere" from "model exists but all
+        # workers serving it are offline" for a clearer error message.
+        known_anywhere = any(model in w.models for w in REGISTRY.all_workers())
+        if known_anywhere:
+            msg = (f"No inference server currently has model '{model}' "
+                   f"online. It is configured on a worker that is not "
+                   f"currently connected.")
+        else:
+            msg = f"No inference server currently has model '{model}' loaded."
+        raise HTTPException(status_code=503, detail=openai_error(msg, "server_error"))
+    return worker
+
+
+async def run_job_and_wait(worker: WorkerState, kind: str, payload: dict,
+                            request: Request) -> Tuple[Job, dict]:
+    """Non-streaming (or poll-fallback) path: submit a job to a specific
+    worker's queue and block until that worker returns the full result --
+    OR the client disconnects, in which case the worker is told to cancel
+    the job and we stop waiting rather than sitting on a connection nobody
+    is reading the response from."""
+    job = await REGISTRY.submit_job(worker, kind, payload, stream=False)
+    disconnect_check_interval = CONFIG.get("client_disconnect_check_interval_seconds", 1.0)
+
+    async def watch_for_disconnect():
+        while True:
+            await asyncio.sleep(disconnect_check_interval)
+            if await request.is_disconnected():
+                await _cancel_job_for_disconnect(job, worker, "request")
+                return
+
+    watcher = asyncio.create_task(watch_for_disconnect())
+    try:
+        result = await asyncio.wait_for(job.future, timeout=job.timeout)
+    except asyncio.TimeoutError:
+        await REGISTRY.cancel_job_on_worker(worker, job, "request_timeout_seconds elapsed")
+        raise HTTPException(status_code=504, detail=openai_error(
+            "Timed out waiting for the inference worker to respond.",
+            "server_error"))
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=openai_error(
+            f"Worker failed to process the request: {e}", "server_error"))
+    finally:
+        watcher.cancel()
+    return job, result
+
+
+def worker_supports_real_streaming(worker: WorkerState) -> bool:
+    """True token streaming requires the persistent WebSocket transport --
+    long-polling has no way to push individual tokens as they're produced."""
+    return worker.is_online() and worker.transport == "ws"
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
+    check_client_key(authorization)
+    body = await request.json()
+    model = body.get("model")
+    messages = body.get("messages")
+    if not model or not messages:
+        raise HTTPException(status_code=400, detail=openai_error(
+            "'model' and 'messages' are required.", "invalid_request_error"))
+    stream = bool(body.get("stream", False))
+
+    worker = route_or_503(model)
+
+    if stream and worker_supports_real_streaming(worker):
+        payload = {
+            "kind": "chat", "model": model, "messages": messages, "stream": True,
+            "params": normalize_generation_params(body),
+        }
+        job = await REGISTRY.submit_job(worker, "chat", payload, stream=True)
+        return StreamingResponse(
+            real_stream_generator(job, model, "chat", request, worker),
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming, or the chosen worker is currently on the long-poll
+    # fallback transport (no true incremental push available there).
+    payload = {
+        "kind": "chat", "model": model, "messages": messages, "stream": False,
+        "params": normalize_generation_params(body),
+    }
+    job, result = await run_job_and_wait(worker, "chat", payload, request)
+    if stream:
+        return StreamingResponse(
+            fake_sse_stream(lambda: to_stream_chat_chunk(job.id, model, result)),
+            media_type="text/event-stream",
+        )
+    return JSONResponse(format_chat_completion(job.id, model, result))
+
+
+@app.post("/v1/completions")
+async def completions(request: Request, authorization: Optional[str] = Header(None)):
+    check_client_key(authorization)
+    body = await request.json()
+    model = body.get("model")
+    prompt = body.get("prompt")
+    if not model or prompt is None:
+        raise HTTPException(status_code=400, detail=openai_error(
+            "'model' and 'prompt' are required.", "invalid_request_error"))
+    stream = bool(body.get("stream", False))
+
+    worker = route_or_503(model)
+
+    if stream and worker_supports_real_streaming(worker):
+        payload = {
+            "kind": "completion", "model": model, "prompt": prompt, "stream": True,
+            "params": normalize_generation_params(body),
+        }
+        job = await REGISTRY.submit_job(worker, "completions", payload, stream=True)
+        return StreamingResponse(
+            real_stream_generator(job, model, "completion", request, worker),
+            media_type="text/event-stream",
+        )
+
+    payload = {
+        "kind": "completion", "model": model, "prompt": prompt, "stream": False,
+        "params": normalize_generation_params(body),
+    }
+    job, result = await run_job_and_wait(worker, "completions", payload, request)
+    if stream:
+        return StreamingResponse(
+            fake_sse_stream(lambda: to_stream_text_chunk(job.id, model, result)),
+            media_type="text/event-stream",
+        )
+    return JSONResponse(format_text_completion(job.id, model, result))
+
+
+@app.post("/v1/embeddings")
+async def embeddings(request: Request, authorization: Optional[str] = Header(None)):
+    check_client_key(authorization)
+    # This GGUF/llama.cpp worker setup does not serve embeddings.
+    return JSONResponse(
+        status_code=400,
+        content=openai_error(
+            "This deployment does not support the embeddings endpoint. "
+            "Only chat/completions models are available via connected workers.",
+            "invalid_request_error",
+            code="embeddings_not_supported",
+        ),
+    )
+
+
+@app.get("/v1/models")
+async def list_models(authorization: Optional[str] = Header(None)):
+    check_client_key(authorization)
+    now = int(time.time())
+    data = [
+        {"id": alias, "object": "model", "created": now, "owned_by": "kaggle-worker"}
+        for alias in REGISTRY.all_known_models().keys()
+    ]
+    return {"object": "list", "data": data}
+
+
+@app.get("/health")
+async def health():
+    REGISTRY.cleanup()
+    workers_snapshot = [w.snapshot() for w in REGISTRY.all_workers()]
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "workers": workers_snapshot,
+        "queue_depth": REGISTRY.total_queue_depth(),
+        "in_flight_jobs": REGISTRY.total_in_flight(),
+    }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    if not CONFIG["dashboard"].get("enabled", True):
+        raise HTTPException(status_code=404)
+    refresh = CONFIG["dashboard"].get("refresh_seconds", 5)
+    workers = REGISTRY.all_workers()
+    workers_sorted = sorted(workers, key=lambda w: w.worker_id)
+
+    rows = []
+    for w in workers_sorted:
+        snap = w.snapshot()
+        status_class = "ok" if snap["online"] else "bad"
+        gpu = snap["gpu_stats"] or {}
+        gpu_str = (f"{gpu.get('used_mb', '?')}/{gpu.get('total_mb', '?')} MB "
+                   f"({gpu.get('utilization_percent', '?')}%)") if gpu else "—"
+        n_ctx_str = f"{snap['n_ctx']:,}" if snap.get("n_ctx") else "—"
+        rows.append(f"""
+      <tr>
+        <td>{snap['worker_id']}</td>
+        <td class="{status_class}">{snap['online']}</td>
+        <td>{snap['transport']}</td>
+        <td>{snap['status']}</td>
+        <td>{snap['current_model'] or '—'}</td>
+        <td>{n_ctx_str}</td>
+        <td>{', '.join(snap['known_models']) or '(none reported yet)'}</td>
+        <td>{snap['in_flight_jobs']}</td>
+        <td>{snap['queue_depth']}</td>
+        <td>{gpu_str}</td>
+        <td>{snap['last_heartbeat_age_seconds']}</td>
+      </tr>""")
+
+    total_queue = REGISTRY.total_queue_depth()
+    total_in_flight = REGISTRY.total_in_flight()
+    online_count = sum(1 for w in workers if w.is_online())
+
+    html = f"""
+    <html><head><meta http-equiv="refresh" content="{refresh}">
+    <title>Multi-Worker Proxy Dashboard</title>
+    <style>
+        body {{ font-family: monospace; background:#0d1117; color:#c9d1d9; padding:2rem; }}
+        .ok {{ color:#3fb950; }} .bad {{ color:#f85149; }}
+        table {{ border-collapse: collapse; width: 100%; }}
+        td, th {{ padding: 6px 12px; text-align:left; border-bottom: 1px solid #21262d; }}
+        th {{ color: #8b949e; text-transform: uppercase; font-size: 0.8em; }}
+        .summary td {{ padding: 4px 12px; }}
+        h2 {{ margin-bottom: 0.2em; }}
+        .sub {{ color: #8b949e; margin-top:0; }}
+    </style></head><body>
+    <h2>GGUF Kaggle Multi-Worker Proxy Dashboard</h2>
+    <p class="sub">{online_count}/{len(workers)} workers online &middot;
+       total queue depth {total_queue} &middot; total in-flight {total_in_flight}</p>
+    <table>
+      <tr>
+        <th>Worker ID</th><th>Online</th><th>Transport</th><th>Status</th>
+        <th>Current Model</th><th>Loaded n_ctx</th><th>Known Models</th><th>In-Flight</th>
+        <th>Queue</th><th>GPU</th><th>Last HB (s)</th>
+      </tr>
+      {''.join(rows) if rows else '<tr><td colspan="11">No workers have registered yet.</td></tr>'}
+    </table>
+    </body></html>
+    """
+    return HTMLResponse(html)
+
+
+# --------------------------------------------------------------------------- #
+# Worker registration payload (shared by WS hello and long-poll register)
+# --------------------------------------------------------------------------- #
+
+
+def apply_worker_hello(worker: WorkerState, models: dict, transport: str) -> None:
+    worker.models = models or {}
+    worker.transport = transport
+    worker.status = "idle"
+    worker.touch()
+    logger.info("Worker '%s' registered via %s. Models: %s",
+                worker.worker_id, transport, list(worker.models.keys()))
+
+
+# --------------------------------------------------------------------------- #
+# WebSocket transport (primary)
+# --------------------------------------------------------------------------- #
+
+
+@app.websocket("/worker/ws")
+async def worker_ws(websocket: WebSocket):
+    await websocket.accept()
+    authed = False
+    worker_id = None
+    worker: Optional[WorkerState] = None
+    try:
+        # First message must be an auth/hello frame.
+        hello_raw = await asyncio.wait_for(websocket.receive_text(), timeout=15)
+        hello = json.loads(hello_raw)
+        if hello.get("type") != "hello":
+            await websocket.close(code=4001)
+            return
+        worker_id = hello.get("worker_id")
+        if not worker_id:
+            await websocket.send_text(json.dumps({
+                "type": "auth_failed", "reason": "worker_id is required",
             }))
+            await websocket.close(code=4001)
+            return
+        timestamp = hello.get("timestamp", "")
+        signature = hello.get("signature", "")
+        if not verify_worker_auth(worker_id, timestamp, signature):
+            await websocket.send_text(json.dumps({"type": "auth_failed"}))
+            await websocket.close(code=4003)
             return
 
-        queue: "asyncio.Queue" = asyncio.Queue()
-        loop = self.loop
+        worker = await REGISTRY.get_or_create(worker_id)
 
-        def on_token(delta: str, finish_reason: Optional[str]) -> None:
-            loop.call_soon_threadsafe(
-                queue.put_nowait, {"delta": delta, "finish_reason": finish_reason})
+        if worker.is_online() and worker.ws is not None:
+            # This specific worker_id already has an active connection --
+            # reject the new one rather than silently stealing the slot.
+            # (Unlike the single-worker reference, DIFFERENT worker_ids are
+            # always allowed to be active simultaneously; this check only
+            # guards against the same worker_id double-connecting.)
+            await websocket.send_text(json.dumps({
+                "type": "auth_failed",
+                "reason": f"worker_id '{worker_id}' already has an active connection",
+            }))
+            await websocket.close(code=4009)
+            return
 
-        def worker_thread() -> None:
-            try:
-                run_inference_streaming(payload, job_id, on_token)
-                loop.call_soon_threadsafe(queue.put_nowait, {"__done__": True})
-            except RuntimeError as e:
-                if is_cuda_oom_error(e):
-                    recover_from_oom(self.target_model_id, e)
-                    err = "cuda_out_of_memory: the model ran out of GPU memory for this request"
-                elif str(e).startswith("cancelled:"):
-                    err = str(e)
-                else:
-                    logger.error("Runtime error during streaming inference: %s\n%s",
-                                  e, traceback.format_exc())
-                    err = f"inference_error: {e}"
-                loop.call_soon_threadsafe(queue.put_nowait, {"__error__": err})
-            except Exception as e:
-                logger.error("Unexpected error during streaming inference: %s\n%s",
-                              e, traceback.format_exc())
-                loop.call_soon_threadsafe(queue.put_nowait, {"__error__": f"inference_error: {e}"})
+        authed = True
+        worker.ws = websocket
+        apply_worker_hello(worker, hello.get("models", {}), "ws")
+        await websocket.send_text(json.dumps({"type": "hello_ack"}))
 
-        threading.Thread(target=worker_thread, daemon=True).start()
+        heartbeat_timeout = CONFIG["websocket"]["heartbeat_timeout_seconds"]
 
-        completion_tokens = 0
+        async def dispatcher(w: WorkerState):
+            """Pulls jobs off THIS worker's queue and pushes them to it one
+            at a time (a single GGUF backend processes one request at a
+            time), waiting for the result before moving on. For streaming
+            jobs, 'done' means the worker sent stream_done/error -- the
+            individual tokens themselves are delivered separately via the
+            job's stream_queue and consumed directly by the SSE response."""
+            while True:
+                job = await REGISTRY.wait_next_for_delivery(w, timeout=5)
+                if job is None:
+                    if not w.is_online() or w.ws is not websocket:
+                        return
+                    continue
+                w.status = "busy"
+                try:
+                    await websocket.send_text(json.dumps({
+                        "type": "job",
+                        "job_id": job.id,
+                        "payload": job.payload,
+                    }))
+                except Exception as e:
+                    await REGISTRY.requeue_or_fail(w, job, f"send failed: {e}")
+                    return
+                # Wait for the job's future to resolve. The window is
+                # rolling (based on last_activity_at) rather than a single
+                # fixed deadline, so a long but actively-streaming
+                # generation doesn't get killed just for taking a while.
+                while not job.future.done():
+                    await asyncio.sleep(0.2)
+                    if not w.is_online() or w.ws is not websocket:
+                        break
+                    last_activity = job.last_activity_at or job.delivered_at or time.time()
+                    if time.time() - last_activity > job.timeout:
+                        break
+                if not job.future.done():
+                    await REGISTRY.requeue_or_fail(w, job, "worker did not respond in time")
+                w.status = "idle"
+
+        dispatcher_task = asyncio.create_task(dispatcher(worker))
+        worker.dispatcher_task = dispatcher_task
+
         try:
             while True:
-                item = await queue.get()
-                if item.get("__done__"):
-                    await ws.send(json.dumps({
-                        "type": "stream_done", "job_id": job_id,
-                        "result": {"usage": {"completion_tokens": completion_tokens}},
-                    }))
-                    return
-                if "__error__" in item:
-                    await ws.send(json.dumps({
-                        "type": "error", "job_id": job_id, "error": item["__error__"],
-                    }))
-                    return
-                if item.get("delta"):
-                    completion_tokens += 1
-                await ws.send(json.dumps({
-                    "type": "stream_chunk", "job_id": job_id,
-                    "delta": item.get("delta", ""), "finish_reason": item.get("finish_reason"),
-                }))
-        except Exception as e:
-            logger.warning("Lost connection while streaming job %s: %s", job_id, e)
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=heartbeat_timeout)
+                msg = json.loads(raw)
+                mtype = msg.get("type")
+                if mtype == "heartbeat":
+                    worker.touch()
+                    worker.status = msg.get("status", worker.status)
+                    worker.current_model = msg.get("current_model", worker.current_model)
+                    if "n_ctx" in msg:
+                        worker.n_ctx = msg.get("n_ctx")
+                    gpu_stats = msg.get("gpu_stats")
+                    if isinstance(gpu_stats, dict):
+                        worker.gpu_stats = gpu_stats
+                    await websocket.send_text(json.dumps({"type": "heartbeat_ack"}))
+                elif mtype == "ack":
+                    worker.touch()  # job delivery acknowledged, nothing else to do
+                elif mtype == "result":
+                    worker.touch()
+                    job_id = msg.get("job_id")
+                    REGISTRY.complete(worker, job_id, msg.get("result"), msg.get("error"))
+                elif mtype == "stream_chunk":
+                    # A single token/delta for an in-progress streaming job.
+                    worker.touch()
+                    job_id = msg.get("job_id")
+                    REGISTRY.mark_activity(worker, job_id)
+                    job = worker.jobs.get(job_id)
+                    if job is not None and job.stream_queue is not None:
+                        await job.stream_queue.put({
+                            "delta": msg.get("delta", ""),
+                            "finish_reason": msg.get("finish_reason"),
+                        })
+                elif mtype == "stream_done":
+                    # Streaming job finished successfully -- unblock the SSE
+                    # consumer with the end-of-stream sentinel and resolve
+                    # the job future (carries aggregated usage, if any).
+                    worker.touch()
+                    job_id = msg.get("job_id")
+                    job = worker.jobs.get(job_id)
+                    if job is not None and job.stream_queue is not None:
+                        await job.stream_queue.put(None)
+                    REGISTRY.complete(worker, job_id, msg.get("result", {}), None)
+                elif mtype == "error":
+                    # Out-of-band error for a job that may be mid-stream.
+                    worker.touch()
+                    job_id = msg.get("job_id")
+                    job = worker.jobs.get(job_id)
+                    if job is not None and job.stream_queue is not None:
+                        await job.stream_queue.put({"error": msg.get("error", "unknown error")})
+                        await job.stream_queue.put(None)
+                    REGISTRY.complete(worker, job_id, None, msg.get("error", "unknown error"))
+                elif mtype == "models_update":
+                    worker.models = msg.get("models", worker.models)
+                else:
+                    logger.debug("Unknown WS message type from worker '%s': %s",
+                                worker_id, mtype)
+        finally:
+            dispatcher_task.cancel()
 
-    async def run_websocket_forever(self):
-        t_cfg = self.config["transport"]
-        backoff = t_cfg["reconnect_initial_backoff_seconds"]
-        max_backoff = t_cfg["reconnect_max_backoff_seconds"]
-
-        while True:
-            try:
-                async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as ws:
-                    hello = {
-                        "type": "hello",
-                        "models": {self.target_model_id: self._worker_model_payload()},
-                        **self._sign(),
-                    }
-                    await ws.send(json.dumps(hello))
-                    ack_raw = await asyncio.wait_for(ws.recv(), timeout=15)
-                    ack = json.loads(ack_raw)
-                    if ack.get("type") != "hello_ack":
-                        raise ConnectionError(f"Handshake rejected: {ack}")
-
-                    logger.info("WebSocket connected and authenticated with proxy.")
-                    logger.info("Ready to serve inference requests.")
-                    self.ws_failures = 0
-                    backoff = t_cfg["reconnect_initial_backoff_seconds"]
-
-                    heartbeat_task = asyncio.create_task(self._ws_heartbeat_loop(ws))
-                    try:
-                        async for raw in ws:
-                            msg = json.loads(raw)
-                            mtype = msg.get("type")
-                            if mtype == "job":
-                                payload = msg["payload"]
-                                await ws.send(json.dumps({"type": "ack", "job_id": msg["job_id"]}))
-                                if payload.get("stream"):
-                                    await self.process_stream_job(ws, msg["job_id"], payload)
-                                else:
-                                    result = await self.process_job(msg["job_id"], payload)
-                                    await ws.send(json.dumps({"type": "result", **result}))
-                            elif mtype == "cancel":
-                                # Client disconnected or the job timed out on
-                                # the proxy side -- the eventual result is
-                                # useless, so hard-kill the subprocess doing
-                                # the work right now instead of letting it
-                                # run to completion and block the next job.
-                                job_id = msg.get("job_id")
-                                if job_id:
-                                    await self.loop.run_in_executor(None, cancel_job, job_id)
-                            elif mtype == "heartbeat_ack":
-                                pass
-                            else:
-                                logger.debug("Unhandled WS message: %s", msg)
-                    finally:
-                        heartbeat_task.cancel()
-
-            except (asyncio.CancelledError,):
-                raise
-            except Exception as e:
-                self.ws_failures += 1
-                logger.warning("WebSocket connection failed/dropped (%s). Failure count=%d",
-                                e, self.ws_failures)
-                if self.ws_failures >= t_cfg["ws_failure_threshold_before_poll_fallback"]:
-                    logger.info("Too many WS failures, switching to long-poll fallback.")
-                    return
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
-
-    async def _ws_heartbeat_loop(self, ws):
-        interval = self.config["transport"].get("heartbeat_interval_seconds", 5)
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                payload = await self._heartbeat_payload()
-                await ws.send(json.dumps(payload))
-            except Exception:
-                return
-
-    async def run_long_poll_forever(self, stop_after_seconds: float):
-        """Runs long-poll for a while (including its own periodic heartbeat
-        posts), then returns so the caller can retry upgrading back to WS.
-
-        Long-poll has no push channel for the proxy to deliver an
-        out-of-band cancel while a job is running, so on this transport a
-        cancel is instead piggybacked onto the heartbeat response (see
-        _poll_heartbeat below) and checked between poll cycles. This means
-        cancellation latency on long-poll is bounded by the heartbeat
-        interval rather than being instant, which is an inherent limitation
-        of a pure request/response fallback transport -- WS remains the
-        transport to prefer whenever available for exactly this reason.
-        """
-        t_cfg = self.config["transport"]
-        try:
-            requests.post(f"{self.proxy_url}/worker/register", json={
-                "models": {self.target_model_id: self._worker_model_payload()},
-                **self._sign(),
-            }, timeout=15)
-        except Exception as e:
-            logger.warning("Long-poll registration failed: %s", e)
-
-        heartbeat_interval = t_cfg.get("heartbeat_interval_seconds", 5)
-        last_heartbeat = 0.0
-        end_time = time.time() + stop_after_seconds
-        while time.time() < end_time:
-            try:
-                if time.time() - last_heartbeat >= heartbeat_interval:
-                    await self._poll_heartbeat()
-                    last_heartbeat = time.time()
-
-                params = {**self._sign(), "worker_id": self.worker_id}
-                resp = await self.loop.run_in_executor(
-                    None,
-                    lambda: requests.get(f"{self.proxy_url}/worker/poll", params=params,
-                                          timeout=t_cfg["long_poll_wait_seconds"] + 15),
-                )
-                if resp.status_code != 200:
-                    logger.warning("Long-poll returned HTTP %s: %s", resp.status_code, resp.text[:200])
-                    await asyncio.sleep(t_cfg["poll_interval_seconds"])
-                    continue
-                data = resp.json()
-                job = data.get("job")
-                if job is None:
-                    continue
-                result = await self.process_job(job["job_id"], job["payload"])
-                await self.loop.run_in_executor(
-                    None,
-                    lambda: requests.post(f"{self.proxy_url}/worker/result",
-                                           json={**self._sign(), **result}, timeout=30),
-                )
-            except Exception as e:
-                logger.warning("Long-poll cycle error: %s", e)
-                await asyncio.sleep(t_cfg["poll_interval_seconds"])
-
-    async def _poll_heartbeat(self):
-        try:
-            payload = await self._heartbeat_payload()
-            resp = await self.loop.run_in_executor(
-                None,
-                lambda: requests.post(f"{self.proxy_url}/worker/heartbeat",
-                                       json=payload, timeout=15),
-            )
-            try:
-                data = resp.json()
-            except Exception:
-                return
-            cancel_job_id = data.get("cancel_job_id")
-            if cancel_job_id:
-                cancel_job(cancel_job_id)
-        except Exception:
-            pass
-
-    async def deregister(self):
-        """Tells the proxy we're going away so it stops waiting on us."""
-        try:
-            await self.loop.run_in_executor(
-                None,
-                lambda: requests.post(f"{self.proxy_url}/worker/deregister",
-                                       json=self._sign(), timeout=10),
-            )
-            logger.info("Deregistered from proxy.")
-        except Exception as e:
-            logger.warning("Deregistration call failed (proxy may already consider us offline): %s", e)
-
-    async def run_forever(self):
-        prefer_ws = self.config["transport"].get("prefer_websocket", True)
-        while True:
-            if prefer_ws:
-                try:
-                    await self.run_websocket_forever()
-                except Exception as e:
-                    logger.error("WebSocket loop crashed: %s", e)
-                logger.info("Falling back to long-polling before retrying WebSocket...")
-            await self.run_long_poll_forever(stop_after_seconds=120)
-            logger.info("Attempting to upgrade back to WebSocket transport...")
-
-
-def recover_from_oom(model_alias: str, e: Exception) -> None:
-    """Free what CUDA cache we can in THIS (parent) process after a job's
-    child process reported an OOM. The child process itself already exited
-    (taking its own CUDA context with it), so there's no reload to do here
-    -- just surface the error for that one request."""
-    logger.error("CUDA OOM while running '%s': %s", model_alias, e)
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
+    except (WebSocketDisconnect, asyncio.TimeoutError):
         pass
-
-
-# --------------------------------------------------------------------------- #
-# Entrypoint
-# --------------------------------------------------------------------------- #
-
-
-async def main():
-    # Step 1/2: download + verify-load the single target model BEFORE
-    # connecting to the proxy, so the worker never advertises itself as
-    # ready until it actually knows a working (n_ctx, n_gpu_layers, ...)
-    # configuration for per-job runner processes to use.
-    loop = asyncio.get_event_loop()
-    try:
-        await loop.run_in_executor(None, MODELS.load_startup_model)
     except Exception as e:
-        logger.error("FATAL: could not load target model '%s': %s\n%s",
-                     f"{TARGET_MODEL_REPO}/{FILE_NAME}", e, traceback.format_exc())
-        sys.exit(1)
-
-    client = ProxyClient(CONFIG, MODELS.target_model_id, TARGET_MODEL_REPO, FILE_NAME)
-    monitor_task = asyncio.create_task(disk_monitor_loop())
-    try:
-        while True:
-            try:
-                await client.run_forever()
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                logger.error("Top-level worker loop crashed, restarting in 5s: %s\n%s",
-                              e, traceback.format_exc())
-                await asyncio.sleep(5)
-    except KeyboardInterrupt:
-        logger.info("Shutting down worker (KeyboardInterrupt).")
-        await client.deregister()
-        MODELS.unload()
-        return
+        logger.warning("Worker '%s' WS session error: %s", worker_id, e)
     finally:
-        monitor_task.cancel()
+        if authed and worker is not None and worker.ws is websocket:
+            worker.ws = None
+            worker.transport = None
+            # Mark offline THE INSTANT the socket is gone -- don't wait for
+            # worker_offline_after_seconds. The dispatcher task tied to this
+            # connection has already been cancelled above, so nothing will
+            # ever pull queued jobs or resolve in-flight ones for this
+            # connection; without this, is_online() would keep reporting
+            # True for up to worker_offline_after_seconds, so new requests
+            # would be routed to it and then hang, and any job that was
+            # already delivered would just sit until its own (much longer)
+            # per-job timeout expired. mark_offline() also stamps
+            # disconnected_at, which starts the reconnect-grace clock used
+            # by the watchdog to decide when to cancel remaining jobs and
+            # remove this worker entirely if it never comes back.
+            worker.mark_offline()
+            logger.info("Worker '%s' disconnected from WebSocket.", worker_id)
+            await REGISTRY.fail_in_flight_jobs_for_worker(
+                worker, "worker disconnected mid-request")
+
+
+# --------------------------------------------------------------------------- #
+# Long-poll transport (fallback)
+# --------------------------------------------------------------------------- #
+
+
+@app.post("/worker/register")
+async def worker_register(request: Request):
+    body = await request.json()
+    worker_id = body.get("worker_id")
+    if not worker_id:
+        raise HTTPException(status_code=400, detail="worker_id is required")
+    if not verify_worker_auth(worker_id, body.get("timestamp", ""), body.get("signature", "")):
+        raise HTTPException(status_code=401, detail="bad worker signature")
+
+    worker = await REGISTRY.get_or_create(worker_id)
+    if worker.is_online() and worker.transport == "ws":
+        # This worker_id already has a live WebSocket connection; don't let
+        # a stray long-poll registration for the same id silently steal or
+        # confuse routing. Other worker_ids are unaffected.
+        raise HTTPException(status_code=409, detail=(
+            f"worker_id '{worker_id}' already has an active WebSocket connection"))
+    apply_worker_hello(worker, body.get("models", {}), "poll")
+    return {"status": "registered"}
+
+
+@app.get("/worker/poll")
+async def worker_poll(worker_id: str, timestamp: str, signature: str):
+    if not verify_worker_auth(worker_id, timestamp, signature):
+        raise HTTPException(status_code=401, detail="bad worker signature")
+    worker = REGISTRY.get(worker_id)
+    if worker is None:
+        raise HTTPException(status_code=404, detail=(
+            "worker_id not registered -- call /worker/register first"))
+    worker.touch()
+    if worker.transport != "ws":
+        worker.transport = "poll"
+    worker.status = "idle"
+    job = await REGISTRY.wait_next_for_delivery(
+        worker, timeout=CONFIG["long_poll_timeout_seconds"])
+    if job is None:
+        return {"job": None}
+    worker.status = "busy"
+    return {"job": {"job_id": job.id, "payload": job.payload}}
+
+
+@app.post("/worker/result")
+async def worker_result(request: Request):
+    body = await request.json()
+    worker_id = body.get("worker_id")
+    if not worker_id:
+        raise HTTPException(status_code=400, detail="worker_id is required")
+    if not verify_worker_auth(worker_id, body.get("timestamp", ""), body.get("signature", "")):
+        raise HTTPException(status_code=401, detail="bad worker signature")
+    worker = REGISTRY.get(worker_id)
+    if worker is None:
+        raise HTTPException(status_code=404, detail="unknown worker_id")
+    worker.touch()
+    worker.status = "idle"
+    job_id = body.get("job_id")
+    ok = REGISTRY.complete(worker, job_id, body.get("result"), body.get("error"))
+    return {"accepted": ok}
+
+
+@app.post("/worker/heartbeat")
+async def worker_heartbeat(request: Request):
+    """Used by long-poll workers between jobs so they're marked online even
+    while /worker/poll is (deliberately) blocked waiting for work. Also
+    carries GPU stats and loaded n_ctx, since long-poll workers have no
+    other channel to push them outside of a job cycle.
+
+    The response may include `cancel_job_id`: if the proxy has a pending
+    cancellation queued for this worker (see WorkerState.request_cancel),
+    it's handed back here so the worker can hard-kill that job on its next
+    check -- this is the long-poll equivalent of the immediate WS "cancel"
+    push, just bounded to one heartbeat interval of latency instead of
+    being instant.
+    """
+    body = await request.json()
+    worker_id = body.get("worker_id")
+    if not worker_id:
+        raise HTTPException(status_code=400, detail="worker_id is required")
+    if not verify_worker_auth(worker_id, body.get("timestamp", ""), body.get("signature", "")):
+        raise HTTPException(status_code=401, detail="bad worker signature")
+    worker = REGISTRY.get(worker_id)
+    if worker is None:
+        raise HTTPException(status_code=404, detail=(
+            "worker_id not registered -- call /worker/register first"))
+    worker.touch()
+    worker.status = body.get("status", worker.status)
+    worker.current_model = body.get("current_model", worker.current_model)
+    if "n_ctx" in body:
+        worker.n_ctx = body.get("n_ctx")
+    gpu_stats = body.get("gpu_stats")
+    if isinstance(gpu_stats, dict):
+        worker.gpu_stats = gpu_stats
+    if "models" in body:
+        worker.models = body["models"]
+
+    response: Dict[str, Any] = {"status": "ok"}
+    if worker.pending_cancel_job_id:
+        response["cancel_job_id"] = worker.pending_cancel_job_id
+        worker.pending_cancel_job_id = None
+    return response
+
+
+@app.post("/worker/deregister")
+async def worker_deregister(request: Request):
+    """Explicit 'I'm shutting down' signal. Both transports can call this on
+    a clean shutdown (e.g. Ctrl+C in a Kaggle notebook) so the proxy learns
+    about the disconnect immediately instead of relying purely on the
+    WebSocket close event or the long-poll heartbeat timeout."""
+    body = await request.json()
+    worker_id = body.get("worker_id")
+    if not worker_id:
+        raise HTTPException(status_code=400, detail="worker_id is required")
+    if not verify_worker_auth(worker_id, body.get("timestamp", ""), body.get("signature", "")):
+        raise HTTPException(status_code=401, detail="bad worker signature")
+    worker = REGISTRY.get(worker_id)
+    if worker is not None:
+        worker.ws = None
+        worker.transport = None
+        worker.mark_offline()
+        logger.info("Worker '%s' explicitly deregistered.", worker_id)
+        await REGISTRY.fail_in_flight_jobs_for_worker(worker, "worker deregistered")
+    return {"status": "deregistered"}
+
+
+# --------------------------------------------------------------------------- #
+# Background watchdog: fail jobs that were delivered but never completed
+# (covers the case of a worker dying mid-job on either transport, as a
+# backstop for anything the immediate-disconnect handlers above don't catch
+# -- e.g. a long-poll worker that vanishes without ever calling
+# /worker/deregister). Now iterates every worker's job map, not a single
+# global one. It also enforces the reconnect grace window: any worker that
+# has been continuously disconnected for longer than
+# worker_reconnect_grace_seconds (default 30s) has ALL of its remaining
+# jobs cancelled and is removed from the registry outright, rather than
+# lingering with a queue nothing will ever service.
+# --------------------------------------------------------------------------- #
+
+
+async def watchdog_loop():
+    reconnect_grace = CONFIG.get("worker_reconnect_grace_seconds", 30)
+    while True:
+        await asyncio.sleep(5)
+        now = time.time()
+        for worker in REGISTRY.all_workers():
+            for job in list(worker.jobs.values()):
+                if job.future.done():
+                    continue
+                if job.delivered:
+                    last_activity = job.last_activity_at or job.delivered_at or now
+                    if (now - last_activity) > job.timeout:
+                        await REGISTRY.requeue_or_fail(worker, job, "delivery watchdog timeout")
+                elif (now - job.created_at) > job.timeout:
+                    if job.stream_queue is not None:
+                        await job.stream_queue.put({"error": "timed out waiting in queue"})
+                        await job.stream_queue.put(None)
+                    REGISTRY._resolve_future(job, error="timed out waiting in queue")
+                    worker.in_flight_jobs = max(0, worker.in_flight_jobs - 1)
+                    await REGISTRY.cancel_job_on_worker(worker, job, "timed out waiting in queue")
+            # A worker whose heartbeat has gone stale (e.g. a long-poll
+            # worker that stopped calling /worker/heartbeat or /worker/poll
+            # without ever hitting /worker/deregister) should be swept to
+            # offline here too, so routing stops sending it new work even
+            # before worker_offline_after_seconds would naturally expire on
+            # its own via is_online()'s own check. (is_online() already
+            # handles the expiry math; this block only handles failing its
+            # in-flight jobs once that expiry has occurred, and stamping
+            # disconnected_at so the reconnect-grace reaper below can
+            # eventually pick it up too.)
+            if not worker.is_online() and worker.in_flight_jobs > 0:
+                await REGISTRY.fail_in_flight_jobs_for_worker(
+                    worker, "worker heartbeat expired")
+                if worker.disconnected_at is None:
+                    worker.disconnected_at = now
+        # Any worker that has now been disconnected continuously for at
+        # least `reconnect_grace` seconds gets its remaining jobs cancelled
+        # (queued ones included, not just in-flight) and is dropped from
+        # the registry entirely -- it does not get to sit around waiting
+        # for a reconnect that isn't guaranteed to come.
+        await REGISTRY.reap_unreconnected_workers(
+            reconnect_grace, "worker did not reconnect within the grace period")
+        REGISTRY.cleanup()
+        REGISTRY.prune_dead_workers()
+
+
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(watchdog_loop())
+    logger.info("Multi-worker proxy server started on %s:%s",
+                CONFIG["host"], CONFIG["port"])
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        MODELS.unload()
-        print("[worker] Stopped.")
+    uvicorn.run(app, host=CONFIG["host"], port=CONFIG["port"], log_level="info")
