@@ -317,6 +317,82 @@ class Job:
     abandoned: bool = False
     liveness_task: "Optional[asyncio.Task]" = None
 
+    # True once real_stream_generator() has actually started being
+    # iterated by Starlette's StreamingResponse machinery for this job.
+    # From that point on, Starlette's own internal disconnect-listener
+    # task owns the request's ASGI receive() channel -- see the long
+    # comment in watch_job_liveness() for why watch_job_liveness() MUST
+    # NOT call request.is_disconnected() (which itself calls receive())
+    # concurrently with that once this is True, on pain of the two
+    # consumers racing for the same 'http.disconnect' message and one of
+    # them silently losing it.
+    stream_response_active: bool = False
+
+    # -- Stream diagnostics, for the dashboard's per-worker detail dialog - #
+    # Purely informational; nothing else in the proxy reads these. Updated
+    # by real_stream_generator() (the ping_* and generator_exit_at fields)
+    # and by watch_job_liveness() (the is_disconnected_* fields) so an
+    # operator can see, live, which of the layered disconnect signals (if
+    # any) is actually firing for a given in-flight streaming job.
+    stream_ping_sent_count: int = 0
+    stream_ping_ok_count: int = 0
+    stream_ping_failed_count: int = 0
+    last_ping_sent_at: Optional[float] = None
+    last_ping_ok_at: Optional[float] = None
+    last_ping_failed_at: Optional[float] = None
+    generator_exit_at: Optional[float] = None
+    last_is_disconnected_check_at: Optional[float] = None
+    last_is_disconnected_result: Optional[bool] = None
+
+    def diagnostic_snapshot(self) -> dict:
+        """Everything the dashboard's per-worker detail dialog shows about
+        this job's stream-receiver / disconnect-detection state. Purely
+        informational -- read-only view onto the fields above."""
+        now = time.time()
+
+        def age(ts: Optional[float]) -> Optional[float]:
+            return round(now - ts, 1) if ts is not None else None
+
+        return {
+            "job_id": self.id,
+            "kind": self.kind,
+            "stream": self.stream,
+            "created_at": self.created_at,
+            "age_seconds": age(self.created_at),
+            "delivered": self.delivered,
+            "delivered_at": self.delivered_at,
+            "delivered_age_seconds": age(self.delivered_at),
+            "last_activity_at": self.last_activity_at,
+            "last_activity_age_seconds": age(self.last_activity_at),
+            "done": self.future.done(),
+            "abandoned": self.abandoned,
+            "cancel_requested": self.cancel_requested,
+            # True once the SSE StreamingResponse actually took over this
+            # request's receive() channel (see stream_response_active on
+            # the Job dataclass). If this is False for a job the operator
+            # expects to be streaming, the stream never actually started
+            # (e.g. still queued) -- so "no cancel yet" may just mean
+            # "not delivered yet", not a detection failure.
+            "stream_response_active": self.stream_response_active,
+            "stream_ping_sent_count": self.stream_ping_sent_count,
+            "stream_ping_ok_count": self.stream_ping_ok_count,
+            "stream_ping_failed_count": self.stream_ping_failed_count,
+            "last_ping_sent_at": self.last_ping_sent_at,
+            "last_ping_sent_age_seconds": age(self.last_ping_sent_at),
+            "last_ping_ok_at": self.last_ping_ok_at,
+            "last_ping_ok_age_seconds": age(self.last_ping_ok_at),
+            "last_ping_failed_at": self.last_ping_failed_at,
+            "generator_exit_at": self.generator_exit_at,
+            "generator_exit_age_seconds": age(self.generator_exit_at),
+            # Only meaningful while stream_response_active is False (see
+            # watch_job_liveness): once the SSE generator takes over, this
+            # stops updating on purpose, to avoid racing the generator's
+            # own disconnect detection for the same receive() channel.
+            "last_is_disconnected_check_at": self.last_is_disconnected_check_at,
+            "last_is_disconnected_check_age_seconds": age(self.last_is_disconnected_check_at),
+            "last_is_disconnected_result": self.last_is_disconnected_result,
+        }
+
 
 # --------------------------------------------------------------------------- #
 # Per-worker state
@@ -610,6 +686,41 @@ class WorkerRegistry:
         exist specifically as the deterministic backstop for whenever this
         signal fails to fire (e.g. a reverse proxy masking the disconnect
         entirely) -- see /worker/{worker_id}/kill.
+
+        CRITICAL SECOND CAVEAT (this is what was actually breaking
+        streaming cancellation): request.is_disconnected() itself calls
+        `await request.receive()` under the hood. For a *streaming*
+        response, Starlette's own StreamingResponse machinery runs a
+        concurrent `listen_for_disconnect` task that ALSO calls
+        `receive()` on that exact same ASGI channel, specifically so it
+        can turn a real 'http.disconnect' message into a GeneratorExit on
+        real_stream_generator(). An ASGI receive() channel has exactly
+        ONE message per event and can only be consumed by whichever
+        coroutine happens to call receive() first. Running this polling
+        loop's is_disconnected() calls concurrently with that means the
+        two consumers are racing for the same disconnect message: on any
+        given tick, either this loop "wins" and correctly learns the
+        client is gone (fine), OR Starlette's own listener wins instead
+        -- and receive() delivers a message to exactly one caller, so
+        whichever one didn't win never sees it. If THIS loop happens to
+        be mid-receive() when the real disconnect lands and loses that
+        race silently (no exception, it just never gets that particular
+        message), it will keep returning False on every subsequent call
+        forever, since there is nothing left in the channel to read; and
+        Starlette's own listener, having "lost" a race on some other
+        tick, may equally fail to fire GeneratorExit. Depending purely on
+        scheduling timing, this produces exactly the symptom reported:
+        intermittent, unreliable detection of streaming disconnects --
+        including runs where cancellation flat-out never happens despite
+        working when tested manually. The fix: once
+        job.stream_response_active is True (real_stream_generator has
+        started running and therefore Starlette's own listener now owns
+        this request's receive() channel), this loop MUST stop calling
+        request.is_disconnected() entirely and fall back to a read-only
+        wait on job.future -- detection during active streaming is left
+        entirely to real_stream_generator's own keepalive-ping/
+        GeneratorExit signals, which no longer have a competing consumer
+        stealing their messages.
         """
         interval = CONFIG.get("client_disconnect_check_interval_seconds", 1.0)
         try:
@@ -617,6 +728,14 @@ class WorkerRegistry:
                 await asyncio.sleep(interval)
                 if job.future.done():
                     return
+                if job.stream_response_active:
+                    # The SSE generator now owns request's receive()
+                    # channel exclusively. Don't touch is_disconnected()
+                    # -- just keep idling so we're still around to react
+                    # if job.future resolves (e.g. the generator's own
+                    # ping/GeneratorExit path abandons the job), and loop
+                    # back to sleep otherwise.
+                    continue
                 disconnected = False
                 try:
                     disconnected = await request.is_disconnected()
@@ -627,6 +746,8 @@ class WorkerRegistry:
                     # as disconnected rather than looping forever assuming
                     # the connection is fine.
                     disconnected = True
+                job.last_is_disconnected_check_at = time.time()
+                job.last_is_disconnected_result = disconnected
                 if disconnected:
                     job.abandoned = True
                     logger.info(
@@ -1097,6 +1218,16 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
     _PING_DUE = object()  # sentinel; stream_queue itself only ever holds
                           # dict items or None, so this can't collide
 
+    # From this point on, Starlette's StreamingResponse is actively
+    # iterating this generator, which means its own internal
+    # listen_for_disconnect task now owns request's ASGI receive()
+    # channel. Tell watch_job_liveness to back off from
+    # request.is_disconnected() (which also calls receive()) so the two
+    # don't race for the same 'http.disconnect' message -- see the long
+    # comment on watch_job_liveness for why that race is what was
+    # actually breaking streaming cancellation.
+    job.stream_response_active = True
+
     async def abandon(reason: str) -> None:
         if job.future.done():
             return
@@ -1145,15 +1276,21 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
                     yield f"data: {json.dumps(err)}\n\n"
                     await REGISTRY.cancel_job_on_worker(worker, job, "stream token timeout")
                     break
+                job.stream_ping_sent_count += 1
+                job.last_ping_sent_at = time.time()
                 try:
                     yield ": ping\n\n"
                     last_ping_at = time.time()
+                    job.last_ping_ok_at = last_ping_at
+                    job.stream_ping_ok_count += 1
                 except Exception:
                     # The write itself failed -- this IS the connection
                     # being confirmed dead, no polling needed. Re-raise so
                     # the outer GeneratorExit/Exception handling below
                     # (or, if this isn't a GeneratorExit, the generic
                     # except clause) can run the same abandon path.
+                    job.last_ping_failed_at = time.time()
+                    job.stream_ping_failed_count += 1
                     await abandon("keepalive write failed")
                     raise
                 continue
@@ -1202,6 +1339,7 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
         # yield would raise "generator ignored GeneratorExit"), so the
         # `finally` below skips its usual DONE sentinel in this case.
         exiting_via_generator_exit = True
+        job.generator_exit_at = time.time()
         if not job.future.done():
             asyncio.create_task(abandon("generator closed"))
         raise
@@ -1426,6 +1564,25 @@ async def kill_all():
     return result
 
 
+@app.get("/worker/{worker_id}/detail")
+async def worker_detail(worker_id: str):
+    """Everything the dashboard's per-worker detail dialog shows: the
+    worker's own snapshot() plus a diagnostic_snapshot() for every job it
+    currently owns (queued or in-flight), most-recent first. This is what
+    lets an operator see, live, whether a streaming job's SSE receiver is
+    still considered connected, when it last got a ping through
+    successfully, whether GeneratorExit has fired, etc. -- instead of only
+    being able to infer it indirectly from worker-side logs."""
+    worker = REGISTRY.get(worker_id)
+    if worker is None:
+        raise HTTPException(status_code=404, detail=f"unknown worker_id '{worker_id}'")
+    jobs = sorted(worker.jobs.values(), key=lambda j: j.created_at, reverse=True)
+    return {
+        "worker": worker.snapshot(),
+        "jobs": [j.diagnostic_snapshot() for j in jobs],
+    }
+
+
 @app.post("/worker/{worker_id}/kill")
 async def kill_worker(worker_id: str):
     """Per-worker emergency stop: empties THIS worker's queue, fails every
@@ -1466,7 +1623,7 @@ async def dashboard():
         n_ctx_str = f"{snap['n_ctx']:,}" if snap.get("n_ctx") else "—"
         wid = snap['worker_id']
         rows.append(f"""
-      <tr>
+      <tr class="worker-row" onclick="showDetail('{wid}')">
         <td>{wid}</td>
         <td class="{status_class}">{snap['online']}</td>
         <td>{snap['transport']}</td>
@@ -1478,7 +1635,7 @@ async def dashboard():
         <td>{snap['queue_depth']}</td>
         <td>{gpu_str}</td>
         <td>{snap['last_heartbeat_age_seconds']}</td>
-        <td><button class="kill-btn" onclick="killWorker('{wid}')">Kill</button></td>
+        <td><button class="kill-btn" onclick="event.stopPropagation(); killWorker('{wid}')">Kill</button></td>
       </tr>""")
 
     total_queue = REGISTRY.total_queue_depth()
@@ -1510,6 +1667,27 @@ async def dashboard():
         }}
         .kill-all-btn:hover {{ background:#da3633; }}
         #status-msg {{ color:#8b949e; margin-left: 1em; }}
+        .worker-row {{ cursor: pointer; }}
+        .worker-row:hover {{ background: #161b22; }}
+        #detail-overlay {{
+            display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6);
+            z-index: 10;
+        }}
+        #detail-dialog {{
+            display:none; position:fixed; top:8%; left:50%; transform:translateX(-50%);
+            width:min(760px, 90vw); max-height:80vh; overflow-y:auto;
+            background:#0d1117; border:1px solid #30363d; border-radius:8px;
+            padding:1.5rem; z-index:11;
+        }}
+        #detail-dialog h3 {{ margin-top:0; }}
+        #detail-dialog .close-btn {{
+            float:right; background:none; border:none; color:#8b949e;
+            font-size:1.2em; cursor:pointer;
+        }}
+        #detail-dialog table {{ margin-top: 0.5em; }}
+        #detail-dialog td:first-child {{ color:#8b949e; white-space:nowrap; }}
+        .sig-ok {{ color:#3fb950; }} .sig-bad {{ color:#f85149; }} .sig-warn {{ color:#d29922; }}
+        .job-block {{ border-top: 1px solid #21262d; margin-top: 1em; padding-top: 0.8em; }}
     </style></head><body>
     <h2>GGUF Kaggle Multi-Worker Proxy Dashboard</h2>
     <p class="sub">{online_count}/{len(workers)} workers online &middot;
@@ -1524,6 +1702,14 @@ async def dashboard():
     </table>
     <button class="kill-all-btn" onclick="killAll()">Kill ALL Workers</button>
     <span id="status-msg"></span>
+
+    <div id="detail-overlay" onclick="closeDetail()"></div>
+    <div id="detail-dialog">
+        <button class="close-btn" onclick="closeDetail()">&times;</button>
+        <h3 id="detail-title">Worker detail</h3>
+        <div id="detail-body">Loading…</div>
+    </div>
+
     <script>
         const refreshSeconds = {refresh};
 
@@ -1569,10 +1755,103 @@ async def dashboard():
             }}
         }}
 
+        let detailOpen = false;
+        let detailWorkerId = null;
+        let detailPollTimer = null;
+
+        function fmtAge(seconds) {{
+            if (seconds === null || seconds === undefined) return 'never';
+            return seconds.toFixed(1) + 's ago';
+        }}
+
+        function renderJob(job) {{
+            // Green = signal fired and looks healthy, yellow = signal hasn't
+            // fired yet but stream is young, red = signal notably absent
+            // given how long the job's been running.
+            const age = job.age_seconds ?? 0;
+            const streamActiveCls = job.stream_response_active ? 'sig-ok' : 'sig-warn';
+            let pingCls = 'sig-warn';
+            if (job.last_ping_ok_age_seconds !== null && job.last_ping_ok_age_seconds !== undefined) {{
+                pingCls = job.last_ping_ok_age_seconds < 5 ? 'sig-ok' : 'sig-bad';
+            }} else if (job.stream_response_active && age > 5) {{
+                pingCls = 'sig-bad';
+            }}
+            const genExitCls = job.generator_exit_at ? 'sig-warn' : '';
+            const disconnCls = job.last_is_disconnected_result ? 'sig-bad'
+                              : (job.last_is_disconnected_result === false ? 'sig-ok' : '');
+            return `
+                <div class="job-block">
+                  <table>
+                    <tr><td>Job ID</td><td>${{job.job_id}}</td></tr>
+                    <tr><td>Kind / streaming</td><td>${{job.kind}} / ${{job.stream}}</td></tr>
+                    <tr><td>Age</td><td>${{age.toFixed(1)}}s</td></tr>
+                    <tr><td>Done / abandoned / cancel requested</td>
+                        <td>${{job.done}} / ${{job.abandoned}} / ${{job.cancel_requested}}</td></tr>
+                    <tr><td>Stream receiver connected</td>
+                        <td class="${{streamActiveCls}}">${{job.stream_response_active}}
+                        ${{job.stream_response_active ? '' : '(not streaming yet, or non-streaming job)'}}</td></tr>
+                    <tr><td>Pings sent / ok / failed</td>
+                        <td>${{job.stream_ping_sent_count}} / ${{job.stream_ping_ok_count}} / ${{job.stream_ping_failed_count}}</td></tr>
+                    <tr><td>Last ping ok</td>
+                        <td class="${{pingCls}}">${{fmtAge(job.last_ping_ok_age_seconds)}}</td></tr>
+                    <tr><td>Last ping failed</td><td>${{job.last_ping_failed_at ? 'yes, at ' + new Date(job.last_ping_failed_at * 1000).toLocaleTimeString() : 'no'}}</td></tr>
+                    <tr><td>GeneratorExit fired</td>
+                        <td class="${{genExitCls}}">${{job.generator_exit_at ? fmtAge(job.generator_exit_age_seconds) : 'no'}}</td></tr>
+                    <tr><td>Last is_disconnected() check</td>
+                        <td class="${{disconnCls}}">${{job.last_is_disconnected_result === null || job.last_is_disconnected_result === undefined ? 'never checked' : (job.last_is_disconnected_result + ', ' + fmtAge(job.last_is_disconnected_check_age_seconds))}}</td></tr>
+                    <tr><td>Last token activity</td><td>${{fmtAge(job.last_activity_age_seconds)}}</td></tr>
+                  </table>
+                </div>`;
+        }}
+
+        async function refreshDetail() {{
+            if (!detailOpen || !detailWorkerId) return;
+            try {{
+                const resp = await fetch('/worker/' + encodeURIComponent(detailWorkerId) + '/detail');
+                if (!resp.ok) {{
+                    document.getElementById('detail-body').textContent = 'Worker no longer found.';
+                    return;
+                }}
+                const data = await resp.json();
+                const body = document.getElementById('detail-body');
+                if (!data.jobs.length) {{
+                    body.innerHTML = '<p>No jobs (queued or in-flight) currently tracked for this worker.</p>';
+                    return;
+                }}
+                body.innerHTML = data.jobs.map(renderJob).join('');
+            }} catch (e) {{
+                document.getElementById('detail-body').textContent = 'Fetch failed: ' + e;
+            }}
+        }}
+
+        function showDetail(workerId) {{
+            detailOpen = true;
+            detailWorkerId = workerId;
+            document.getElementById('detail-title').textContent = 'Worker: ' + workerId;
+            document.getElementById('detail-overlay').style.display = 'block';
+            document.getElementById('detail-dialog').style.display = 'block';
+            refreshDetail();
+            detailPollTimer = setInterval(refreshDetail, 1000);
+        }}
+
+        function closeDetail() {{
+            detailOpen = false;
+            detailWorkerId = null;
+            document.getElementById('detail-overlay').style.display = 'none';
+            document.getElementById('detail-dialog').style.display = 'none';
+            if (detailPollTimer) {{
+                clearInterval(detailPollTimer);
+                detailPollTimer = null;
+            }}
+        }}
+
         // JS-driven refresh instead of <meta refresh> so an in-flight kill
         // action's confirm()/status message doesn't get yanked away by an
-        // unconditional page reload firing mid-click.
-        setTimeout(() => location.reload(), refreshSeconds * 1000);
+        // unconditional page reload firing mid-click -- and so the detail
+        // dialog (which polls independently every second) doesn't get
+        // wiped out by a full-page reload while someone's actively
+        // inspecting a worker's stream diagnostics.
+        setTimeout(() => {{ if (!detailOpen) location.reload(); }}, refreshSeconds * 1000);
     </script>
     </body></html>
     """
