@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button';
 
 import { AccountsTab } from './components/AccountsTab';
 import { DeploymentsTab } from './components/DeploymentsTab';
+import { RunningDeploymentsPanel } from './components/RunningDeploymentsPanel';
 import { useWebSocket } from './hooks/useWebSocket';
 import { LoginPage } from './pages/LoginPage';
 import { AuthProvider, useAuth } from './context/AuthContext';
@@ -78,6 +79,9 @@ function Dashboard() {
                 <><WifiOff className="w-3 h-3 text-red-500" /><span className="text-muted-foreground font-medium">Offline</span></>
               )}
             </div>
+
+            {/* Running deployments panel */}
+            <RunningDeploymentsPanel />
 
             {/* Logout */}
             <Button
