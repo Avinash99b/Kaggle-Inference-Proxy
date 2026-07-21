@@ -329,6 +329,11 @@ class OrchestratorConfig:
     # Optional URL to inference subprocess file that gets downloaded
     # alongside the main inference script.
     inference_subprocess_file: Optional[str] = None
+    # Deployments older than this (measured from DeploymentState.created_at)
+    # are automatically torn down (Kaggle kernel deleted + local state
+    # cleared) by deployment_status_loop's periodic sweep. Default is one
+    # day. Set to 0 or a negative value to disable the sweep entirely.
+    max_deployment_age_hours: float = 24.0
 
 
 ###############################################################################
@@ -1548,11 +1553,26 @@ class KaggleService:
         except HTTPException:
             raise
         except Exception as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code == 404 or "not found" in str(e).lower() or "404" in str(e):
+                # The notebook is already gone on Kaggle's side (deleted
+                # out-of-band, or it simply disappeared -- this is the
+                # exact scenario that originally caused delete_deployment
+                # to think it needed to keep retrying / left stale
+                # account.deployment state around). Nothing left to
+                # delete is a successful outcome, not a failure: log at
+                # info and let the caller proceed to clear local state.
+                logger.info(
+                    f"Kernel {kernel_ref} for deployment {deployment.deployment_id} "
+                    f"was already gone on Kaggle; treating delete as successful."
+                )
+                return
             self._log_http_error_detail(e, f"kernels_delete failed for {kernel_ref}")
             logger.error(
                 f"Failed to delete kernel {kernel_ref} for deployment {deployment.deployment_id}: {e}. "
                 f"May still be running on Kaggle; delete manually if needed."
             )
+            raise
 
     async def list_notebooks(self, account: AccountState) -> List[dict]:
         """
@@ -1854,6 +1874,181 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"Error during KaggleSessionManager shutdown: {e}")
 
+    async def _reconcile_account_deployment(self, account: "AccountState") -> Optional[str]:
+        """
+        Single-account version of the startup reconciliation logic:
+        lists `account`'s live Kaggle kernels, finds the (at most one)
+        orchestrator-owned kernel that should represent its current
+        deployment, and updates self.deployments / account.deployment
+        to match Kaggle's live state -- Kaggle is always the source of
+        truth here, never local memory/orchestrator_state.json.
+
+        This is the single place both startup reconciliation
+        (discover_existing_deployments, all accounts) and any
+        on-demand/pre-deploy reconciliation (create_deployment, one
+        account) go through, so "trust local state" can never
+        silently diverge between the two call sites again.
+
+        Returns the confirmed deployment_id if this account currently
+        has a live orchestrator kernel on Kaggle, or None if it has
+        none (in which case any local account.deployment /
+        self.deployments entry for this account is cleared, since a
+        local record with no matching live kernel is stale -- this is
+        exactly the case that caused the "Account already has active
+        deployment" false-positive when a kernel had actually already
+        disappeared on Kaggle's side).
+
+        Never raises: a failure listing or querying this account is
+        logged and treated as "unable to confirm anything changed" --
+        existing local state for this account is left untouched rather
+        than guessed at, so a transient Kaggle/network hiccup can't
+        wipe out a deployment that's actually still fine.
+        """
+        if not account.kaggle_api_token:
+            logger.info(
+                f"Skipping reconciliation for account {account.account_id}: "
+                f"no kaggle_api_token configured."
+            )
+            return account.deployment.deployment_id if account.deployment else None
+
+        try:
+            notebooks = await self.kaggle.list_notebooks(account)
+        except Exception as e:
+            logger.error(
+                f"Reconciliation: failed to list notebooks for account "
+                f"{account.account_id}: {e}. Leaving existing local state untouched."
+            )
+            return account.deployment.deployment_id if account.deployment else None
+
+        matches = []
+        for nb in notebooks:
+            slug = nb.get("slug", "")
+            if not slug.startswith(NOTEBOOK_SLUG_PREFIX):
+                continue
+            deployment_id = _deployment_id_from_slug(slug)
+            if not deployment_id:
+                continue
+            matches.append((deployment_id, slug, nb))
+
+        if not matches:
+            logger.info(f"Account {account.account_id} has no active deployments on Kaggle.")
+            if account.deployment:
+                stale_id = account.deployment.deployment_id
+                self.deployments.pop(stale_id, None)
+                account.deployment = None
+                logger.info(
+                    f"Cleared stale local deployment {stale_id} for account "
+                    f"{account.account_id}: no matching kernel found on Kaggle."
+                )
+            return None
+
+        if len(matches) > 1:
+            logger.warning(
+                f"Account {account.account_id} has {len(matches)} orchestrator "
+                f"notebooks ({[m[1] for m in matches]}); an account should have "
+                f"at most one. Choosing the most recently updated and ignoring "
+                f"the others."
+            )
+
+        # Most-recently-updated wins; treat missing last_run_time as
+        # oldest (0) rather than erroring, so accounts/kernels without
+        # that field don't crash the sort.
+        deployment_id, slug, nb = max(
+            matches, key=lambda m: (m[2].get("last_run_time") or 0)
+        )
+
+        try:
+            notebook_url = f"https://www.kaggle.com/code/{account.kaggle_username}/{slug}"
+
+            # Build a throwaway DeploymentState just to drive the
+            # existing get_notebook_status() call, which only needs
+            # notebook_id + started_at off the object it's given.
+            # started_at is seeded from Kaggle's own last_run_time
+            # (already fetched above as part of `nb`) rather than
+            # local time.time(), so uptime reflects when Kaggle
+            # itself last ran the kernel, not when this process
+            # happened to notice it.
+            kaggle_last_run = nb.get("last_run_time")
+            probe = DeploymentState(
+                deployment_id=deployment_id,
+                account_id=account.account_id,
+                model_name="",
+                model_repo="",
+                model_file="",
+                notebook_id=slug,
+                notebook_url=notebook_url,
+                notebook_status="unknown",
+                worker_id=account.account_id,
+                created_at=time.time(),
+                started_at=kaggle_last_run if kaggle_last_run is not None else time.time(),
+            )
+            live_status = await self.kaggle.get_notebook_status(probe, account)
+
+            # Merge with whatever we already know locally about this
+            # deployment_id, preferring live Kaggle fields but keeping
+            # saved model metadata when present.
+            existing = self.deployments.get(deployment_id) or (
+                account.deployment if account.deployment and account.deployment.deployment_id == deployment_id
+                else None
+            )
+
+            if existing:
+                existing.notebook_id = slug
+                existing.notebook_url = notebook_url
+                existing.notebook_status = live_status
+                existing.account_id = account.account_id
+                existing.worker_id = existing.worker_id or account.account_id
+                existing.last_status_check = time.time()
+                if kaggle_last_run is not None:
+                    existing.started_at = kaggle_last_run
+                deployment = existing
+            else:
+                deployment = DeploymentState(
+                    deployment_id=deployment_id,
+                    account_id=account.account_id,
+                    model_name="unknown",
+                    model_repo="unknown",
+                    model_file="unknown",
+                    notebook_id=slug,
+                    notebook_url=notebook_url,
+                    notebook_status=live_status,
+                    worker_id=account.account_id,
+                    created_at=time.time(),
+                    started_at=kaggle_last_run,
+                    error_message=None,
+                    quota_reserved_seconds=0,
+                )
+
+            # If local state was tracking a *different* deployment_id
+            # for this account than what Kaggle now shows as live,
+            # drop the stale one -- an account can only ever have one
+            # live orchestrator deployment.
+            if (
+                account.deployment
+                and account.deployment.deployment_id != deployment_id
+                and account.deployment.deployment_id in self.deployments
+            ):
+                stale_id = account.deployment.deployment_id
+                self.deployments.pop(stale_id, None)
+                logger.info(
+                    f"Cleared stale local deployment {stale_id} for account "
+                    f"{account.account_id}: superseded by live kernel {slug}."
+                )
+
+            self.deployments[deployment_id] = deployment
+            account.deployment = deployment
+
+            logger.info(f"Reconciled deployment: {deployment_id} (status={live_status})")
+            return deployment_id
+
+        except Exception as e:
+            logger.error(
+                f"Reconciliation: failed to recover deployment for notebook "
+                f"{slug!r} on account {account.account_id}: {e}. Leaving existing "
+                f"local state untouched."
+            )
+            return account.deployment.deployment_id if account.deployment else None
+
     async def discover_existing_deployments(self):
         """
         Startup reconciliation: rebuilds self.deployments / account.deployment
@@ -1862,25 +2057,16 @@ class Orchestrator:
         to merge in where possible -- never as the source of truth for
         whether a deployment exists or what its live status/url/id are.
 
-        For each configured account this:
-          1. Lists the account's Kaggle kernels (KaggleService.list_notebooks).
-          2. Filters to slugs starting with NOTEBOOK_SLUG_PREFIX.
-          3. Picks the most-recently-updated match if more than one exists
-             (an account should only ever have one orchestrator deployment,
-             but Kaggle is the source of truth even if that invariant was
-             violated out-of-band).
-          4. Queries live status via the existing get_notebook_status path.
-          5. Builds/updates a DeploymentState, preferring live Kaggle
-             fields (status/url/id) and preserving saved model metadata
-             when a matching local record existed.
+        Delegates the actual per-account work to
+        _reconcile_account_deployment (see its docstring for the full
+        per-account algorithm); this method just loops over every
+        configured account and then does one final global sweep to
+        drop any self.deployments entry that no account confirmed as
+        live this run.
 
-        Any deployment_id present locally (in self.deployments /
-        account.deployment) that has no corresponding live Kaggle kernel
-        for that account is then dropped -- Kaggle is the source of
-        truth, so state that only exists locally is considered stale.
-
-        A failure listing or querying one account is logged and skipped;
-        it never aborts startup or affects other accounts.
+        A failure reconciling one account is logged and skipped by
+        _reconcile_account_deployment itself; it never aborts startup
+        or affects other accounts.
         """
         restored_count = 0
         stale_removed_count = 0
@@ -1891,135 +2077,10 @@ class Orchestrator:
         confirmed_deployment_ids: Set[str] = set()
 
         for account in self.accounts.values():
-            if not account.kaggle_api_token:
-                logger.info(
-                    f"Skipping reconciliation for account {account.account_id}: "
-                    f"no kaggle_api_token configured."
-                )
-                continue
-
-            try:
-                notebooks = await self.kaggle.list_notebooks(account)
-            except Exception as e:
-                # list_notebooks already catches internally and returns
-                # [], but guard here too so a truly unexpected exception
-                # (e.g. a bug in list_notebooks itself) still can't take
-                # down the rest of reconciliation.
-                logger.error(
-                    f"Reconciliation: failed to list notebooks for account "
-                    f"{account.account_id}: {e}. Skipping this account."
-                )
-                continue
-
-            matches = []
-            for nb in notebooks:
-                slug = nb.get("slug", "")
-                if not slug.startswith(NOTEBOOK_SLUG_PREFIX):
-                    continue
-                deployment_id = _deployment_id_from_slug(slug)
-                if not deployment_id:
-                    continue
-                logger.info(f"Found orchestrator notebook: {slug}")
-                matches.append((deployment_id, slug, nb))
-
-            if not matches:
-                logger.info(f"Account {account.account_id} has no active deployments.")
-                continue
-
-            if len(matches) > 1:
-                logger.warning(
-                    f"Account {account.account_id} has {len(matches)} orchestrator "
-                    f"notebooks ({[m[1] for m in matches]}); an account should have "
-                    f"at most one. Choosing the most recently updated and ignoring "
-                    f"the others."
-                )
-
-            # Most-recently-updated wins; treat missing last_run_time as
-            # oldest (0) rather than erroring, so accounts/kernels without
-            # that field don't crash the sort.
-            deployment_id, slug, nb = max(
-                matches, key=lambda m: (m[2].get("last_run_time") or 0)
-            )
-
-            try:
-                notebook_url = f"https://www.kaggle.com/code/{account.kaggle_username}/{slug}"
-
-                # Build a throwaway DeploymentState just to drive the
-                # existing get_notebook_status() call, which only needs
-                # notebook_id + started_at off the object it's given.
-                # started_at is seeded from Kaggle's own last_run_time
-                # (already fetched above as part of `nb`) rather than
-                # local time.time(), so uptime reflects when Kaggle
-                # itself last ran the kernel, not when this process
-                # happened to notice it.
-                kaggle_last_run = nb.get("last_run_time")
-                probe = DeploymentState(
-                    deployment_id=deployment_id,
-                    account_id=account.account_id,
-                    model_name="",
-                    model_repo="",
-                    model_file="",
-                    notebook_id=slug,
-                    notebook_url=notebook_url,
-                    notebook_status="unknown",
-                    worker_id=account.account_id,
-                    created_at=time.time(),
-                    started_at=kaggle_last_run if kaggle_last_run is not None else time.time(),
-                )
-                live_status = await self.kaggle.get_notebook_status(probe, account)
-
-                # Merge with whatever we already know locally about this
-                # deployment_id, preferring live Kaggle fields but keeping
-                # saved model metadata when present.
-                existing = self.deployments.get(deployment_id) or (
-                    account.deployment if account.deployment and account.deployment.deployment_id == deployment_id
-                    else None
-                )
-
-                if existing:
-                    existing.notebook_id = slug
-                    existing.notebook_url = notebook_url
-                    existing.notebook_status = live_status
-                    existing.account_id = account.account_id
-                    existing.worker_id = existing.worker_id or account.account_id
-                    existing.last_status_check = time.time()
-                    # Always prefer Kaggle's own last_run_time over
-                    # whatever local started_at was previously recorded --
-                    # it's the authoritative "when did this actually start
-                    # running" answer.
-                    if kaggle_last_run is not None:
-                        existing.started_at = kaggle_last_run
-                    deployment = existing
-                else:
-                    deployment = DeploymentState(
-                        deployment_id=deployment_id,
-                        account_id=account.account_id,
-                        model_name="unknown",
-                        model_repo="unknown",
-                        model_file="unknown",
-                        notebook_id=slug,
-                        notebook_url=notebook_url,
-                        notebook_status=live_status,
-                        worker_id=account.account_id,
-                        created_at=time.time(),
-                        started_at=kaggle_last_run,
-                        error_message=None,
-                        quota_reserved_seconds=0,
-                    )
-
-                self.deployments[deployment_id] = deployment
-                account.deployment = deployment
+            deployment_id = await self._reconcile_account_deployment(account)
+            if deployment_id:
                 confirmed_deployment_ids.add(deployment_id)
                 restored_count += 1
-
-                logger.info(f"Recovered deployment: {deployment_id} (status={live_status})")
-
-            except Exception as e:
-                logger.error(
-                    f"Reconciliation: failed to recover deployment for notebook "
-                    f"{slug!r} on account {account.account_id}: {e}. Skipping."
-                )
-                continue
 
         # Drop anything local that we didn't just confirm is still live.
         stale_ids = [
@@ -2093,6 +2154,7 @@ class Orchestrator:
                 machine_shape=machine_shape,
                 enable_tpu=config_dict.get("enable_tpu", False),
                 inference_subprocess_file=config_dict.get("inference_subprocess_file"),
+                max_deployment_age_hours=config_dict.get("max_deployment_age_hours", 24.0),
             )
         except HTTPException:
             raise
@@ -2162,8 +2224,64 @@ class Orchestrator:
             except Exception as e:
                 logger.error(f"Quota refresh loop error: {e}")
 
+    async def _cleanup_expired_deployments(self):
+        """
+        Auto-clears any deployment older than
+        config.max_deployment_age_hours (default 24h / one day),
+        measured from DeploymentState.created_at. For each expired
+        deployment this deletes the underlying Kaggle kernel (via the
+        same delete_deployment path the DELETE /api/deployments/{id}
+        endpoint uses) and removes it from local tracking, so long-
+        running/forgotten deployments can't silently burn GPU quota
+        or occupy an account's "one deployment at a time" slot
+        forever.
+
+        A no-op if max_deployment_age_hours is 0 or negative (feature
+        disabled). Never raises: failure to clean up one deployment is
+        logged and the sweep continues with the rest -- a stuck/failed
+        cleanup this cycle just gets retried next cycle.
+        """
+        max_age_hours = self.config.max_deployment_age_hours if self.config else 24.0
+        if max_age_hours is None or max_age_hours <= 0:
+            return
+
+        max_age_seconds = max_age_hours * 3600
+        now = time.time()
+
+        expired_ids = [
+            d.deployment_id
+            for d in self.deployments.values()
+            if d.notebook_status not in ("stopped", "completed", "error")
+            and d.created_at is not None
+            and (now - d.created_at) >= max_age_seconds
+        ]
+
+        for deployment_id in expired_ids:
+            deployment = self.deployments.get(deployment_id)
+            if deployment is None:
+                continue
+            age_hours = (now - deployment.created_at) / 3600
+            logger.info(
+                f"Deployment {deployment_id} is {age_hours:.1f}h old "
+                f"(limit {max_age_hours}h); auto-deleting."
+            )
+            try:
+                await self.delete_deployment(deployment_id)
+                await self.websocket.broadcast({
+                    "event": "deployment_auto_expired",
+                    "deployment_id": deployment_id,
+                    "age_hours": age_hours,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception as e:
+                logger.error(
+                    f"Auto-cleanup: failed to delete expired deployment "
+                    f"{deployment_id}: {e}. Will retry next cycle."
+                )
+
     async def deployment_status_loop(self):
-        """Background task: poll deployment status periodically."""
+        """Background task: poll deployment status periodically, and
+        auto-expire deployments past config.max_deployment_age_hours."""
         interval = self.config.deployment_status_check_interval_seconds if self.config else 30
 
         while True:
@@ -2205,6 +2323,8 @@ class Orchestrator:
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                             })
 
+                await self._cleanup_expired_deployments()
+
                 self.state.save(self.accounts, self.deployments)
 
             except Exception as e:
@@ -2239,10 +2359,26 @@ class Orchestrator:
             )
 
         if account.deployment:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Account already has active deployment: {account.deployment.deployment_id}"
-            )
+            # Local state says this account is busy, but local state is
+            # a cache, not the source of truth (see module docstring,
+            # "STARTUP RECONCILIATION"). Before rejecting the request,
+            # re-check what's actually live on Kaggle right now -- this
+            # is exactly the case that produced the false-positive
+            # "Account already has active deployment" error when the
+            # notebook had already disappeared on Kaggle's side (e.g.
+            # deleted out-of-band, or a Kaggle-side bug) but the
+            # orchestrator process never got a chance to notice, so
+            # account.deployment was left pointing at a dead deployment.
+            live_deployment_id = await self._reconcile_account_deployment(account)
+            if live_deployment_id and account.deployment:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Account already has active deployment: {account.deployment.deployment_id}"
+                )
+            # else: reconciliation found nothing live on Kaggle (or
+            # confirmed the previous one is gone) and has already
+            # cleared account.deployment itself -- fall through and
+            # allow this deployment to proceed.
 
         try:
             deployment_id = f"dep-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
@@ -2306,34 +2442,65 @@ class Orchestrator:
             raise HTTPException(status_code=500, detail=f"Deployment failed: {e}")
 
     async def delete_deployment(self, deployment_id: str):
-        """Stop (delete the underlying Kaggle kernel) and remove a deployment from local tracking."""
+        """
+        Stop (delete the underlying Kaggle kernel) and remove a
+        deployment from local tracking.
+
+        Local tracking (self.deployments / account.deployment) is
+        always cleared, even if the remote Kaggle delete call itself
+        fails -- a transient Kaggle-side error deleting the kernel
+        must never leave the account permanently stuck "occupied" by
+        a deployment that create_deployment then refuses to replace.
+        The next reconciliation pass (or the next deploy attempt,
+        which now reconciles first -- see create_deployment) will
+        confirm against Kaggle's live state regardless. The remote
+        failure is still surfaced to the caller as a 500 so it isn't
+        silently hidden.
+        """
         if deployment_id not in self.deployments:
             raise HTTPException(status_code=404, detail="Deployment not found")
 
         deployment = self.deployments[deployment_id]
+        remote_error: Optional[Exception] = None
 
         try:
             account = self.accounts.get(deployment.account_id)
             await self.kaggle.stop_notebook(deployment, account)
-
-            if deployment.account_id in self.accounts:
-                self.accounts[deployment.account_id].deployment = None
-
-            deployment.notebook_status = "stopped"
-
-            self.state.save(self.accounts, self.deployments)
-
-            logger.info(f"Deleted deployment {deployment_id}")
-
-            await self.websocket.broadcast({
-                "event": "deployment_stopped",
-                "deployment_id": deployment_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-
         except Exception as e:
-            logger.error(f"Failed to delete deployment: {e}")
-            raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+            remote_error = e
+            logger.error(
+                f"Failed to delete Kaggle kernel for deployment {deployment_id}: {e}. "
+                f"Clearing local tracking anyway so the account isn't stuck; "
+                f"verify manually on Kaggle if needed."
+            )
+
+        # Clear the account's "active deployment" pointer unconditionally
+        # (this is what actually frees the account up to accept a new
+        # deployment). The record itself is kept in self.deployments,
+        # marked "stopped", matching the existing convention elsewhere
+        # (deployment_status_loop skips "stopped"/"completed"/"error"
+        # deployments rather than expecting them removed) -- so deployment
+        # history stays visible via GET /api/deployments.
+        if deployment.account_id in self.accounts:
+            self.accounts[deployment.account_id].deployment = None
+
+        deployment.notebook_status = "stopped"
+
+        self.state.save(self.accounts, self.deployments)
+
+        await self.websocket.broadcast({
+            "event": "deployment_stopped",
+            "deployment_id": deployment_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        if remote_error is not None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Local deployment cleared, but Kaggle kernel delete failed: {remote_error}"
+            )
+
+        logger.info(f"Deleted deployment {deployment_id}")
 
     async def refresh_deployment(self, deployment_id: str):
         """Force a status check for a deployment."""
