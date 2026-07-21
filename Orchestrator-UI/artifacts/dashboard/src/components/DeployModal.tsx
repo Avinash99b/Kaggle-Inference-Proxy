@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useCreateDeployment, useListAccounts } from '@workspace/api-client-react';
 import { useHuggingFaceGgufFiles } from '@/hooks/useHuggingFaceGgufFiles';
 import { useQueryInvalidation } from '@/hooks/useQueryInvalidation';
@@ -13,15 +13,6 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
-import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from '@/components/ui/command';
 import {
   Loader2,
   AlertCircle,
@@ -29,6 +20,7 @@ import {
   Check,
   HardDrive,
   Star,
+  Search,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -69,6 +61,70 @@ interface ModelFilePickerProps {
   placeholder: string;
 }
 
+/** Single row rendered inside the dropdown list. */
+function FileRow({
+  file,
+  isSelected,
+  onSelect,
+}: {
+  file: { path: string; size: number };
+  isSelected: boolean;
+  onSelect: (path: string) => void;
+}) {
+  const quant = extractQuant(file.path);
+  const isRecommended = quant ? RECOMMENDED_QUANTS.has(quant) : false;
+  const displayName = file.path.split('/').pop() ?? file.path;
+
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(file.path)}
+      className={cn(
+        'flex w-full items-start gap-2 px-3 py-3 text-left active:bg-accent sm:py-2.5 sm:hover:bg-accent',
+        isSelected && 'bg-primary/5',
+      )}
+    >
+      <Check
+        className={cn(
+          'w-3.5 h-3.5 shrink-0 mt-0.5',
+          isSelected ? 'text-primary opacity-100' : 'opacity-0',
+        )}
+      />
+
+      <div className="flex flex-col min-w-0 flex-1 gap-1">
+        <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+          <span
+            className={cn(
+              'font-mono text-xs break-all',
+              isSelected ? 'text-primary font-medium' : 'text-foreground',
+            )}
+          >
+            {displayName}
+          </span>
+
+          {isRecommended && (
+            <span className="inline-flex items-center gap-0.5 text-[9px] font-bold px-1 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20 shrink-0">
+              <Star className="w-2 h-2 fill-current" />
+              Recommended
+            </span>
+          )}
+
+          {quant && !isRecommended && (
+            <span className="inline-flex items-center text-[9px] font-bold px-1 py-0.5 rounded bg-secondary text-muted-foreground shrink-0 font-mono">
+              {quant}
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-1 shrink-0 text-[11px] text-muted-foreground/70 font-mono">
+          <HardDrive className="w-3 h-3 opacity-50" />
+          {formatSize(file.size)}
+        </div>
+      </div>
+    </button>
+  );
+}
+
 function ModelFilePicker({
   files,
   value,
@@ -78,160 +134,161 @@ function ModelFilePicker({
   placeholder,
 }: ModelFilePickerProps) {
   const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
 
   const selected = useMemo(() => files.find((f) => f.path === value) ?? null, [files, value]);
+
+  const filtered = useMemo(() => {
+    if (!search.trim()) return files;
+    const q = search.toLowerCase();
+    return files.filter((f) => f.path.toLowerCase().includes(q));
+  }, [files, search]);
 
   const handleSelect = (path: string) => {
     onChange(path === value ? '' : path);
     setOpen(false);
+    setSearch('');
   };
 
+  const handleClose = () => {
+    setOpen(false);
+    setSearch('');
+  };
+
+  // Close dropdown on outside click/tap or Escape. `mousedown` alone never
+  // fires from a touch tap on Android, so outside-taps left the dropdown
+  // stuck open, its list capturing/absorbing subsequent scroll gestures —
+  // that's what actually looked like "broken scrolling" on mobile.
+  useEffect(() => {
+    if (!open) return;
+    const handleOutside = (e: MouseEvent | TouchEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        handleClose();
+      }
+    };
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') handleClose();
+    };
+    document.addEventListener('mousedown', handleOutside);
+    document.addEventListener('touchstart', handleOutside);
+    document.addEventListener('keydown', handleKey);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('touchstart', handleOutside);
+      document.removeEventListener('keydown', handleKey);
+    };
+  }, [open]);
+
+  const listContent = (
+    <>
+      {filtered.length === 0 ? (
+        <div className="py-8 text-center text-sm text-muted-foreground">
+          {files.length === 0 ? 'No files.' : 'No matching files.'}
+        </div>
+      ) : (
+        filtered.map((file) => (
+          <FileRow
+            key={file.path}
+            file={file}
+            isSelected={file.path === value}
+            onSelect={handleSelect}
+          />
+        ))
+      )}
+    </>
+  );
+
   return (
-    <Popover open={open} onOpenChange={disabled ? undefined : setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          disabled={disabled}
-          data-testid="select-modelfile"
-          className={cn(
-            'flex w-full items-center justify-between rounded-md border bg-background px-3 py-2',
-            'text-sm ring-offset-background transition-colors',
-            'focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2',
-            'disabled:cursor-not-allowed disabled:opacity-50',
-            'border-border hover:border-border/80',
-            open && 'ring-2 ring-ring ring-offset-2',
-          )}
-          onClick={() => !disabled && setOpen((v) => !v)}
-        >
-          <span
-            className={cn(
-              'truncate font-mono text-xs text-left',
-              !selected && 'text-muted-foreground font-sans',
-            )}
-          >
-            {isLoading ? (
-              <span className="flex items-center gap-2 text-muted-foreground font-sans">
-                <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading files…
-              </span>
-            ) : selected ? (
-              selected.path.split('/').pop()
-            ) : (
-              placeholder
-            )}
-          </span>
-
-          <div className="flex items-center gap-1.5 shrink-0 ml-2">
-            {selected && (
-              <span className="text-[10px] text-muted-foreground/70 font-mono">
-                {formatSize(selected.size)}
-              </span>
-            )}
-            <ChevronDown className={cn('w-4 h-4 text-muted-foreground/60 transition-transform', open && 'rotate-180')} />
-          </div>
-        </button>
-      </PopoverTrigger>
-
-      <PopoverContent
-        className="w-[var(--radix-popover-trigger-width)] p-0 border-border shadow-xl shadow-black/25"
-        align="start"
-        sideOffset={4}
+    <div ref={containerRef} className="relative">
+      <button
+        ref={triggerRef}
+        type="button"
+        disabled={disabled}
+        data-testid="select-modelfile"
+        className={cn(
+          'flex w-full items-center justify-between rounded-md border bg-background px-3 py-2',
+          'text-sm ring-offset-background transition-colors',
+          'focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2',
+          'disabled:cursor-not-allowed disabled:opacity-50',
+          'border-border hover:border-border/80',
+          open && 'ring-2 ring-ring ring-offset-2',
+        )}
+        onClick={() => !disabled && setOpen((v) => !v)}
       >
-        <Command>
-          <div className="border-b border-border/60">
-            <CommandInput
-              placeholder="Search files…"
-              className="h-9 text-xs font-mono"
-            />
+        <span
+          className={cn(
+            'truncate font-mono text-xs text-left',
+            !selected && 'text-muted-foreground font-sans',
+          )}
+        >
+          {isLoading ? (
+            <span className="flex items-center gap-2 text-muted-foreground font-sans">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading files…
+            </span>
+          ) : selected ? (
+            selected.path.split('/').pop()
+          ) : (
+            placeholder
+          )}
+        </span>
+
+        <div className="flex items-center gap-1.5 shrink-0 ml-2">
+          {selected && (
+            <span className="text-[10px] text-muted-foreground/70 font-mono">
+              {formatSize(selected.size)}
+            </span>
+          )}
+          <ChevronDown className={cn('w-4 h-4 text-muted-foreground/60 transition-transform', open && 'rotate-180')} />
+        </div>
+      </button>
+
+      {open && (
+        <div
+          className={cn(
+            'absolute z-50 top-[calc(100%+4px)] left-0 w-full',
+            'rounded-md border border-border bg-card shadow-xl shadow-black/25',
+            'flex flex-col overflow-hidden',
+          )}
+          style={{ maxHeight: 'min(320px, 60vh)' }}
+        >
+          <div className="shrink-0 border-b border-border/60 px-2 py-1.5">
+            <div className="relative">
+              <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground/60" />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search files…"
+                className="w-full h-8 pl-7 pr-2 rounded border border-transparent bg-background text-xs font-mono focus:outline-none focus:border-border"
+              />
+            </div>
           </div>
 
-          <CommandList className="max-h-[280px] overflow-y-auto overscroll-contain">
-            <CommandEmpty className="py-6 text-center text-sm text-muted-foreground">
-              No matching files.
-            </CommandEmpty>
-
-            <CommandGroup>
-              {files.map((file) => {
-                const quant = extractQuant(file.path);
-                const isRecommended = quant ? RECOMMENDED_QUANTS.has(quant) : false;
-                const displayName = file.path.split('/').pop() ?? file.path;
-                const isSelected = file.path === value;
-
-                return (
-                  <CommandItem
-                    key={file.path}
-                    value={file.path}
-                    onSelect={handleSelect}
-                    className={cn(
-                      'flex items-center gap-2 px-3 py-2.5 cursor-pointer aria-selected:bg-accent',
-                      isSelected && 'bg-primary/5',
-                    )}
-                  >
-                    {/* Check mark */}
-                    <Check
-                      className={cn(
-                        'w-3.5 h-3.5 shrink-0',
-                        isSelected ? 'text-primary opacity-100' : 'opacity-0',
-                      )}
-                    />
-
-                    {/* File info */}
-                    <div className="flex flex-col min-w-0 flex-1">
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <span
-                          className={cn(
-                            'font-mono text-xs truncate',
-                            isSelected ? 'text-primary font-medium' : 'text-foreground',
-                          )}
-                          title={displayName}
-                        >
-                          {displayName}
-                        </span>
-
-                        {isRecommended && (
-                          <span className="inline-flex items-center gap-0.5 text-[9px] font-bold px-1 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20 shrink-0">
-                            <Star className="w-2 h-2 fill-current" />
-                            Recommended
-                          </span>
-                        )}
-
-                        {quant && !isRecommended && (
-                          <span className="inline-flex items-center text-[9px] font-bold px-1 py-0.5 rounded bg-secondary text-muted-foreground shrink-0 font-mono">
-                            {quant}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Size */}
-                    <div className="flex items-center gap-1 shrink-0 text-[11px] text-muted-foreground/70 font-mono">
-                      <HardDrive className="w-3 h-3 opacity-50" />
-                      {formatSize(file.size)}
-                    </div>
-                  </CommandItem>
-                );
-              })}
-            </CommandGroup>
-          </CommandList>
+          <div className="overflow-y-auto divide-y divide-border/40">
+            {listContent}
+          </div>
 
           {files.length > 0 && (
-            <div className="border-t border-border/50 px-3 py-1.5 flex items-center justify-between">
+            <div className="shrink-0 border-t border-border/50 px-3 py-1.5 flex items-center justify-between">
               <span className="text-[10px] text-muted-foreground/50 font-mono">
-                {files.length} file{files.length !== 1 ? 's' : ''} · sorted by size
+                {filtered.length} of {files.length} file{files.length !== 1 ? 's' : ''}
               </span>
               {selected && (
                 <button
                   type="button"
                   className="text-[10px] text-muted-foreground/50 hover:text-muted-foreground transition-colors"
-                  onClick={() => { onChange(''); setOpen(false); }}
+                  onClick={() => { onChange(''); handleClose(); }}
                 >
                   Clear
                 </button>
               )}
             </div>
           )}
-        </Command>
-      </PopoverContent>
-    </Popover>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -310,7 +367,7 @@ export function DeployModal({ isOpen, onClose, accountId }: DeployModalProps) {
           toast({
             variant: 'destructive',
             title: 'Failed to create deployment',
-            description: error.error || 'Unknown error occurred',
+            description: error.message || 'Unknown error occurred',
           });
         },
       },
