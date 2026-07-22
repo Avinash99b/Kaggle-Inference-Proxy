@@ -17,11 +17,30 @@ worker is:
 Clients only ever see a normal, stateless OpenAI-compatible API:
 
     GET  /v1/models
-    POST /v1/chat/completions
+    POST /v1/chat/completions    (supports multimodal image content blocks)
     POST /v1/completions
-    POST /v1/embeddings          (not supported -> clean OpenAI-style error)
+    POST /v1/embeddings          (routed to any worker serving the model)
     GET  /health
     GET  /dashboard
+
+max_tokens handling:
+    Clients may specify a generation-length cap via max_tokens,
+    max_completion_tokens, max_new_tokens, or max_output_tokens (whichever
+    their SDK/library uses) -- see normalize_generation_params(). If none
+    is given, or it's given as null/0/negative, generation is UNLIMITED:
+    the worker generates until it hits EOS, a stop sequence, or its own
+    context limit, rather than the proxy silently imposing a default cap.
+
+Multimodal (image) support:
+    `messages` content blocks are forwarded to the worker as-is, including
+    OpenAI-style {"type": "image_url", "image_url": {"url": "data:..." |
+    "https://..."}} blocks. validate_chat_messages() below only checks
+    shape (so a malformed request gets a clean 400 instead of a confusing
+    worker-side failure) -- it does not fetch, decode, or transform image
+    data itself; that's the worker's job, and only workers whose loaded
+    model actually supports vision will produce something meaningful from
+    it. Non-vision workers will typically either ignore the image blocks
+    or error, depending on how the worker/runner is implemented.
 
 Workers connect OUTBOUND to this server (this server never dials into
 Kaggle) via one of two transports:
@@ -296,7 +315,7 @@ def openai_error(message: str, err_type: str = "server_error", code: Optional[st
 @dataclass
 class Job:
     id: str
-    kind: str                      # "chat", "completions"
+    kind: str                      # "chat", "completions", "embeddings"
     payload: dict                  # normalized job payload sent to worker
     worker_id: Optional[str] = None            # which worker this job was routed to
     created_at: float = field(default_factory=time.time)
@@ -1192,6 +1211,36 @@ def format_text_completion(job_id: str, model: str, result: dict) -> dict:
     }
 
 
+def format_embeddings_response(model: str, result: dict) -> dict:
+    """Build an OpenAI-compatible /v1/embeddings response from a worker
+    result. The worker is expected to return either:
+
+      {"embeddings": [[...], [...], ...]}   -- one vector per input, OR
+      {"embedding": [...]}                  -- single input shorthand
+
+    both alongside an optional "usage" dict, mirroring the flexibility
+    OpenAI-compatible embedding servers (llama.cpp, text-embeddings-
+    inference, vLLM, etc.) typically offer."""
+    vectors = result.get("embeddings")
+    if vectors is None:
+        single = result.get("embedding")
+        vectors = [single] if single is not None else []
+    data = [
+        {"object": "embedding", "index": i, "embedding": vec}
+        for i, vec in enumerate(vectors)
+    ]
+    usage = result.get("usage") or {
+        "prompt_tokens": result.get("prompt_tokens", 0),
+        "total_tokens": result.get("total_tokens", result.get("prompt_tokens", 0)),
+    }
+    return {
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": usage,
+    }
+
+
 async def fake_sse_stream(final_chunk_builder):
     """Used only when the winning worker is on the long-poll fallback
     transport, which cannot push individual tokens as they're generated. We
@@ -1493,11 +1542,33 @@ async def real_stream_generator(job: Job, model: str, kind: str, request: Reques
 
 
 def normalize_generation_params(body: dict) -> dict:
-    """Pull out OpenAI-style generation params with sane defaults."""
+    """Pull out generation params, tolerant of the several different field
+    names various client libraries/SDKs use for "how many tokens to
+    generate": max_tokens (classic OpenAI), max_completion_tokens (newer
+    OpenAI), max_new_tokens (HuggingFace/vLLM-native/KoboldAI), and
+    max_output_tokens (Gemini-style/Anthropic-shim clients). Whichever is
+    present wins, in that priority order. If none are present, or the one
+    present is null/0/negative, generation is UNLIMITED: max_tokens=None
+    is passed to the worker, which should generate until EOS/stop/context
+    limit instead of stopping at a proxy-imposed default."""
+    max_tokens = None
+    for key in ("max_tokens", "max_completion_tokens", "max_new_tokens", "max_output_tokens"):
+        if key in body:
+            value = body.get(key)
+            if value is not None:
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    value = None
+                if value is not None and value <= 0:
+                    value = None
+            max_tokens = value
+            break
+
     return {
         "temperature": body.get("temperature", 0.8),
         "top_p": body.get("top_p", 0.95),
-        "max_tokens": body.get("max_tokens", 512),
+        "max_tokens": max_tokens,
         "stop": body.get("stop"),
         "presence_penalty": body.get("presence_penalty", 0.0),
         "frequency_penalty": body.get("frequency_penalty", 0.0),
@@ -1560,6 +1631,55 @@ def worker_supports_real_streaming(worker: WorkerState) -> bool:
     return worker.is_online() and worker.transport == "ws"
 
 
+_VALID_CONTENT_BLOCK_TYPES = {"text", "image_url", "input_audio", "file"}
+
+
+def validate_chat_messages(messages: Any) -> Optional[str]:
+    """Shape-check `messages` for the standard OpenAI multimodal content
+    form, so a malformed request fails fast with a clear 400 instead of a
+    confusing worker-side error. `content` on each message may be either
+    a plain string (text-only, the common case) or a list of content
+    blocks for multimodal messages, e.g.:
+
+        {"role": "user", "content": [
+            {"type": "text", "text": "What's in this image?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        ]}
+
+    Returns an error message string if invalid, or None if OK. Does not
+    mutate or otherwise touch the messages -- they're forwarded to the
+    worker byte-for-byte via payload["messages"] either way."""
+    if not isinstance(messages, list) or not messages:
+        return "'messages' must be a non-empty array."
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            return f"messages[{i}] must be an object."
+        if "role" not in msg:
+            return f"messages[{i}] is missing 'role'."
+        content = msg.get("content")
+        if content is None:
+            continue  # allowed for some assistant tool-call messages
+        if isinstance(content, str):
+            continue
+        if isinstance(content, list):
+            for j, block in enumerate(content):
+                if not isinstance(block, dict) or "type" not in block:
+                    return f"messages[{i}].content[{j}] must be an object with a 'type'."
+                block_type = block["type"]
+                if block_type == "image_url":
+                    image_url = block.get("image_url")
+                    url = image_url.get("url") if isinstance(image_url, dict) else None
+                    if not url:
+                        return (f"messages[{i}].content[{j}] is an image_url block "
+                                f"missing image_url.url.")
+                # Unknown block types are passed through rather than
+                # rejected -- workers may support types this proxy
+                # doesn't know about yet (e.g. provider-specific blocks).
+            continue
+        return f"messages[{i}].content must be a string or an array of content blocks."
+    return None
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
     check_client_key(authorization)
@@ -1569,6 +1689,10 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     if not model or not messages:
         raise HTTPException(status_code=400, detail=openai_error(
             "'model' and 'messages' are required.", "invalid_request_error"))
+    validation_error = validate_chat_messages(messages)
+    if validation_error:
+        raise HTTPException(status_code=400, detail=openai_error(
+            validation_error, "invalid_request_error"))
     stream = bool(body.get("stream", False))
 
     worker = route_or_503(model)
@@ -1638,17 +1762,43 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
 
 @app.post("/v1/embeddings")
 async def embeddings(request: Request, authorization: Optional[str] = Header(None)):
+    """Routes to whichever connected worker advertises the requested
+    embedding model, the same way chat/completions does. A worker
+    "serves" an embedding model simply by including its id in the
+    `models` dict it sent in its hello/register payload -- there is no
+    separate capability flag, so any worker (embedding-only, or a
+    generation worker that also exposes an embedding model) can serve
+    this as long as it knows that model id and returns the shape
+    format_embeddings_response() expects (see its docstring).
+
+    Accepts the standard OpenAI request shape:
+        {"model": "...", "input": "text" | ["text", ...] | [token_ids, ...]}
+    `input` may be a single string, a list of strings, or (per the OpenAI
+    spec) a list of pre-tokenized integer arrays -- passed through as-is
+    to the worker, which is responsible for interpreting it correctly."""
     check_client_key(authorization)
-    # This GGUF/llama.cpp worker setup does not serve embeddings.
-    return JSONResponse(
-        status_code=400,
-        content=openai_error(
-            "This deployment does not support the embeddings endpoint. "
-            "Only chat/completions models are available via connected workers.",
-            "invalid_request_error",
-            code="embeddings_not_supported",
-        ),
-    )
+    body = await request.json()
+    model = body.get("model")
+    input_ = body.get("input")
+    if not model or input_ is None:
+        raise HTTPException(status_code=400, detail=openai_error(
+            "'model' and 'input' are required.", "invalid_request_error"))
+
+    # Normalize to a list the way OpenAI's own API does internally, so the
+    # worker always receives a list regardless of whether the client sent
+    # a bare string or an array.
+    inputs = input_ if isinstance(input_, list) else [input_]
+
+    worker = route_or_503(model)
+    payload = {
+        "kind": "embeddings",
+        "model": model,
+        "input": inputs,
+        "encoding_format": body.get("encoding_format", "float"),
+        "dimensions": body.get("dimensions"),
+    }
+    job, result = await run_job_and_wait(worker, "embeddings", payload, request)
+    return JSONResponse(format_embeddings_response(model, result))
 
 
 @app.get("/v1/models")

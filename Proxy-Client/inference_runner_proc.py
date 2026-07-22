@@ -33,7 +33,12 @@ On startup, this process reads ONE "load" line describing how to load the
 model:
 
     {"type": "load", "model_path": "...", "n_ctx": 4096, "n_batch": 512,
-     "n_threads": 8, "n_gpu_layers": -1, "tensor_split": [0.5, 0.5] | null}
+     "n_threads": 8, "n_gpu_layers": -1, "tensor_split": [0.5, 0.5] | null,
+     "embedding": false}
+
+"embedding" (default false) tells llama.cpp to build the model with
+embedding output enabled, which is required before any "embeddings"-kind
+job will work -- see the embeddings section below.
 
 and emits either:
 
@@ -48,10 +53,31 @@ After a successful load, it then reads one "job" line at a time in a loop:
 and emits, per job:
 
     {"type": "token", "job_id": ..., "delta": "...", "finish_reason": null|"stop"}
-      (zero or more, streaming jobs only)
+      (zero or more, streaming chat/completion jobs only)
     {"type": "done", "job_id": ..., "result": {"text": ..., "finish_reason": ...,
                                                  "usage": {...}}}
+      (chat/completion jobs)
+    {"type": "done", "job_id": ..., "result": {"embeddings": [[...], ...],
+                                                 "usage": {...}}}
+      (embeddings jobs -- always non-streaming, one vector per input string)
     {"type": "error", "job_id": ..., "error": "..."}
+
+job["kind"] is one of "chat", "completion", or "embeddings". For chat/
+completion jobs, job["max_tokens"] may be None/absent, meaning UNLIMITED
+generation -- llama-cpp-python itself already treats max_tokens<=0 or None
+as "generate until EOS/stop/context limit" (see run_job() below), so this
+script passes it straight through rather than substituting its own
+default cap.
+
+Embeddings jobs require the model to have been loaded with
+{"embedding": true} in the "load" message (see below) -- llama.cpp needs
+this flag set at load time to build the model with an embedding-capable
+compute graph/pooling head. A model loaded without it will fail any
+embeddings job with a clear error rather than silently returning
+garbage. Whether a given GGUF actually has good embedding quality still
+depends on the model itself (dedicated embedding models like
+nomic-embed-text or bge-* work well; a generic chat model's embeddings
+are usable but not optimized for retrieval).
 
 then waits for the next "job" line. job_id is included purely so the parent
 can sanity-check it's reading events for the job it thinks is running
@@ -88,11 +114,50 @@ def _read_line() -> dict:
     return json.loads(raw)
 
 
+def run_embeddings_job(llm, job: dict, job_id: str) -> None:
+    """Non-streaming only -- embeddings are a single blocking call, there's
+    no token-by-token output to push. Requires the model to have been
+    loaded with embedding=True (see main()); llama-cpp-python raises if
+    you call create_embedding() on a model that wasn't."""
+    inputs = job.get("input") or []
+    if isinstance(inputs, str):
+        inputs = [inputs]
+    try:
+        out = llm.create_embedding(input=inputs)
+    except Exception as e:
+        raise RuntimeError(
+            "embeddings_not_supported: this worker's loaded model was not "
+            f"initialized with embedding=True, or does not support "
+            f"embeddings: {e}") from e
+    # llama-cpp-python's create_embedding() returns OpenAI-shaped
+    # {"data": [{"embedding": [...], "index": 0}, ...], "usage": {...}}.
+    # Sort by index defensively (should already be in order) and hand
+    # back just the vectors, in request order, for format_embeddings_
+    # response() on the proxy side to wrap into the final OpenAI shape.
+    data = sorted(out.get("data", []), key=lambda d: d.get("index", 0))
+    vectors = [d["embedding"] for d in data]
+    usage = out.get("usage", {})
+    _emit({"type": "done", "job_id": job_id,
+           "result": {"embeddings": vectors, "usage": usage}})
+
+
 def run_job(llm, job: dict, job_id: str) -> None:
+    kind = job["kind"]
+
+    if kind == "embeddings":
+        run_embeddings_job(llm, job, job_id)
+        return
+
+    # max_tokens<=0 or None is passed straight through to llama-cpp-python
+    # unchanged -- it already treats that as "unlimited, bounded only by
+    # n_ctx" (see its own create_chat_completion/__call__ docstrings), so
+    # there is no default to substitute here. The old code's
+    # `job.get("max_tokens", 512)` used to silently cap every request that
+    # didn't explicitly set max_tokens at 512 tokens; that default is gone.
     gen_kwargs = dict(
         temperature=job.get("temperature", 0.8),
         top_p=job.get("top_p", 0.95),
-        max_tokens=job.get("max_tokens", 512),
+        max_tokens=job.get("max_tokens"),
         stop=job.get("stop"),
         presence_penalty=job.get("presence_penalty", 0.0),
         frequency_penalty=job.get("frequency_penalty", 0.0),
@@ -100,7 +165,6 @@ def run_job(llm, job: dict, job_id: str) -> None:
     if job.get("seed") is not None:
         gen_kwargs["seed"] = job["seed"]
 
-    kind = job["kind"]
     stream = bool(job.get("stream", False))
 
     if not stream:
@@ -157,6 +221,12 @@ def main() -> None:
     n_threads = load_req.get("n_threads") or (os.cpu_count() or 4)
     n_gpu_layers = load_req.get("n_gpu_layers", -1)
     tensor_split = load_req.get("tensor_split")
+    # Must be set at load time -- llama.cpp builds a different compute
+    # graph/pooling head for embedding output. A model loaded with
+    # embedding=False can still run chat/completion jobs fine, but any
+    # "embeddings" job against it will fail with a clear error from
+    # run_embeddings_job() above rather than silently misbehaving.
+    embedding = bool(load_req.get("embedding", False))
 
     try:
         from llama_cpp import Llama
@@ -192,6 +262,7 @@ def main() -> None:
                 n_batch=n_batch,
                 n_threads=n_threads,
                 n_gpu_layers=n_gpu_layers,
+                embedding=embedding,
                 verbose=False,
             )
             if tensor_split:

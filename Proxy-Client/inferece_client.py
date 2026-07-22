@@ -6,9 +6,35 @@ Single-model Kaggle notebook inference worker.
 Adapted from `run_model_with_proxy.py` for SINGLE-MODEL mode: loads exactly
 one GGUF model at startup (selected via TARGET_MODEL_REPO and FILE_NAME env vars), connects
 outbound to a proxy (WebSocket first, HTTP long-poll fallback), serves
-chat/text completion jobs (including token streaming), reports GPU
-utilization every 5 seconds via heartbeat, and shuts down cleanly on
-KeyboardInterrupt (unloading the model and deregistering from the proxy).
+chat/text completion jobs (including token streaming) and, optionally,
+embeddings jobs, reports GPU utilization every 5 seconds via heartbeat, and
+shuts down cleanly on KeyboardInterrupt (unloading the model and
+deregistering from the proxy).
+
+EMBEDDINGS
+-------------------------------------------------------------------------------
+Set ENABLE_EMBEDDINGS=1 to load the target model with llama.cpp's
+embedding output enabled, which lets this worker also serve "embeddings"
+jobs (routed from the proxy's POST /v1/embeddings) against the SAME loaded
+model, alongside its normal chat/completion jobs. This is off by default:
+it costs a bit of extra VRAM/load time, and if all you want is embeddings,
+a dedicated embedding GGUF (nomic-embed-text, bge-*, etc.) run as its own
+worker will generally give better embedding quality than repurposing a
+chat model's hidden states.
+
+max_tokens / generation length
+-------------------------------------------------------------------------------
+This worker no longer imposes its own default cap (previously 512) on
+chat/completion jobs that don't specify a max_tokens. The proxy's
+normalize_generation_params() resolves whichever max-tokens field a
+client sent (max_tokens / max_completion_tokens / max_new_tokens /
+max_output_tokens) down to a single canonical value, or None if the
+client wants unlimited generation -- this worker forwards that straight
+through to llama-cpp-python, which itself treats None (or <=0) as
+"generate until EOS/stop/context limit" rather than requiring an explicit
+cap. Set default_generation.max_tokens in inference_server_config.json if
+you want this specific worker to default to a fixed cap when a payload
+somehow arrives without a "params" object at all (bypassing the proxy).
 
 There is no model-switching in this build: once the target model is loaded it
 stays loaded for the lifetime of the process. If you need a different
@@ -37,6 +63,7 @@ enabled):
     export PROXY_URL="https://kaggle-inference-proxy.onrender.com"
     export WORKER_ID="kaggle-account-1"
     export WORKER_SECRET="shared-secret-key"
+    export ENABLE_EMBEDDINGS="0"   # set to "1" to also serve /v1/embeddings
     python inference_client.py
 """
 
@@ -116,7 +143,7 @@ CONFIG_PATH = os.environ.get("WORKER_CONFIG_PATH", "inference_server_config.json
 
 DEFAULT_CONFIG = {
     "model_cache_dir": _DEFAULT_MODEL_CACHE_DIR,
-    "default_generation": {"temperature": 0.8, "top_p": 0.95, "max_tokens": 512},
+    "default_generation": {"temperature": 0.8, "top_p": 0.95, "max_tokens": None},  # None = unlimited
     "transport": {
         "prefer_websocket": True,
         "ws_path": "/worker/ws",
@@ -214,6 +241,15 @@ WORKER_ID = os.environ.get("WORKER_ID", "kaggle-worker-1")
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "change-me-worker-secret")
 HUGGINGFACE_TOKEN = os.environ.get("HUGGINGFACE_TOKEN", "")
 WORKER_LOG_LEVEL = os.environ.get("WORKER_LOG_LEVEL", CONFIG["logging"].get("level", "INFO"))
+# When set truthy, the target model is loaded with embedding=True (llama.cpp
+# needs this at load time to build an embedding-capable compute graph), which
+# enables serving "embeddings"-kind jobs against it in addition to normal
+# chat/completion jobs. Off by default: enabling it on a large generation
+# model wastes a bit of VRAM/load time for a capability most deployments
+# won't use, and dedicated embedding GGUFs (e.g. nomic-embed-text, bge-*)
+# give meaningfully better embedding quality than a chat model's hidden
+# states repurposed as embeddings anyway.
+ENABLE_EMBEDDINGS = os.environ.get("ENABLE_EMBEDDINGS", "").strip().lower() in ("1", "true", "yes")
 
 if not TARGET_MODEL_REPO or not FILE_NAME:
     print("[worker] FATAL: TARGET_MODEL_REPO and FILE_NAME environment variables are required.")
@@ -800,6 +836,12 @@ class ModelManager:
             n_batch=n_batch,
             n_threads=n_threads,
             n_gpu_layers=n_gpu_layers,
+            # Match whatever the real per-job runner subprocess will load
+            # with (see PersistentRunner.start()'s load_req) -- embedding
+            # output changes the compute graph enough that a probe done
+            # without this flag isn't a reliable predictor of whether the
+            # real load will fit in VRAM.
+            embedding=ENABLE_EMBEDDINGS,
             verbose=False,
         )
         llm = None
@@ -1072,6 +1114,11 @@ class PersistentRunner:
             "n_threads": MODELS.n_threads,
             "n_gpu_layers": MODELS.n_gpu_layers,
             "tensor_split": MODELS.tensor_split,
+            # Mirrors ENABLE_EMBEDDINGS -- must be set at load time (llama.cpp
+            # needs a different compute graph for embedding output), so
+            # every (re)spawn of the runner subprocess needs to pass it, not
+            # just the initial one.
+            "embedding": ENABLE_EMBEDDINGS,
             # The startup probe's n_ctx can go stale by the time a per-job
             # runner actually allocates its own llama_context (VRAM
             # fragmentation, other processes claiming memory between probe
@@ -1374,16 +1421,39 @@ async def disk_monitor_loop():
 
 
 def build_chat_prompt_messages(messages: list) -> list:
+    # `content` is passed through as-is (string OR a list of OpenAI-style
+    # content blocks, e.g. [{"type": "text", ...}, {"type": "image_url",
+    # "image_url": {"url": "data:image/..."}}]). This function only
+    # normalizes role/content presence; it does not need to understand
+    # multimodal content itself -- llama-cpp-python's chat handler is
+    # responsible for that, and only actually uses the image blocks if the
+    # loaded model + chat_format support vision (e.g. llava/qwen-vl style
+    # GGUFs with a --clip_model_path/mmproj file). A text-only model will
+    # typically just ignore or error on image blocks, same as any other
+    # OpenAI-compatible server given a model that doesn't support vision.
     return [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages]
 
 
 def build_gen_kwargs(payload: dict) -> dict:
     params = payload.get("params", {})
     defaults = CONFIG.get("default_generation", {})
+    # max_tokens: None here means UNLIMITED, not "use some fallback
+    # number". The proxy's normalize_generation_params() already resolved
+    # whichever of max_tokens/max_completion_tokens/max_new_tokens/
+    # max_output_tokens the client sent down to a single canonical
+    # "max_tokens" (or None if the client wants unlimited generation), so
+    # this worker just needs to forward it -- it must NOT invent its own
+    # default of 512 here, or every "unlimited" request would silently get
+    # capped again at the worker. default_generation.max_tokens in this
+    # worker's own config file is only consulted as a last resort, for the
+    # rare case a payload arrives with no "params" object at all (e.g.
+    # driven directly rather than via the proxy); it also defaults to None
+    # (unlimited) unless the operator sets it explicitly in
+    # inference_server_config.json.
     gen_kwargs = dict(
         temperature=params.get("temperature", defaults.get("temperature", 0.8)),
         top_p=params.get("top_p", defaults.get("top_p", 0.95)),
-        max_tokens=params.get("max_tokens", defaults.get("max_tokens", 512)),
+        max_tokens=params.get("max_tokens", defaults.get("max_tokens")),
         stop=params.get("stop"),
         presence_penalty=params.get("presence_penalty", 0.0),
         frequency_penalty=params.get("frequency_penalty", 0.0),
@@ -1395,7 +1465,12 @@ def build_gen_kwargs(payload: dict) -> dict:
 
 def _build_runner_job_dict(payload: dict, gen_kwargs: dict) -> dict:
     """Flattens payload + gen_kwargs into the shape inference_runner_proc.py
-    expects for its "job" field (see that script's docstring)."""
+    expects for its "job" field (see that script's docstring).
+
+    Note: gen_kwargs (temperature/top_p/max_tokens/...) is only meaningful
+    for chat/completion jobs -- it's still merged in unconditionally for
+    embeddings jobs for simplicity, but inference_runner_proc.py's
+    run_embeddings_job() ignores all of it and only reads job["input"]."""
     job = {
         "kind": payload["kind"],
         "stream": bool(payload.get("stream", False)),
@@ -1403,6 +1478,8 @@ def _build_runner_job_dict(payload: dict, gen_kwargs: dict) -> dict:
     }
     if payload["kind"] == "chat":
         job["messages"] = build_chat_prompt_messages(payload["messages"])
+    elif payload["kind"] == "embeddings":
+        job["input"] = payload["input"]
     else:
         job["prompt"] = payload["prompt"]
     return job
@@ -1455,6 +1532,13 @@ def run_inference_streaming(payload: dict, job_id: str, on_token):
     an error to the (still-connected, if any) SSE consumer; if nobody is
     listening anymore that's fine too -- the point of killing is to free
     the GPU immediately regardless of who's still watching."""
+    if payload.get("kind") == "embeddings":
+        # Defensive only -- the proxy never submits embeddings jobs with
+        # stream=True (there's no token-by-token output for a single
+        # embedding vector call), so this path should be unreachable in
+        # practice. Guarding it explicitly turns a would-be confusing
+        # KeyError (job_dict has no "prompt"/"messages") into a clear error.
+        raise RuntimeError("embeddings jobs do not support streaming")
     requested_model = str(payload.get("model", MODELS.target_model_id))
     allowed_models = {MODELS.target_model_id, MODELS.target_repo, MODELS.file_name}
     if requested_model not in allowed_models:
@@ -1537,7 +1621,17 @@ class ProxyClient:
         return {"worker_id": self.worker_id, "timestamp": ts, "signature": sig}
 
     def _worker_model_payload(self) -> dict:
-        return {"repo": self.target_repo, "file": self.file_name}
+        # The proxy routes purely by "is this model id a key in
+        # worker.models" -- it doesn't currently read capability flags out
+        # of this metadata dict for routing decisions. "supports_embeddings"
+        # is included anyway so a dashboard/operator can see at a glance
+        # which connected workers were started with ENABLE_EMBEDDINGS,
+        # without having to know that out-of-band.
+        return {
+            "repo": self.target_repo,
+            "file": self.file_name,
+            "supports_embeddings": ENABLE_EMBEDDINGS,
+        }
 
     async def _heartbeat_payload(self) -> dict:
         # aggregate_gpu_stats() shells out to nvidia-smi via a *blocking*
