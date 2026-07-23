@@ -1681,47 +1681,152 @@ def validate_chat_messages(messages: Any) -> Optional[str]:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
+async def chat_completions(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
     check_client_key(authorization)
+
     body = await request.json()
     model = body.get("model")
     messages = body.get("messages")
+
     if not model or not messages:
-        raise HTTPException(status_code=400, detail=openai_error(
-            "'model' and 'messages' are required.", "invalid_request_error"))
+        raise HTTPException(
+            status_code=400,
+            detail=openai_error(
+                "'model' and 'messages' are required.",
+                "invalid_request_error",
+            ),
+        )
+
     validation_error = validate_chat_messages(messages)
     if validation_error:
-        raise HTTPException(status_code=400, detail=openai_error(
-            validation_error, "invalid_request_error"))
-    stream = bool(body.get("stream", False))
+        raise HTTPException(
+            status_code=400,
+            detail=openai_error(
+                validation_error,
+                "invalid_request_error",
+            ),
+        )
 
+    stream = bool(body.get("stream", False))
     worker = route_or_503(model)
 
+    print("\n" + "=" * 80)
+    print("CHAT COMPLETION REQUEST")
+    print("=" * 80)
+    print(f"Worker : {worker.worker_id}")
+    print(f"Model  : {model}")
+    print(f"Stream : {stream}")
+    print("Messages:")
+    for i, msg in enumerate(messages):
+        print(f"  [{i}] {msg}")
+    print("Full Body:")
+    print(body)
+    print("=" * 80)
+
+    # ------------------------------------------------------------------
+    # REAL STREAMING
+    # ------------------------------------------------------------------
     if stream and worker_supports_real_streaming(worker):
+
         payload = {
-            "kind": "chat", "model": model, "messages": messages, "stream": True,
+            "kind": "chat",
+            "model": model,
+            "messages": messages,
+            "stream": True,
             "params": normalize_generation_params(body),
         }
-        job = await REGISTRY.submit_job(worker, "chat", payload, stream=True, request=request)
+
+        job = await REGISTRY.submit_job(
+            worker,
+            "chat",
+            payload,
+            stream=True,
+            request=request,
+        )
+
+        async def debug_stream():
+            assembled = []
+
+            async for chunk in real_stream_generator(
+                job,
+                model,
+                "chat",
+                request,
+                worker,
+            ):
+                print("\n----- STREAM CHUNK -----")
+                print(chunk)
+                assembled.append(chunk)
+                yield chunk
+
+            print("\n" + "=" * 80)
+            print("FULL STREAM RESPONSE")
+            print("=" * 80)
+            print("".join(str(x) for x in assembled))
+            print("=" * 80)
+
         return StreamingResponse(
-            real_stream_generator(job, model, "chat", request, worker),
+            debug_stream(),
             media_type="text/event-stream",
         )
 
-    # Non-streaming, or the chosen worker is currently on the long-poll
-    # fallback transport (no true incremental push available there).
+    # ------------------------------------------------------------------
+    # NON-STREAMING
+    # ------------------------------------------------------------------
     payload = {
-        "kind": "chat", "model": model, "messages": messages, "stream": False,
+        "kind": "chat",
+        "model": model,
+        "messages": messages,
+        "stream": False,
         "params": normalize_generation_params(body),
     }
-    job, result = await run_job_and_wait(worker, "chat", payload, request)
+
+    job, result = await run_job_and_wait(
+        worker,
+        "chat",
+        payload,
+        request,
+    )
+
+    print("\n" + "=" * 80)
+    print("CHAT COMPLETION RESPONSE")
+    print("=" * 80)
+    print(result)
+    print("=" * 80)
+
+    # ------------------------------------------------------------------
+    # FAKE STREAMING (HTTP fallback)
+    # ------------------------------------------------------------------
     if stream:
+
+        async def debug_fake_stream():
+            assembled = []
+
+            async for chunk in fake_sse_stream(
+                lambda: to_stream_chat_chunk(job.id, model, result)
+            ):
+                print("\n----- FAKE STREAM CHUNK -----")
+                print(chunk)
+                assembled.append(chunk)
+                yield chunk
+
+            print("\n" + "=" * 80)
+            print("FULL FAKE STREAM RESPONSE")
+            print("=" * 80)
+            print("".join(str(x) for x in assembled))
+            print("=" * 80)
+
         return StreamingResponse(
-            fake_sse_stream(lambda: to_stream_chat_chunk(job.id, model, result)),
+            debug_fake_stream(),
             media_type="text/event-stream",
         )
-    return JSONResponse(format_chat_completion(job.id, model, result))
 
+    return JSONResponse(
+        format_chat_completion(job.id, model, result)
+    )
 
 @app.post("/v1/completions")
 async def completions(request: Request, authorization: Optional[str] = Header(None)):

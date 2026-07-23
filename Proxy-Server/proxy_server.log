@@ -1,1 +1,87 @@
 2026-07-23 19:48:16,990 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 19:51:08,641 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 19:51:22,382 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 19:58:03,475 [INFO] proxy_server_multi: Routed job f68bb802-f0e7-41b9-84b5-cbdba1c2404e (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 19:58:04,366 [INFO] proxy_server_multi: Routed job 6bd29245-7a5b-43ff-b481-c22872feadf9 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=2, gpu_util=0%)
+2026-07-23 19:58:21,358 [INFO] proxy_server_multi: Routed job 726b5bd3-f37a-440b-bfcb-6795206d56e4 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 19:58:32,836 [INFO] proxy_server_multi: Routed job b5ec6445-29b7-4246-830d-c04cdd763b36 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:02:36,690 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:02:39,504 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:02:44,405 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:02:56,904 [INFO] proxy_server_multi: Routed job 5a1b4da9-2108-4bf3-8330-be5ae522f655 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:12:14,965 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:12:17,824 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:12:22,674 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:13:07,548 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:13:09,707 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:13:10,264 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:13:27,882 [INFO] proxy_server_multi: Routed job 33ed17c2-129c-4eae-a4db-e2b31846015c (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:13:54,281 [INFO] proxy_server_multi: Routed job dd5d35e1-6fb8-4edf-b488-bb7e3b3757f0 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:13:55,186 [INFO] proxy_server_multi: Routed job 59bd8db6-7b7a-4596-bdaa-d9b24c772854 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=2, gpu_util=0%)
+2026-07-23 20:15:08,539 [INFO] proxy_server_multi: Routed job 7e2922d5-b7b6-4aef-b4bf-2386e34727e6 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:15:12,348 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:15:14,272 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:15:15,146 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:15:22,634 [INFO] proxy_server_multi: Routed job f613373d-2dde-4885-9956-c1afd65d53b2 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:16:20,652 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:16:22,067 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:16:23,383 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:16:28,424 [INFO] proxy_server_multi: Routed job 0ad9f2d2-21f8-4f21-bb37-ae1f56199d93 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=None%)
+2026-07-23 20:17:45,524 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:17:52,763 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:17:53,807 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via poll. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:18:05,216 [INFO] proxy_server_multi: Routed job 24b57015-2c3d-4e56-a6b3-79fce7bd8a38 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=None%)
+2026-07-23 20:18:06,062 [INFO] proxy_server_multi: Routed job b28b1075-6559-467e-9df4-7d4b09a742df (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=2, gpu_util=None%)
+2026-07-23 20:18:44,879 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:19:13,203 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:19:20,790 [INFO] proxy_server_multi: Routed job 3f1d940a-73cb-483b-a015-38b4e1c98a2e (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:19:49,328 [INFO] proxy_server_multi: Routed job e15c3e92-74f1-47fc-89b2-a0552a6788dd (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:20:03,376 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:20:06,165 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:20:11,063 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:20:19,523 [INFO] proxy_server_multi: Routed job 39e177b6-9038-4ed7-91cd-f6aecb4780dd (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:20:33,362 [INFO] proxy_server_multi: Routed job 3c5f16b0-defb-4ed1-b43c-676bd44b40d4 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:21:29,472 [INFO] proxy_server_multi: Routed job da3953cb-ca52-4044-a23c-7fb244e3f2d6 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:21:30,499 [INFO] proxy_server_multi: Routed job f1e207f7-4136-4cb1-99ec-b20a3829e502 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=2, gpu_util=0%)
+2026-07-23 20:21:59,514 [INFO] proxy_server_multi: Routed job f54ac1ad-abcb-42a0-b704-df2b05d4e5b2 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:23:25,379 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:23:27,992 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:23:32,939 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:23:39,361 [INFO] proxy_server_multi: Routed job 94ebabee-fefd-41b9-b789-e5c6512fbaf1 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:24:30,337 [INFO] proxy_server_multi: Routed job 1c0c8e29-bc41-4fc9-965a-f9d702c2ce9a (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:24:31,170 [INFO] proxy_server_multi: Routed job 6c72e497-6338-4360-938b-8c86b2b4a7ff (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=2, gpu_util=0%)
+2026-07-23 20:24:51,655 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:24:53,921 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:24:54,386 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:25:12,064 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:25:21,422 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:25:49,415 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:26:01,340 [INFO] proxy_server_multi: Routed job 49475f68-9315-4345-b13f-8312d949e4e2 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:31:49,750 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:31:53,181 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:31:57,480 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:31:59,678 [INFO] proxy_server_multi: Routed job a8d4108e-80fb-4aab-82b2-4ca256400295 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=None%)
+2026-07-23 20:34:49,475 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:41:50,686 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:41:54,978 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:42:02,073 [INFO] proxy_server_multi: Routed job 86f0418f-7c4d-495b-aaa0-4cd5207c0303 (kind=chat, model=unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf) -> worker 'bathulaavi' (in_flight=1, gpu_util=0%)
+2026-07-23 20:44:08,043 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:44:40,697 [INFO] proxy_server_multi: Worker 'bathulaavi' did not reconnect within 30s of disconnecting; removed the worker from the registry.
+2026-07-23 20:50:41,121 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:50:49,504 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:51:11,789 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:52:00,719 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:52:13,477 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:52:19,740 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:52:50,724 [INFO] proxy_server_multi: Worker 'bathulaavi' did not reconnect within 30s of disconnecting; removed the worker from the registry.
+2026-07-23 20:53:44,720 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:53:48,693 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:53:51,538 [INFO] proxy_server_multi: Multi-worker proxy server started on 0.0.0.0:8000
+2026-07-23 20:53:55,837 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:55:47,262 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:55:58,718 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:56:02,194 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:56:36,545 [INFO] proxy_server_multi: Worker 'bathulaavi' did not reconnect within 30s of disconnecting; removed the worker from the registry.
+2026-07-23 20:58:34,290 [INFO] proxy_server_multi: Worker 'bathulaavi' registered via ws. Models: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf']
+2026-07-23 20:58:41,826 [INFO] proxy_server_multi: Worker 'bathulaavi' disconnected from WebSocket.
+2026-07-23 20:59:16,556 [INFO] proxy_server_multi: Worker 'bathulaavi' did not reconnect within 30s of disconnecting; removed the worker from the registry.

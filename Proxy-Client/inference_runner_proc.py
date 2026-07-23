@@ -415,8 +415,8 @@ def run_job(llm, job: dict, job_id: str) -> None:
     _debug(f"job {job_id} finished streaming, completion_tokens={completion_tokens}, text: {text}, finish_reason: {finish_reason}")
     
     _emit({"type": "done", "job_id": job_id, "result": {"usage": {"completion_tokens": completion_tokens}}})
-def _debug(msg: str) -> None:
-    print(f"[runner] {msg}\n")
+def _debug(msg: str, *args) -> None:
+    print(f"[runner] {msg % args}\n", file=sys.stderr)
     
 
 def main() -> None:

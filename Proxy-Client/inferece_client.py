@@ -84,7 +84,7 @@ import time
 import traceback
 from typing import Any, Dict, List, Optional, Set
 
-print("Version2 to see if kaggle cache is updated")
+print("Version3 to see if kaggle cache is updated")
 # --------------------------------------------------------------------------- #
 # Step -1: consolidate Hugging Face's own cache into our tracked cache dir.
 #
@@ -740,8 +740,8 @@ def is_cuda_oom_error(e: Exception) -> bool:
 # at a time, so a stuck/orphaned job can be hard-killed (and the process
 # respawned) without reloading the model on every normal request.
 # --------------------------------------------------------------------------- #
-def _debug(msg: str):
-    print(msg)
+def _debug(msg: str, *args) -> None:
+    print(msg % args, file=sys.stderr)
 
 class ModelManager:
     def __init__(self, config: dict, target_repo: str, file_name: str):
@@ -854,7 +854,7 @@ class ModelManager:
                     _debug("=" * 80)
                     _debug("LLAMA CONFIG")
                     _debug("chat_format:", getattr(llm, "chat_format", None))
-                    _debug("chat_handler:", type(getattr(llm, "chat_handler", None)).__name__)
+                    _debug("chat_handler:",type(getattr(llm, "chat_handler", None)).__name__)
                     _debug("=" * 80)
                     self.tensor_split = split
                 except Exception as e:
