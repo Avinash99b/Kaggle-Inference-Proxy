@@ -411,8 +411,14 @@ def run_job(llm, job: dict, job_id: str) -> None:
                 completion_tokens += 1
             if text or finish_reason:
                 _emit({"type": "token", "job_id": job_id, "delta": text, "finish_reason": finish_reason})
-
+    
+    _debug(f"job {job_id} finished streaming, completion_tokens={completion_tokens}, text: {text}, finish_reason: {finish_reason}")
+    
     _emit({"type": "done", "job_id": job_id, "result": {"usage": {"completion_tokens": completion_tokens}}})
+def _debug(msg: str) -> None:
+    sys.stderr.write(f"[runner] {msg}\n")
+    sys.stderr.flush()
+
 def main() -> None:
     load_req = _read_line()
     if not load_req or load_req.get("type") != "load":

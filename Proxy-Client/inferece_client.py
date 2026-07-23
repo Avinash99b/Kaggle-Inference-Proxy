@@ -740,7 +740,9 @@ def is_cuda_oom_error(e: Exception) -> bool:
 # at a time, so a stuck/orphaned job can be hard-killed (and the process
 # respawned) without reloading the model on every normal request.
 # --------------------------------------------------------------------------- #
-
+def _debug(msg: str, *args):
+    if CONFIG.get("logging", {}).get("level", "").upper() == "DEBUG":
+        logger.debug(msg, *args)
 
 class ModelManager:
     def __init__(self, config: dict, target_repo: str, file_name: str):
@@ -850,6 +852,11 @@ class ModelManager:
                 try:
                     split = [1.0 / GPU_COUNT] * GPU_COUNT
                     llm = Llama(tensor_split=split, **kwargs)
+                    _debug("=" * 80)
+                    _debug("LLAMA CONFIG")
+                    _debug("chat_format:", getattr(llm, "chat_format", None))
+                    _debug("chat_handler:", type(getattr(llm, "chat_handler", None)).__name__)
+                    _debug("=" * 80)
                     self.tensor_split = split
                 except Exception as e:
                     if is_cuda_oom_error(e):
