@@ -66,7 +66,7 @@ enabled):
     export ENABLE_EMBEDDINGS="0"   # set to "1" to also serve /v1/embeddings
     python inference_client.py
 """
-
+print("Version 1 to see if kaggle cache is updated")
 from __future__ import annotations
 
 import asyncio
