@@ -416,8 +416,8 @@ def run_job(llm, job: dict, job_id: str) -> None:
     
     _emit({"type": "done", "job_id": job_id, "result": {"usage": {"completion_tokens": completion_tokens}}})
 def _debug(msg: str) -> None:
-    sys.stderr.write(f"[runner] {msg}\n")
-    sys.stderr.flush()
+    print(f"[runner] {msg}\n")
+    
 
 def main() -> None:
     load_req = _read_line()

@@ -740,9 +740,8 @@ def is_cuda_oom_error(e: Exception) -> bool:
 # at a time, so a stuck/orphaned job can be hard-killed (and the process
 # respawned) without reloading the model on every normal request.
 # --------------------------------------------------------------------------- #
-def _debug(msg: str, *args):
-    if CONFIG.get("logging", {}).get("level", "").upper() == "DEBUG":
-        logger.debug(msg, *args)
+def _debug(msg: str):
+    print(msg)
 
 class ModelManager:
     def __init__(self, config: dict, target_repo: str, file_name: str):
