@@ -84,7 +84,7 @@ import time
 import traceback
 from typing import Any, Dict, List, Optional, Set
 
-print("Version 1 to see if kaggle cache is updated")
+print("Version2 to see if kaggle cache is updated")
 # --------------------------------------------------------------------------- #
 # Step -1: consolidate Hugging Face's own cache into our tracked cache dir.
 #
