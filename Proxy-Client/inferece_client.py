@@ -1470,12 +1470,20 @@ def _build_runner_job_dict(payload: dict, gen_kwargs: dict) -> dict:
     Note: gen_kwargs (temperature/top_p/max_tokens/...) is only meaningful
     for chat/completion jobs -- it's still merged in unconditionally for
     embeddings jobs for simplicity, but inference_runner_proc.py's
-    run_embeddings_job() ignores all of it and only reads job["input"]."""
+    run_embeddings_job() ignores all of it and only reads job["input"].
+
+    Tool-calling fields are forwarded as-is so the runner can pass them into
+    llama-cpp-python and, if needed, parse native tool-call tags back into
+    OpenAI-style tool_calls.
+    """
     job = {
         "kind": payload["kind"],
         "stream": bool(payload.get("stream", False)),
         **gen_kwargs,
     }
+    for key in ("tools", "tool_choice", "parallel_tool_calls"):
+        if key in payload:
+            job[key] = payload[key]
     if payload["kind"] == "chat":
         job["messages"] = build_chat_prompt_messages(payload["messages"])
     elif payload["kind"] == "embeddings":

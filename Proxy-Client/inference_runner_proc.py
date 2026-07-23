@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import traceback
 
@@ -112,6 +113,179 @@ def _read_line() -> dict:
     if not raw:
         return {}
     return json.loads(raw)
+
+
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.IGNORECASE | re.DOTALL)
+_FUNCTION_RE = re.compile(r"<function(?:=|\s+name=)([^>\s]+)>(.*?)</function>", re.IGNORECASE | re.DOTALL)
+_PARAMETER_RE = re.compile(r"<parameter(?:=|\s+name=)([^>\s]+)>(.*?)</parameter>", re.IGNORECASE | re.DOTALL)
+
+
+def _clean_tag_value(value: str) -> str:
+    return value.strip().strip('"').strip("'")
+
+
+def _extract_tool_schema_map(tools: object) -> dict:
+    schema_map = {}
+    if not isinstance(tools, list):
+        return schema_map
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else None
+        if not function:
+            continue
+        name = function.get("name")
+        if not name:
+            continue
+        schema_map[str(name)] = function.get("parameters") or {}
+    return schema_map
+
+
+def _normalize_jsonish_text(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return text
+    lowered = text.lower()
+    if lowered in {"true", "false", "null"}:
+        return lowered
+    return text
+
+
+def _coerce_scalar_value(raw_value: str, schema: dict | None = None):
+    text = _normalize_jsonish_text(raw_value)
+    schema_type = None
+    if isinstance(schema, dict):
+        schema_type = schema.get("type")
+        if isinstance(schema_type, list):
+            schema_type = next((t for t in schema_type if t != "null"), schema_type[0] if schema_type else None)
+    if schema_type == "boolean":
+        lowered = text.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    if schema_type == "integer":
+        try:
+            return int(float(text))
+        except Exception:
+            return text
+    if schema_type == "number":
+        try:
+            return float(text)
+        except Exception:
+            return text
+    if schema_type in {"array", "object"}:
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+    lowered = text.strip().lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if re.fullmatch(r"[-+]?\d+", text.strip()):
+        try:
+            return int(text.strip())
+        except Exception:
+            pass
+    if re.fullmatch(r"[-+]?((\d+\.\d*)|(\d*\.\d+))(e[-+]?\d+)?", text.strip(), re.IGNORECASE) or re.fullmatch(r"[-+]?\d+[eE][-+]?\d+", text.strip()):
+        try:
+            return float(text.strip())
+        except Exception:
+            pass
+    if text[:1] in "[{":
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+    return raw_value.strip()
+
+
+def _parse_qwen_tool_calls(text: str, tools: object = None, job_id: str = "") -> tuple[str, list]:
+    """Parse Qwen3-Coder native <tool_call> XML blocks into OpenAI tool_calls.
+
+    Returns the assistant content with tool blocks removed plus the structured
+    tool_calls list.
+    """
+    if not text:
+        return "", []
+
+    schema_map = _extract_tool_schema_map(tools)
+    matches = list(_TOOL_CALL_BLOCK_RE.finditer(text))
+    if not matches:
+        return text, []
+
+    prefix = text[:matches[0].start()].rstrip()
+    tool_calls = []
+
+    for idx, match in enumerate(matches):
+        block = match.group(1).strip()
+        func_match = _FUNCTION_RE.search(block)
+        if not func_match:
+            inner = block.strip()
+            tool_name = None
+            parsed_args = {}
+            try:
+                payload = json.loads(inner)
+                if isinstance(payload, dict):
+                    tool_name = payload.get("name") or payload.get("function") or payload.get("tool") or payload.get("tool_name")
+                    args = payload.get("arguments") or payload.get("args") or payload.get("parameters") or {}
+                    if isinstance(args, str):
+                        try:
+                            parsed_args = json.loads(args)
+                        except Exception:
+                            parsed_args = {"arguments": args}
+                    elif isinstance(args, dict):
+                        parsed_args = args
+                else:
+                    continue
+            except Exception:
+                continue
+            if not tool_name:
+                continue
+            tool_calls.append({
+                "id": f"call_{job_id or 'job'}_{idx}",
+                "type": "function",
+                "function": {
+                    "name": str(tool_name),
+                    "arguments": json.dumps(parsed_args, ensure_ascii=False),
+                },
+            })
+            continue
+
+        tool_name = _clean_tag_value(func_match.group(1))
+        body = func_match.group(2)
+        params = {}
+        tool_schema = schema_map.get(tool_name, {})
+        for p_match in _PARAMETER_RE.finditer(body):
+            param_name = _clean_tag_value(p_match.group(1))
+            raw_value = p_match.group(2).strip()
+            schema = {}
+            if isinstance(tool_schema, dict):
+                properties = tool_schema.get("properties") or {}
+                if isinstance(properties, dict):
+                    schema = properties.get(param_name) or {}
+            params[param_name] = _coerce_scalar_value(raw_value, schema=schema)
+
+        tool_calls.append({
+            "id": f"call_{job_id or 'job'}_{idx}",
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "arguments": json.dumps(params, ensure_ascii=False),
+            },
+        })
+
+    return prefix, tool_calls
+
+
+def _message_content_from_choice(choice: dict) -> str:
+    message = choice.get("message") or {}
+    if isinstance(message, dict):
+        content = message.get("content")
+        if content is None:
+            content = choice.get("text")
+        return content or ""
+    return choice.get("text", "") or ""
 
 
 def run_embeddings_job(llm, job: dict, job_id: str) -> None:
@@ -148,6 +322,10 @@ def run_job(llm, job: dict, job_id: str) -> None:
         run_embeddings_job(llm, job, job_id)
         return
 
+    tools = job.get("tools")
+    tool_choice = job.get("tool_choice")
+    tool_calling_requested = bool(tools) or tool_choice not in (None, "none")
+
     # max_tokens<=0 or None is passed straight through to llama-cpp-python
     # unchanged -- it already treats that as "unlimited, bounded only by
     # n_ctx" (see its own create_chat_completion/__call__ docstrings), so
@@ -165,27 +343,55 @@ def run_job(llm, job: dict, job_id: str) -> None:
     if job.get("seed") is not None:
         gen_kwargs["seed"] = job["seed"]
 
-    stream = bool(job.get("stream", False))
+    if kind == "chat":
+        chat_kwargs = {
+            "messages": job["messages"],
+            **gen_kwargs,
+        }
+        if tools is not None:
+            chat_kwargs["tools"] = tools
+        if tool_choice is not None:
+            chat_kwargs["tool_choice"] = tool_choice
+    else:
+        chat_kwargs = None
+
+    # When the caller is asking for tool use, we intentionally collapse
+    # streaming into a single structured completion. Qwen3-Coder's native
+    # tool-call format arrives as tagged text, so we need the full turn to
+    # parse it correctly back into OpenAI-style tool_calls.
+    stream = bool(job.get("stream", False)) and not tool_calling_requested
 
     if not stream:
         if kind == "chat":
-            out = llm.create_chat_completion(messages=job["messages"], **gen_kwargs)
+            out = llm.create_chat_completion(**chat_kwargs)
             choice = out["choices"][0]
-            text = choice["message"]["content"]
-            finish_reason = choice.get("finish_reason", "stop")
+            message = choice.get("message") or {}
+            text = _message_content_from_choice(choice)
+            finish_reason = choice.get("finish_reason", message.get("finish_reason", "stop"))
+            tool_calls = message.get("tool_calls") or []
+            if tool_calling_requested and not tool_calls:
+                text, tool_calls = _parse_qwen_tool_calls(text, tools=tools, job_id=job_id)
+                if tool_calls:
+                    finish_reason = "tool_calls"
+            result = {
+                "text": text,
+                "finish_reason": finish_reason,
+                "usage": out.get("usage", {}),
+            }
+            if tool_calls:
+                result["tool_calls"] = tool_calls
         else:
             out = llm(prompt=job["prompt"], **gen_kwargs)
             choice = out["choices"][0]
             text = choice["text"]
             finish_reason = choice.get("finish_reason", "stop")
-        usage = out.get("usage", {})
-        _emit({"type": "done", "job_id": job_id,
-               "result": {"text": text, "finish_reason": finish_reason, "usage": usage}})
+            result = {"text": text, "finish_reason": finish_reason, "usage": out.get("usage", {})}
+        _emit({"type": "done", "job_id": job_id, "result": result})
         return
 
     completion_tokens = 0
     if kind == "chat":
-        gen = llm.create_chat_completion(messages=job["messages"], stream=True, **gen_kwargs)
+        gen = llm.create_chat_completion(stream=True, **chat_kwargs)
         for chunk in gen:
             choice = chunk["choices"][0]
             delta = choice.get("delta", {}) or {}
@@ -207,8 +413,6 @@ def run_job(llm, job: dict, job_id: str) -> None:
                 _emit({"type": "token", "job_id": job_id, "delta": text, "finish_reason": finish_reason})
 
     _emit({"type": "done", "job_id": job_id, "result": {"usage": {"completion_tokens": completion_tokens}}})
-
-
 def main() -> None:
     load_req = _read_line()
     if not load_req or load_req.get("type") != "load":
